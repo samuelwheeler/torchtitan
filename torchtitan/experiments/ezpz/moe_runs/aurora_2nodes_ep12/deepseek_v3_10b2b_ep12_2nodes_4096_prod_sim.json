@@ -1,6 +1,6 @@
 {
   "training": {
-    "local_batch_size": 3,
+    "local_batch_size": 2,
     "seq_len": 4096,
     "steps": 1000,
     "gc_freq": 1000
@@ -40,12 +40,11 @@
     "load_step": -1
   },
   "activation_checkpoint": {
-    "mode": "full",
-    "determinism_check": "none"
+    "mode": "none"
   },
   "dataloader": {
     "dataset": "blendcorpus",
-    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/books.txt",
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
     "num_workers": 2,
     "persistent_workers": true,
     "prefetch_factor": 2,

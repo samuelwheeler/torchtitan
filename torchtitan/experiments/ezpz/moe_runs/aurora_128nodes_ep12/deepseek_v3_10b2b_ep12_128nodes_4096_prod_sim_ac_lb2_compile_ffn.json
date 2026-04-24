@@ -18,7 +18,7 @@
     }
   },
   "parallelism": {
-    "data_parallel_replicate_degree": 2,
+    "data_parallel_replicate_degree": 128,
     "data_parallel_shard_degree": 12,
     "tensor_parallel_degree": 1,
     "pipeline_parallel_degree": 1,
@@ -40,18 +40,23 @@
     "load_step": -1
   },
   "activation_checkpoint": {
-    "mode": "none"
+    "mode": "selective"
   },
   "dataloader": {
     "dataset": "blendcorpus",
-    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/books.txt",
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
     "num_workers": 2,
     "persistent_workers": true,
     "prefetch_factor": 2,
     "train_iters": 1000
   },
   "compile": {
-    "enable": false
+    "enable": true,
+    "components": [
+      "feed_forward",
+      "loss"
+    ],
+    "backend": "inductor"
   },
   "debug": {
     "print_config": true

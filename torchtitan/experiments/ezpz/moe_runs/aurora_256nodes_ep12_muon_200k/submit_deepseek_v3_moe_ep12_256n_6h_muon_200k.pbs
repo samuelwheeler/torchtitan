@@ -1,0 +1,68 @@
+#!/bin/bash -l
+#PBS -A AuroraGPT
+#PBS -q prod
+#PBS -l select=256
+#PBS -l walltime=06:00:00
+#PBS -l filesystems=flare:home
+#PBS -N tt-dsv3-moe-256n-muon
+#PBS -j oe
+#PBS -o /dev/null
+
+set -euo pipefail
+
+LAUNCHER_REL_PATH="torchtitan/experiments/ezpz/moe_runs/launch_deepseek_v3_moe_ep12.sh"
+CONFIG_REL_PATH="torchtitan/experiments/ezpz/moe_runs/aurora_256nodes_ep12_muon_200k/deepseek_v3_10b2b_ep12_256nodes_4096_prod_sim_ac_lb2_compile_ffn_200k.json"
+SUBMITTER_REL_PATH="torchtitan/experiments/ezpz/moe_runs/aurora_256nodes_ep12_muon_200k/submit_deepseek_v3_moe_ep12_256n_6h_muon_200k.pbs"
+
+resolve_repo_root() {
+  local candidate="$1"
+
+  while [[ -n "${candidate}" && "${candidate}" != "/" ]]; do
+    if [[ -f "${candidate}/${LAUNCHER_REL_PATH}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    candidate="$(dirname "${candidate}")"
+  done
+
+  return 1
+}
+
+REPO_ROOT="$(resolve_repo_root "${REPO_ROOT:-${PBS_O_WORKDIR:-$(pwd)}}")" || {
+  echo "Unable to locate repo root containing ${LAUNCHER_REL_PATH}." >&2
+  echo "Pass REPO_ROOT=/path/to/torchtitan if you submit from outside the repo." >&2
+  exit 1
+}
+
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+  cd "${PBS_O_WORKDIR}"
+fi
+
+RUN_NAME="${RUN_NAME:-deepseek_v3_10b2b_ep12_256n_muon_200k_${PBS_JOBID%%.*}}"
+RUN_SLUG="$(echo "${RUN_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"
+export RUN_ROOT_OVERRIDE="${RUN_ROOT_OVERRIDE:-${REPO_ROOT}/outputs/moe_runs/${RUN_SLUG}}"
+export RUN_SUBMITTER_PATH="${REPO_ROOT}/${SUBMITTER_REL_PATH}"
+
+mkdir -p "${RUN_ROOT_OVERRIDE}/logs"
+exec > >(tee -a "${RUN_ROOT_OVERRIDE}/logs/batch.log") 2>&1
+
+cd "${REPO_ROOT}"
+
+export TT_CONFIG_JSON="${TT_CONFIG_JSON:-${REPO_ROOT}/${CONFIG_REL_PATH}}"
+export HF_ASSETS_PATH="${HF_ASSETS_PATH:-${REPO_ROOT}/assets/hf/gemma-7b}"
+
+export WANDB_PROJECT="${WANDB_PROJECT:-torchtitan.moe_runs}"
+export WANDB_TEAM="${WANDB_TEAM:-moe_experiments}"
+export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-deepseek_v3_moe_ep12_256n}"
+
+echo "Job: ${PBS_JOBID:-no_pbs_jobid}"
+echo "Run name: ${RUN_NAME}"
+echo "Run root: ${RUN_ROOT_OVERRIDE}"
+echo "Batch log: ${RUN_ROOT_OVERRIDE}/logs/batch.log"
+echo "TT_CONFIG_JSON: ${TT_CONFIG_JSON}"
+echo "HF_ASSETS_PATH: ${HF_ASSETS_PATH}"
+
+bash "${REPO_ROOT}/${LAUNCHER_REL_PATH}" \
+  "${RUN_NAME}" \
+  --optimizer muon \
+  --optimizer.lr 0.01

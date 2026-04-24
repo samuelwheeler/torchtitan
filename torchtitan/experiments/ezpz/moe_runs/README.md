@@ -13,12 +13,22 @@ the `deepseek_v3_10b_2b_ep12` base config.
 By default, the launcher uses `assets/hf/gemma-7b` when available, and
 `deepseek_v3` model vocab size is automatically synced from the tokenizer files.
 
-## Files
+## Layout
 
-- `deepseek_v3_10b2b_ep12_2nodes.json`: JSON overrides
-- `deepseek_v3_10b2b_ep12_2nodes_smoke.json`: smoke-test JSON overrides (default)
-- `deepseek_v3_10b2b_ep12_2nodes_4096_perf.json`: 4096-seq throughput-oriented JSON
-- `launch_deepseek_v3_moe_ep12.sh`: launcher script
+- `launch_deepseek_v3_moe_ep12.sh` and `run_torchtitan_ezpz_train.sh`: shared runtime launchers
+- `aurora_2nodes_ep12/`: 2-node Aurora configs plus plain-training and profiling PBS submitters
+- `aurora_2nodes_ep12_throughput_2h/`: dedicated 2-node Aurora throughput run with its own config and PBS submitter
+- `aurora_128nodes_ep12/`: 128-node Aurora config plus its PBS submitter
+- `aurora_256nodes_ep12_muon_200k/`: 256-node Aurora config plus its PBS submitter
+- `polaris_2nodes/`: Polaris configs
+
+Each launched run now gets its own directory under `outputs/moe_runs/<run_slug>/`
+with:
+
+- `configs/`: copied input JSON plus the resolved effective config
+- `metadata/`: copied launcher and submitter scripts
+- `logs/`: batch log redirection
+- `checkpoints/`: training checkpoints
 
 The launcher now defaults to the smoke JSON, which uses:
 
@@ -68,13 +78,13 @@ torchtitan/experiments/ezpz/moe_runs/launch_deepseek_v3_moe_ep12.sh my_wandb_run
 To use the non-smoke 4096-seq config:
 
 ```bash
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes.json \
 torchtitan/experiments/ezpz/moe_runs/launch_deepseek_v3_moe_ep12.sh my_wandb_run_name
 ```
 
 To use the 4096-seq throughput-oriented config (no torch.compile, async checkpoint):
 
 ```bash
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_perf.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_perf.json \
 bash torchtitan/experiments/ezpz/moe_runs/launch_deepseek_v3_moe_ep12.sh my_wandb_run_name
 ```

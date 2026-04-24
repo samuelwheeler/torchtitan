@@ -1,0 +1,63 @@
+{
+  "training": {
+    "local_batch_size": 4,
+    "global_batch_size": 96,
+    "seq_len": 4096,
+    "steps": 200,
+    "gc_freq": 200
+  },
+  "model_spec": {
+    "model": {
+      "n_layers": 27,
+      "layer": {
+        "n_dense_layers": 27,
+        "feed_forward": {
+          "hidden_dim": 7040
+        },
+        "attention": {
+          "attn_backend": "flex",
+          "attn_mask_type": "block_causal"
+        }
+      }
+    }
+  },
+  "parallelism": {
+    "data_parallel_replicate_degree": 2,
+    "data_parallel_shard_degree": 12,
+    "tensor_parallel_degree": 1,
+    "pipeline_parallel_degree": 1,
+    "context_parallel_degree": 1,
+    "expert_parallel_degree": 1,
+    "expert_tensor_parallel_degree": 1
+  },
+  "metrics": {
+    "enable_wandb": true,
+    "log_freq": 10
+  },
+  "checkpoint": {
+    "enable": false
+  },
+  "activation_checkpoint": {
+    "mode": "selective",
+    "selective_ac_option": "op"
+  },
+  "dataloader": {
+    "dataset": "blendcorpus",
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
+    "num_workers": 2,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
+    "train_iters": 200
+  },
+  "compile": {
+    "enable": true,
+    "components": [
+      "model",
+      "loss"
+    ],
+    "backend": "inductor"
+  },
+  "debug": {
+    "print_config": true
+  }
+}

@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import json
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -24,6 +26,35 @@ from torchtitan.models.common.rope import apply_rotary_emb_single_complex
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
+
+
+def _infer_vocab_size_from_tokenizer_assets(hf_assets_path: str) -> int | None:
+    tokenizer_json_path = os.path.join(hf_assets_path, "tokenizer.json")
+    if not os.path.exists(tokenizer_json_path):
+        return None
+
+    with open(tokenizer_json_path, encoding="utf-8") as f:
+        tokenizer_data = json.load(f)
+
+    vocab = tokenizer_data.get("model", {}).get("vocab", {})
+    added_tokens = tokenizer_data.get("added_tokens", [])
+
+    max_token_id = -1
+    if isinstance(vocab, dict):
+        for token_id in vocab.values():
+            if isinstance(token_id, int):
+                max_token_id = max(max_token_id, token_id)
+
+    if isinstance(added_tokens, list):
+        for token_info in added_tokens:
+            if isinstance(token_info, dict):
+                token_id = token_info.get("id")
+                if isinstance(token_id, int):
+                    max_token_id = max(max_token_id, token_id)
+
+    if max_token_id < 0:
+        return None
+    return max_token_id + 1
 
 
 class Attention(BaseAttention):
@@ -195,6 +226,17 @@ class DeepSeekV3Model(Decoder):
             training = trainer_config.training
             parallelism = trainer_config.parallelism
             debug = trainer_config.debug
+            inferred_vocab_size = _infer_vocab_size_from_tokenizer_assets(
+                trainer_config.hf_assets_path
+            )
+            if inferred_vocab_size is not None and inferred_vocab_size != self.vocab_size:
+                logger.info(
+                    f"Overriding model vocab_size from {self.vocab_size} to "
+                    f"{inferred_vocab_size} based on tokenizer assets at "
+                    f"{trainer_config.hf_assets_path}."
+                )
+                self.vocab_size = inferred_vocab_size
+
             seq_len = training.seq_len
             if seq_len > self.rope.max_seq_len:
                 logger.warning(

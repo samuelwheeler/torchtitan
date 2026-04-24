@@ -1,18 +1,16 @@
 {
   "training": {
-    "local_batch_size": 3,
+    "local_batch_size": 2,
     "seq_len": 4096,
-    "steps": 1000,
-    "gc_freq": 1000
+    "steps": 200,
+    "gc_freq": 200
   },
   "model_spec": {
     "model": {
       "layer": {
         "attention": {
-          "attn_backend": "sdpa",
-          "attn_mask_type": "causal",
-          "qk_nope_head_dim": 64,
-          "qk_rope_head_dim": 64
+          "attn_backend": "flex",
+          "attn_mask_type": "block_causal"
         }
       }
     }
@@ -28,32 +26,30 @@
   },
   "metrics": {
     "enable_wandb": true,
-    "log_freq": 50
+    "log_freq": 10
   },
   "checkpoint": {
-    "enable": true,
-    "folder": "checkpoints",
-    "interval": 1000,
-    "async_mode": "async",
-    "enable_first_step_checkpoint": false,
-    "last_save_model_only": false,
-    "load_step": -1
+    "enable": false
   },
   "activation_checkpoint": {
     "mode": "selective",
-    "determinism_check": "none",
-    "preserve_rng_state": false
+    "selective_ac_option": "op"
   },
   "dataloader": {
     "dataset": "blendcorpus",
-    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/books.txt",
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
     "num_workers": 2,
     "persistent_workers": true,
     "prefetch_factor": 2,
-    "train_iters": 1000
+    "train_iters": 200
   },
   "compile": {
-    "enable": false
+    "enable": true,
+    "components": [
+      "model",
+      "loss"
+    ],
+    "backend": "inductor"
   },
   "debug": {
     "print_config": true

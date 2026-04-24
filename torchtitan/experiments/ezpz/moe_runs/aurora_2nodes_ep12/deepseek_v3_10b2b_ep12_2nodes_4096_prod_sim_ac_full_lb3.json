@@ -40,11 +40,12 @@
     "load_step": -1
   },
   "activation_checkpoint": {
-    "mode": "selective"
+    "mode": "full",
+    "determinism_check": "none"
   },
   "dataloader": {
     "dataset": "blendcorpus",
-    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/books.txt",
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
     "num_workers": 2,
     "persistent_workers": true,
     "prefetch_factor": 2,

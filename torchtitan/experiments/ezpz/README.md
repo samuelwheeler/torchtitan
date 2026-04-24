@@ -134,107 +134,108 @@ overrides from `TT_CONFIG_JSON`.
 
 ### Aurora (2 nodes, 24 XPUs, EP=12)
 
-Pre-configured JSON overrides: `moe_runs/`
+Aurora 2-node JSON overrides live in `moe_runs/aurora_2nodes_ep12/`.
+The 128-node JSON lives in `moe_runs/aurora_128nodes_ep12/`.
 
 ```bash
 # 1. Smoke test (40 steps, seq_len=1024)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_smoke.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_smoke.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 2. Baseline (1000 steps, seq_len=4096)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 3. Throughput test (seq_len=4096, gc_freq=200)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_perf.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_perf.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 4. Prod sim — no AC (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 5. Prod sim + selective AC op-level (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 6. Selective AC op-level, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 7. Full AC, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_full_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_full_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 8. Layer-1 only AC, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_layer1_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_layer1_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
-# 9. Selective AC + compile FFN+loss (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_lb2_compile_ffn.json \
+# 9. Selective AC + flex attention + compile model+loss (local_batch=2)
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_2nodes_ep12/deepseek_v3_10b2b_ep12_2nodes_4096_prod_sim_ac_lb2_flex_compile_model.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 10. 128-node scale run (1536 XPUs)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/deepseek_v3_10b2b_ep12_128nodes_4096_prod_sim_ac_lb2_compile_ffn.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/aurora_128nodes_ep12/deepseek_v3_10b2b_ep12_128nodes_4096_prod_sim_ac_lb2_compile_ffn.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 ```
 
 ### Polaris (2 nodes, 8 GPUs)
 
-Pre-configured JSON overrides: `moe_runs/polaris/`
+Polaris JSON overrides live in `moe_runs/polaris_2nodes/`.
 
 ```bash
 # 1. Smoke test (40 steps, seq_len=1024)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_smoke.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_smoke.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 2. Baseline (1000 steps, seq_len=4096)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 3. Throughput test (seq_len=4096, gc_freq=200)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_perf.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_perf.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 4. Prod sim — no AC (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 5. Prod sim + selective AC op-level (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 6. Selective AC op-level, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 7. Full AC, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_full_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_full_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
 # 8. Layer-1 only AC, higher batch (local_batch=3)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_layer1_lb3.json \
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_layer1_lb3.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 
-# 9. Selective AC + compile FFN+loss (local_batch=2)
-TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_lb2_compile_ffn.json \
+# 9. Selective AC + compile preset (local_batch=2)
+TT_CONFIG_JSON=torchtitan/experiments/ezpz/moe_runs/polaris_2nodes/deepseek_v3_10b2b_polaris_2nodes_4096_prod_sim_ac_lb2_compile_ffn.json \
   ezpz launch python3 -m torchtitan.experiments.ezpz.train \
     --module ezpz.moe --config moe_10b_2b_from_json --checkpoint.no_enable
 ```

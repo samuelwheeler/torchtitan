@@ -35,6 +35,33 @@ from torchtitan.protocols import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
 
+def disable_fsdp_gradient_division(model: nn.Module) -> None:
+    force_sum_reduction = False
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        backend = str(torch.distributed.get_backend()).lower()
+        if "nccl" not in backend:
+            force_sum_reduction = True
+
+    fsdp_modules_updated = 0
+    for module in model.modules():
+        set_divide_factor = getattr(module, "set_gradient_divide_factor", None)
+        if callable(set_divide_factor):
+            set_divide_factor(1.0)
+            fsdp_modules_updated += 1
+            if force_sum_reduction:
+                set_force_sum = getattr(
+                    module, "set_force_sum_reduction_for_comms", None
+                )
+                if callable(set_force_sum):
+                    set_force_sum(True)
+
+    logger.info(
+        "Configured FSDP gradient division for %d modules (force_sum_reduction=%s)",
+        fsdp_modules_updated,
+        force_sum_reduction,
+    )
+
+
 # Adapted from llama4/infra/parallelize.py
 def parallelize_deepseekv3(
     model: DeepSeekV3Model,
@@ -155,6 +182,7 @@ def parallelize_deepseekv3(
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
     )
+    disable_fsdp_gradient_division(model)
 
     logger.info("Applied fully_shard to the model")
 

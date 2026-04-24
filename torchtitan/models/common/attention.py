@@ -6,7 +6,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -287,7 +287,34 @@ class FlexAttention(LocalMapInnerAttention):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        self.kernel_options = config.kernel_options
+        self.kernel_options = dict(config.kernel_options)
+
+    # Aurora's XPU PyTorch build currently advertises an invalid default flex-attention
+    # backward config for head_dim=128. Override it with the nearest valid config until
+    # the upstream heuristic is fixed in the frameworks build.
+    _xpu_head_dim_128_bwd_kernel_options: ClassVar[dict[str, int]] = {
+        "bwd_BLOCK_M1": 64,
+        "bwd_BLOCK_N1": 128,
+        "bwd_BLOCK_M2": 128,
+        "bwd_BLOCK_N2": 64,
+        "bwd_num_stages": 1,
+        "bwd_num_warps": 8,
+    }
+
+    def __init__(self, kernel_options: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.kernel_options = dict(kernel_options) if kernel_options is not None else {}
+
+    def _get_kernel_options(
+        self,
+        q: torch.Tensor,
+        v: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        kernel_options = dict(self.kernel_options)
+        if q.device.type == "xpu" and q.shape[-1] == 128 and v.shape[-1] == 128:
+            for key, value in self._xpu_head_dim_128_bwd_kernel_options.items():
+                kernel_options.setdefault(key, value)
+        return kernel_options or None
 
     # pyrefly: ignore [bad-override]
     def forward(
@@ -323,7 +350,8 @@ class FlexAttention(LocalMapInnerAttention):
             scale=scale,
             enable_gqa=enable_gqa,
             return_aux=AuxRequest(lse=return_lse),
-            kernel_options=self.kernel_options,
+            kernel_options=self._get_kernel_options(q, v),
+            return_aux=AuxRequest(lse=return_lse),
         )
         # Transpose back to (bs, seq, heads, dim)
         if return_lse:
