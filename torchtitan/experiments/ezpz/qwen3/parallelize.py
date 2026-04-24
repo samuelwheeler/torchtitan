@@ -35,6 +35,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.dual_pipe_v import get_dual_pipe_v_flag
+from torchtitan.experiments.ezpz._distributed_compat import ezpz_distributed
 from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import (
     apply_compile,
@@ -69,7 +70,7 @@ _op_sac_save_list = {
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
     force_sum_reduction = False
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        backend = ezpz.distributed.get_torch_backend()
+        backend = ezpz_distributed.get_torch_backend()
         if backend and backend.lower() != "nccl":
             force_sum_reduction = True
 

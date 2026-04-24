@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import ezpz
-import ezpz.distributed
 import ezpz.utils
 import torch
 import torch.distributed
@@ -23,6 +22,7 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import ConfigManager
+from torchtitan.experiments.ezpz._distributed_compat import ezpz_distributed
 from torchtitan.experiments.ezpz.logging import init_logger
 from torchtitan.experiments.ezpz.optimizer import (
     ADOPTOptimizersContainer,
@@ -97,23 +97,23 @@ def _update_env() -> dict:
     env_dict |= {
         "created_at": dstr,
         "day": ezpz.utils.get_timestamp("%d"),
-        "DIST_INFO": ezpz.distributed.get_dist_info(),
+        "DIST_INFO": ezpz_distributed.get_dist_info(),
         "ezpz_file": ezpz.__file__,
         "ezpz_version": getattr(ezpz, "__version__", "0.0"),
-        "hostname": ezpz.distributed.get_hostname(),
+        "hostname": ezpz_distributed.get_hostname(),
         "month": ezpz.utils.get_timestamp("%m"),
-        "machine": ezpz.distributed.get_machine(),
-        "pytorch_backend": str(ezpz.distributed.get_torch_backend()).lower(),
+        "machine": ezpz_distributed.get_machine(),
+        "pytorch_backend": str(ezpz_distributed.get_torch_backend()).lower(),
         "project": WBPROJ_NAME,
         "torch_version": torch.__version__,
         "torch_file": torch.__file__,
-        "world_size": str(ezpz.distributed.get_world_size()),
+        "world_size": str(ezpz_distributed.get_world_size()),
         "year": ezpz.utils.get_timestamp("%Y"),
         "working_directory": os.getcwd(),
     }
     _ = env_dict.pop("LS_COLORS", None)
     _ = env_dict.pop("PS1", None)
-    logger.info(f"Running on {ezpz.distributed.get_machine()=}")
+    logger.info(f"Running on {ezpz_distributed.get_machine()=}")
     # logger.info(f"environment={json.dumps(env_dict, indent=4, sort_keys=True)}")
 
     return env_dict
@@ -357,7 +357,7 @@ def _translate_legacy_args(args: list[str]) -> list[str]:
 
 
 def _ensure_rank_env() -> None:
-    os.environ.setdefault("LOCAL_RANK", str(ezpz.distributed.get_local_rank()))
+    os.environ.setdefault("LOCAL_RANK", str(ezpz_distributed.get_local_rank()))
     if is_initialized():
         os.environ.setdefault("RANK", str(get_rank()))
         os.environ.setdefault("WORLD_SIZE", str(get_world_size()))
@@ -411,9 +411,9 @@ def main(args: list[str] | None = None) -> None:
                 lambda *_args, **_kwargs: trainer.optimizers.update_hessian()
             )
 
-        if ezpz.distributed.get_rank() == 0 and ezpz.distributed.verify_wandb():
+        if ezpz_distributed.get_rank() == 0 and ezpz_distributed.verify_wandb():
             try:
-                run = ezpz.distributed.setup_wandb(
+                run = ezpz_distributed.setup_wandb(
                     project_name=WBPROJ_NAME,
                     settings={"console": "wrap"},
                 )
@@ -421,12 +421,12 @@ def main(args: list[str] | None = None) -> None:
                 wbconfig |= {"env": _update_env()}
                 wbconfig |= config.to_dict()
                 # wbconfig |= {"config": asdict(config)}
-                wbconfig |= {"dist": ezpz.distributed.get_dist_info()}
+                wbconfig |= {"dist": ezpz_distributed.get_dist_info()}
                 if run is not None:
                     run.config.update(wbconfig)
             except Exception as e:
                 logger.warning("Unable to update `wandb.run.config`, continuing!")
-                if ezpz.distributed.get_rank() == 0:
+                if ezpz_distributed.get_rank() == 0:
                     logger.exception(e)
 
         if config.checkpoint.create_seed_checkpoint:
@@ -456,6 +456,6 @@ def main(args: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    ezpz.distributed.setup_torch()
+    ezpz_distributed.setup_torch()
     _ensure_rank_env()
     main()

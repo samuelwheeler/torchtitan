@@ -6,8 +6,6 @@
 
 import ezpz
 
-import ezpz.distributed
-
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -36,6 +34,7 @@ from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
 from torchtitan.models.common.attention import FusedQKVLinear
+from torchtitan.experiments.ezpz._distributed_compat import ezpz_distributed
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -231,7 +230,7 @@ def apply_tp(
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
     force_sum_reduction = False
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        backend = ezpz.distributed.get_torch_backend() or str(torch.distributed.get_backend())
+        backend = ezpz_distributed.get_torch_backend() or str(torch.distributed.get_backend())
         if backend and "nccl" not in str(backend).lower():
             force_sum_reduction = True
 
@@ -297,6 +296,5 @@ def apply_fsdp(
 
     fully_shard(model, **fsdp_config)
     disable_fsdp_gradient_division(model)
-
 
 

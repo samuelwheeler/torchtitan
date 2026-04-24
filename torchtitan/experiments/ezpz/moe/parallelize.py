@@ -39,6 +39,7 @@ from torchtitan.distributed.activation_checkpoint import apply_ac
 
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
+from torchtitan.experiments.ezpz._distributed_compat import ezpz_distributed
 
 # from torchtitan.models.moe import DeepSeekV3Model
 from torchtitan.experiments.ezpz.moe import moeModel
@@ -58,7 +59,7 @@ from torchtitan.tools.logging import logger
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
     force_sum_reduction = False
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        backend = ezpz.distributed.get_torch_backend() or str(torch.distributed.get_backend())
+        backend = ezpz_distributed.get_torch_backend() or str(torch.distributed.get_backend())
         if backend and "nccl" not in str(backend).lower():
             force_sum_reduction = True
 

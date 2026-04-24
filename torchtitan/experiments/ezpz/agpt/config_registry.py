@@ -1,5 +1,4 @@
 import ezpz
-import ezpz.distributed
 import json
 import os
 from dataclasses import is_dataclass
@@ -12,6 +11,7 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ActivationCheckpointConfig, CommConfig, TrainingConfig
 from torchtitan.config.configs import CompileConfig
+from torchtitan.experiments.ezpz._distributed_compat import ezpz_distributed
 from torchtitan.experiments.ezpz.blendcorpus.blendcorpus_builder import (
     BlendCorpusDataLoader,
 )
@@ -82,7 +82,7 @@ def agpt(
     cfg.training.dtype = dtype
     cfg.dataloader.dataset = "blendcorpus"
     if dataset_path is None:
-        dataset_path = f"torchtitan/experiments/ezpz/data-lists/{ezpz.distributed.get_machine().lower()}/books.txt"
+        dataset_path = f"torchtitan/experiments/ezpz/data-lists/{ezpz_distributed.get_machine().lower()}/books.txt"
     cfg.dataloader.dataset_path = dataset_path
     cfg.metrics.log_freq = 1
     cfg.metrics.enable_wandb = True
@@ -148,7 +148,12 @@ def agpt_20b_flex_attn() -> FaultTolerantTrainer.Config:
 
 
 def ezpz_agpt_7b() -> FaultTolerantTrainer.Config:
-    return agpt("7b", local_batch_size=2, seq_len=4096, hf_assets_path="./assets/hf/llama-2-7b-hf")
+    return agpt(
+        "7b",
+        local_batch_size=2,
+        seq_len=4096,
+        hf_assets_path="./assets/hf/llama-2-7b-hf",
+    )
 
 
 def _load_json_overrides() -> dict[str, Any]:
