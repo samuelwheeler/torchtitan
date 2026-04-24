@@ -21,7 +21,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import Replicate
+from torch.distributed.tensor import DTensor, Replicate
 from torch.optim import Optimizer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
@@ -31,6 +31,7 @@ __all__ = [
     "OptimizersContainer",
     "OptimizersInBackwardContainer",
     "ParamGroupConfig",
+    "collect_moe_load_balancing_metrics",
     "register_moe_load_balancing_hook",
 ]
 
@@ -64,6 +65,106 @@ T = TypeVar("T", bound=Optimizer)
 
 # TODO: Right now this class is biased towards AdamW. We should refactor to
 # support mixed optimizers, including Muon.
+def _is_recomputation_enabled(module: nn.Module) -> bool:
+    return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+
+
+def _get_reduced_moe_tokens_per_expert_by_layer(
+    model_parts: list[nn.Module],
+    parallel_dims: ParallelDims,
+) -> list[tuple[str, torch.Tensor]]:
+    loss_mesh = parallel_dims.get_optional_mesh("loss")
+    layer_labels: list[str] = []
+    tokens_per_expert_list: list[torch.Tensor] = []
+
+    for model_part in model_parts:
+        layers = model_part.get_submodule("layers")
+        assert isinstance(layers, nn.ModuleDict)
+        for layer_name, transformer_block in layers.items():
+            if not getattr(transformer_block, "moe_enabled", False):
+                continue
+
+            moe = transformer_block.moe
+            tokens_per_expert = moe.tokens_per_expert
+            if _is_recomputation_enabled(transformer_block):
+                # Full activation checkpointing replays the MoE forward and doubles
+                # the routing counter unless we correct it before reporting.
+                tokens_per_expert = tokens_per_expert // 2
+
+            layer_id = getattr(transformer_block, "layer_id", None)
+            if isinstance(layer_id, int):
+                layer_label = f"layer_{layer_id}"
+            else:
+                layer_label = f"layer_{layer_name}"
+
+            layer_labels.append(layer_label)
+            tokens_per_expert_list.append(tokens_per_expert)
+
+    if not tokens_per_expert_list:
+        return []
+
+    tokens_per_expert_by_layer = torch.vstack(tokens_per_expert_list)
+
+    if loss_mesh is not None:
+        if isinstance(tokens_per_expert_by_layer, DTensor):
+            tokens_per_expert_by_layer = tokens_per_expert_by_layer.redistribute(
+                placements=[Replicate()] * tokens_per_expert_by_layer.device_mesh.ndim
+            ).to_local()
+        else:
+            pg = loss_mesh.get_group()
+            torch.distributed.all_reduce(
+                tokens_per_expert_by_layer,
+                group=pg,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+    elif isinstance(tokens_per_expert_by_layer, DTensor):
+        tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
+
+    return [
+        (layer_label, tokens_per_expert_by_layer[layer_idx].float())
+        for layer_idx, layer_label in enumerate(layer_labels)
+    ]
+
+
+def collect_moe_load_balancing_metrics(
+    model_parts: list[nn.Module],
+    parallel_dims: ParallelDims,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+
+    for layer_label, tokens_per_expert in _get_reduced_moe_tokens_per_expert_by_layer(
+        model_parts, parallel_dims
+    ):
+        total_assignments = tokens_per_expert.sum()
+        if total_assignments.item() <= 0:
+            metrics[f"moe/{layer_label}/maxvio"] = 0.0
+            metrics[f"moe/{layer_label}/dead_expert_proportion"] = 1.0
+            metrics[f"moe/{layer_label}/lowest_expert_token_proportion"] = 0.0
+            metrics[f"moe/{layer_label}/top_expert_token_proportion"] = 0.0
+            continue
+
+        ideal_assignments = total_assignments / tokens_per_expert.numel()
+        maxvio = (
+            torch.max(torch.abs(tokens_per_expert - ideal_assignments))
+            / ideal_assignments
+        )
+        dead_expert_proportion = (tokens_per_expert == 0).float().mean()
+        normalized_load = tokens_per_expert / total_assignments
+
+        metrics[f"moe/{layer_label}/maxvio"] = maxvio.item()
+        metrics[f"moe/{layer_label}/dead_expert_proportion"] = (
+            dead_expert_proportion.item()
+        )
+        metrics[f"moe/{layer_label}/lowest_expert_token_proportion"] = (
+            normalized_load.min().item()
+        )
+        metrics[f"moe/{layer_label}/top_expert_token_proportion"] = (
+            normalized_load.max().item()
+        )
+
+    return metrics
+
+
 class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
     """A container for multiple optimizers.
 
@@ -429,10 +530,6 @@ def register_moe_load_balancing_hook(
                     # pyrefly: ignore [missing-attribute]
                     return bool(transformer_block.moe.load_balance_coeff)
         return False
-
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
 
     def _update_expert_bias(
         model_parts: list[nn.Module],

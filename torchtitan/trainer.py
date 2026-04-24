@@ -24,6 +24,7 @@ from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import (
+    collect_moe_load_balancing_metrics,
     OptimizersContainer,
     OptimizersInBackwardContainer,
 )
@@ -239,6 +240,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             tokenizer=self.tokenizer,
             seq_len=config.training.seq_len,
             local_batch_size=config.training.local_batch_size,
+            global_batch_size=config.training.global_batch_size,
+            training_steps=config.training.steps,
+            parallel_dims=parallel_dims,
         )
 
         # build model (using meta init)
@@ -716,6 +720,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        should_log = self.metrics_processor.should_log(self.step)
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -762,6 +767,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
+        moe_extra_metrics = (
+            collect_moe_load_balancing_metrics(self.model_parts, parallel_dims)
+            if should_log
+            else {}
+        )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
@@ -770,7 +780,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        if not should_log:
             return
 
         if parallel_dims.dp_cp_enabled:
@@ -805,6 +815,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        extra_metrics.update(moe_extra_metrics)
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
