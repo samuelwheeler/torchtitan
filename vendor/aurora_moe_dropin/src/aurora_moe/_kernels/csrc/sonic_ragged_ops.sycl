@@ -1,0 +1,510 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact Sonic-style local MoE route layout for Aurora XPU.  All route arrays
+// have their true runtime extent; there is no [experts, max_rows, ...] buffer
+// or capacity-factor tail in this interface.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr size_t kThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+using AtomicCounter = sycl::atomic_ref<
+    int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+    sycl::access::address_space::global_space>;
+
+class RaggedCountKernel;
+class RaggedOffsetsKernel;
+class RaggedPackKernel;
+class RaggedGatherRowsKernel;
+class RaggedScatterRowsKernel;
+class RaggedWeightedScatterRowsKernel;
+class RaggedScatterScalarsKernel;
+class RaggedRouteGradKernel;
+class RaggedDownBackwardKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_bf16_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+void check_exact_map(const at::Tensor& grouped_to_source, int64_t routes,
+                     const at::Tensor& values, const char* values_name) {
+  check_i64_vector(grouped_to_source, "grouped_to_source");
+  TORCH_CHECK(grouped_to_source.numel() == routes,
+              "grouped_to_source must provide one entry per route");
+  TORCH_CHECK(values.device() == grouped_to_source.device(), values_name,
+              " and grouped_to_source must share an XPU device");
+}
+
+}  // namespace
+
+// This is the device-side equivalent of an expert sort plus gather.  Counting
+// and the single-work-item prefix scan establish exact expert segments.  An
+// atomic assigns only the relative order inside each segment, which is not a
+// mathematical part of the MoE contract and avoids sorting R route IDs.
+std::vector<at::Tensor> build_ragged_layout_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, int64_t num_experts) {
+  check_bf16_matrix(tokens, "tokens");
+  check_bf16_vector(scores, "scores");
+  check_i64_vector(local_ids, "local_ids");
+  TORCH_CHECK(num_experts > 0, "num_experts must be positive");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == local_ids.device(),
+              "tokens, scores, and local_ids must share an XPU device");
+  const int64_t routes = tokens.size(0);
+  const int64_t columns = tokens.size(1);
+  TORCH_CHECK(scores.numel() == routes && local_ids.numel() == routes,
+              "scores and local_ids must provide one entry per route");
+  TORCH_CHECK(routes <= std::numeric_limits<int32_t>::max(),
+              "ragged layout currently requires at most int32-max routes");
+
+  auto grouped_tokens = at::empty_like(tokens);
+  auto grouped_scores = at::empty_like(scores);
+  auto grouped_to_source = at::empty({routes}, tokens.options().dtype(at::kLong));
+  auto source_to_grouped = at::empty({routes}, tokens.options().dtype(at::kLong));
+  auto group_rows = at::zeros({num_experts}, tokens.options().dtype(at::kInt));
+  auto expert_offsets = at::empty(
+      {num_experts + 1}, tokens.options().dtype(at::kLong));
+  auto counters = at::zeros({num_experts}, tokens.options().dtype(at::kInt));
+  if (routes == 0) {
+    expert_offsets.zero_();
+    return {grouped_tokens, grouped_scores, grouped_to_source,
+            source_to_grouped, group_rows, expert_offsets};
+  }
+
+  const auto* ids = local_ids.data_ptr<int64_t>();
+  auto* rows = group_rows.data_ptr<int32_t>();
+  auto* offsets = expert_offsets.data_ptr<int64_t>();
+  auto* counters_ptr = counters.data_ptr<int32_t>();
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  auto* output = reinterpret_cast<bf16*>(grouped_tokens.data_ptr());
+  auto* output_scores = reinterpret_cast<bf16*>(grouped_scores.data_ptr());
+  auto* grouped_sources = grouped_to_source.data_ptr<int64_t>();
+  auto* source_groups = source_to_grouped.data_ptr<int64_t>();
+  auto& queue = current_queue(tokens);
+
+  const auto count_event = queue.parallel_for<RaggedCountKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        // Router construction owns this range invariant.  Keeping the fast
+        // path branch-free after this load is important for a hot route pack.
+        AtomicCounter(rows[ids[route]]).fetch_add(1);
+      });
+  const auto offsets_event = queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(count_event);
+    cgh.parallel_for<RaggedOffsetsKernel>(sycl::range<1>(1),
+                                          [=](sycl::id<1>) {
+      int64_t offset = 0;
+      offsets[0] = 0;
+      for (int64_t expert = 0; expert < num_experts; ++expert) {
+        offset += static_cast<int64_t>(rows[expert]);
+        offsets[expert + 1] = offset;
+      }
+    });
+  });
+
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(offsets_event);
+    sycl::local_accessor<int64_t, 1> grouped_slots(
+        sycl::range<1>(kRowsPerWorkgroup), cgh);
+    cgh.parallel_for<RaggedPackKernel>(
+        sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t base_route =
+              static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          if (lane < kRowsPerWorkgroup) {
+            const int64_t route = base_route + lane;
+            int64_t grouped_route = -1;
+            if (route < routes) {
+              const int64_t expert = ids[route];
+              const int32_t local_row =
+                  AtomicCounter(counters_ptr[expert]).fetch_add(1);
+              grouped_route = offsets[expert] + static_cast<int64_t>(local_row);
+              grouped_sources[grouped_route] = route;
+              source_groups[route] = grouped_route;
+            }
+            grouped_slots[lane] = grouped_route;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t route = base_route;
+               route < base_route + kRowsPerWorkgroup && route < routes;
+               ++route) {
+            const int64_t grouped_route = grouped_slots[route - base_route];
+            for (int64_t column = lane; column < columns;
+                 column += static_cast<int64_t>(kThreads)) {
+              output[grouped_route * columns + column] =
+                  input[route * columns + column];
+            }
+            if (lane == 0) {
+              output_scores[grouped_route] = input_scores[route];
+            }
+          }
+        });
+  });
+  return {grouped_tokens, grouped_scores, grouped_to_source,
+          source_to_grouped, group_rows, expert_offsets};
+}
+
+at::Tensor gather_source_rows_bf16(const at::Tensor& source_values,
+                                   const at::Tensor& grouped_to_source) {
+  check_bf16_matrix(source_values, "source_values");
+  const int64_t routes = grouped_to_source.numel();
+  check_exact_map(grouped_to_source, routes, source_values, "source_values");
+  TORCH_CHECK(source_values.size(0) == routes,
+              "exact ragged gather requires one source row per route");
+  const int64_t columns = source_values.size(1);
+  auto output = at::empty({routes, columns}, source_values.options());
+  if (routes == 0 || columns == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(source_values.data_ptr());
+  const auto* sources = grouped_to_source.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  current_queue(source_values).parallel_for<RaggedGatherRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t source = sources[route];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            out[route * columns + column] = input[source * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+at::Tensor scatter_grouped_rows_bf16(const at::Tensor& grouped_values,
+                                     const at::Tensor& grouped_to_source,
+                                     int64_t source_rows) {
+  check_bf16_matrix(grouped_values, "grouped_values");
+  const int64_t routes = grouped_values.size(0);
+  check_exact_map(grouped_to_source, routes, grouped_values, "grouped_values");
+  TORCH_CHECK(source_rows == routes,
+              "exact ragged scatter requires source_rows == route count");
+  const int64_t columns = grouped_values.size(1);
+  auto output = at::empty({source_rows, columns}, grouped_values.options());
+  if (routes == 0 || columns == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(grouped_values.data_ptr());
+  const auto* sources = grouped_to_source.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  current_queue(grouped_values).parallel_for<RaggedScatterRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t source = sources[route];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            out[source * columns + column] = input[route * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+at::Tensor weighted_scatter_grouped_rows_bf16(
+    const at::Tensor& grouped_values, const at::Tensor& grouped_scores,
+    const at::Tensor& grouped_to_source, int64_t source_rows) {
+  check_bf16_matrix(grouped_values, "grouped_values");
+  check_bf16_vector(grouped_scores, "grouped_scores");
+  const int64_t routes = grouped_values.size(0);
+  check_exact_map(grouped_to_source, routes, grouped_values, "grouped_values");
+  TORCH_CHECK(grouped_values.device() == grouped_scores.device() &&
+                  grouped_scores.numel() == routes,
+              "grouped values and scores must describe the same XPU routes");
+  TORCH_CHECK(source_rows == routes,
+              "exact ragged scatter requires source_rows == route count");
+  const int64_t columns = grouped_values.size(1);
+  auto output = at::empty({source_rows, columns}, grouped_values.options());
+  if (routes == 0 || columns == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(grouped_values.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(grouped_scores.data_ptr());
+  const auto* sources = grouped_to_source.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  current_queue(grouped_values).parallel_for<RaggedWeightedScatterRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t source = sources[route];
+          const float score = static_cast<float>(scores[route]);
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            out[source * columns + column] = bf16(
+                static_cast<float>(input[route * columns + column]) * score);
+          }
+        }
+      });
+  return output;
+}
+
+at::Tensor scatter_grouped_scalars_bf16(const at::Tensor& grouped_values,
+                                         const at::Tensor& grouped_to_source,
+                                         int64_t source_rows) {
+  check_bf16_vector(grouped_values, "grouped_values");
+  const int64_t routes = grouped_values.numel();
+  check_exact_map(grouped_to_source, routes, grouped_values, "grouped_values");
+  TORCH_CHECK(source_rows == routes,
+              "exact ragged scatter requires source_rows == route count");
+  auto output = at::empty({source_rows}, grouped_values.options());
+  if (routes == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(grouped_values.data_ptr());
+  const auto* sources = grouped_to_source.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(grouped_values).parallel_for<RaggedScatterScalarsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        out[sources[route]] = input[route];
+      });
+  return output;
+}
+
+// One workgroup per exact grouped route.  It gathers dO at the inverse map,
+// scales dO by the route score for the expert chain, and reduces dO·Y for the
+// router-score gradient without materializing a grouped dO buffer.
+std::vector<at::Tensor> ragged_route_grad_bf16(
+    const at::Tensor& grad_source, const at::Tensor& expert_values,
+    const at::Tensor& grouped_scores, const at::Tensor& grouped_to_source) {
+  check_bf16_matrix(grad_source, "grad_source");
+  check_bf16_matrix(expert_values, "expert_values");
+  check_bf16_vector(grouped_scores, "grouped_scores");
+  const int64_t routes = expert_values.size(0);
+  check_exact_map(grouped_to_source, routes, expert_values, "expert_values");
+  TORCH_CHECK(grad_source.device() == expert_values.device() &&
+                  grad_source.device() == grouped_scores.device() &&
+                  grad_source.sizes() == expert_values.sizes() &&
+                  grouped_scores.numel() == routes &&
+                  grad_source.size(0) == routes,
+              "ragged route-gradient tensors must share exact route shapes");
+  const int64_t columns = expert_values.size(1);
+  auto grad_values = at::empty_like(expert_values);
+  auto grad_scores = at::empty({routes}, expert_values.options());
+  if (routes == 0) {
+    return {grad_values, grad_scores};
+  }
+  if (columns == 0) {
+    return {grad_values, at::zeros({routes}, expert_values.options())};
+  }
+  const auto* grad_input = reinterpret_cast<const bf16*>(grad_source.data_ptr());
+  const auto* values = reinterpret_cast<const bf16*>(expert_values.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(grouped_scores.data_ptr());
+  const auto* sources = grouped_to_source.data_ptr<int64_t>();
+  auto* grad_out = reinterpret_cast<bf16*>(grad_values.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(grad_scores.data_ptr());
+  current_queue(grad_source).submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial(sycl::range<1>(kThreads), cgh);
+    cgh.parallel_for<RaggedRouteGradKernel>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(routes) * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t route = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          const int64_t source = sources[route];
+          const float score = static_cast<float>(scores[route]);
+          float dot = 0.0f;
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            const float grad = static_cast<float>(
+                grad_input[source * columns + column]);
+            const float value = static_cast<float>(
+                values[route * columns + column]);
+            grad_out[route * columns + column] = bf16(grad * score);
+            dot += grad * value;
+          }
+          partial[lane] = dot;
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t width = static_cast<int64_t>(kThreads) / 2; width > 0;
+               width /= 2) {
+            if (lane < width) {
+              partial[lane] += partial[lane + width];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+          if (lane == 0) {
+            score_out[route] = bf16(partial[0]);
+          }
+        });
+  });
+  return {grad_values, grad_scores};
+}
+
+// SonicMoE's down-projection backward reorders the score-gradient contraction:
+//
+//   dS = <dO, A W2> = <dO W2^T, A>.
+//
+// The caller has already formed ``down_input_grad = dO W2^T`` with a
+// variable-M grouped GEMM.  This one route-owned kernel creates the two
+// remaining expert-chain gradients, dY=dO*S and dA=down_input_grad*S, while
+// reducing dS directly against A.  It therefore avoids a second forward W2
+// GEMM solely to regenerate Y for the route-score derivative.
+std::vector<at::Tensor> ragged_down_backward_bf16(
+    const at::Tensor& grouped_grad_output,
+    const at::Tensor& down_input_grad_unscaled,
+    const at::Tensor& hidden,
+    const at::Tensor& grouped_scores) {
+  check_bf16_matrix(grouped_grad_output, "grouped_grad_output");
+  check_bf16_matrix(down_input_grad_unscaled, "down_input_grad_unscaled");
+  check_bf16_matrix(hidden, "hidden");
+  check_bf16_vector(grouped_scores, "grouped_scores");
+  const int64_t routes = grouped_grad_output.size(0);
+  TORCH_CHECK(down_input_grad_unscaled.size(0) == routes &&
+                  hidden.sizes() == down_input_grad_unscaled.sizes() &&
+                  grouped_scores.numel() == routes,
+              "Sonic down-backward tensors must share their exact route extent");
+  TORCH_CHECK(grouped_grad_output.device() == down_input_grad_unscaled.device() &&
+                  grouped_grad_output.device() == hidden.device() &&
+                  grouped_grad_output.device() == grouped_scores.device(),
+              "Sonic down-backward tensors must share an XPU device");
+
+  auto grad_values = at::empty_like(grouped_grad_output);
+  auto grad_hidden = at::empty_like(down_input_grad_unscaled);
+  auto grad_scores = at::empty({routes}, hidden.options());
+  if (routes == 0) {
+    return {grad_values, grad_hidden, grad_scores};
+  }
+
+  const int64_t output_columns = grouped_grad_output.size(1);
+  const int64_t hidden_columns = hidden.size(1);
+  const auto* grad_output =
+      reinterpret_cast<const bf16*>(grouped_grad_output.data_ptr());
+  const auto* down_input =
+      reinterpret_cast<const bf16*>(down_input_grad_unscaled.data_ptr());
+  const auto* activations = reinterpret_cast<const bf16*>(hidden.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(grouped_scores.data_ptr());
+  auto* grad_values_out = reinterpret_cast<bf16*>(grad_values.data_ptr());
+  auto* grad_hidden_out = reinterpret_cast<bf16*>(grad_hidden.data_ptr());
+  auto* grad_scores_out = reinterpret_cast<bf16*>(grad_scores.data_ptr());
+  current_queue(grouped_grad_output).submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial(sycl::range<1>(kThreads), cgh);
+    cgh.parallel_for<RaggedDownBackwardKernel>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(routes) * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t route = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          const float score = static_cast<float>(scores[route]);
+          for (int64_t column = lane; column < output_columns;
+               column += static_cast<int64_t>(kThreads)) {
+            const float value = static_cast<float>(
+                grad_output[route * output_columns + column]);
+            grad_values_out[route * output_columns + column] = bf16(value * score);
+          }
+          float dot = 0.0f;
+          for (int64_t column = lane; column < hidden_columns;
+               column += static_cast<int64_t>(kThreads)) {
+            const float value = static_cast<float>(
+                down_input[route * hidden_columns + column]);
+            const float activation = static_cast<float>(
+                activations[route * hidden_columns + column]);
+            grad_hidden_out[route * hidden_columns + column] = bf16(value * score);
+            dot += value * activation;
+          }
+          partial[lane] = dot;
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t width = static_cast<int64_t>(kThreads) / 2; width > 0;
+               width /= 2) {
+            if (lane < width) {
+              partial[lane] += partial[lane + width];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+          if (lane == 0) {
+            grad_scores_out[route] = bf16(partial[0]);
+          }
+        });
+  });
+  return {grad_values, grad_hidden, grad_scores};
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("build_ragged_layout_bf16", &aurora_moe::build_ragged_layout_bf16,
+             "Build exact Sonic-style ragged local-expert layout (XPU)");
+  module.def("gather_source_rows_bf16", &aurora_moe::gather_source_rows_bf16,
+             "Gather exact source rows into ragged grouped order (XPU)");
+  module.def("scatter_grouped_rows_bf16", &aurora_moe::scatter_grouped_rows_bf16,
+             "Scatter exact ragged grouped rows to source order (XPU)");
+  module.def("weighted_scatter_grouped_rows_bf16",
+             &aurora_moe::weighted_scatter_grouped_rows_bf16,
+             "Weight/scatter exact ragged grouped rows to source order (XPU)");
+  module.def("scatter_grouped_scalars_bf16",
+             &aurora_moe::scatter_grouped_scalars_bf16,
+             "Scatter exact ragged grouped scalars to source order (XPU)");
+  module.def("ragged_route_grad_bf16", &aurora_moe::ragged_route_grad_bf16,
+             "Fuse exact ragged dO gather, score scale, and dscore reduction (XPU)");
+  module.def("ragged_down_backward_bf16", &aurora_moe::ragged_down_backward_bf16,
+             "Fuse Sonic reordered down-projection backward pointwise work (XPU)");
+}

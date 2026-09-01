@@ -1,0 +1,234 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Raw oneMKL grouped-BF16 GEMM prototype for ragged MoE expert rows.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+#include <oneapi/mkl/blas.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using BFloat16 = oneapi::mkl::bfloat16;
+using Transpose = oneapi::mkl::transpose;
+
+struct LaunchMetadata {
+  // The pointer-array form of oneMKL's grouped GEMM is consumed by the GPU
+  // backend asynchronously.  Ordinary std::vector storage is host virtual
+  // memory, which PVC cannot dereference (and produced a NotPresent GPU
+  // fault).  Keep descriptor arrays in shared USM through the oneMKL event.
+  // The actual BF16 matrices remain PyTorch XPU allocations.
+  sycl::context context;
+  sycl::device device;
+  std::vector<void*> usm_allocations;
+  std::vector<Transpose> trans_a;
+  std::vector<Transpose> trans_b;
+  std::vector<int64_t> m;
+  std::vector<int64_t> n;
+  std::vector<int64_t> k;
+  std::vector<float> alpha;
+  std::vector<float> beta;
+  std::vector<const BFloat16*> a;
+  std::vector<const BFloat16*> b;
+  std::vector<BFloat16*> c;
+  std::vector<int64_t> lda;
+  std::vector<int64_t> ldb;
+  std::vector<int64_t> ldc;
+  std::vector<int64_t> group_size;
+  sycl::event event;
+
+  explicit LaunchMetadata(sycl::queue& queue)
+      : context(queue.get_context()), device(queue.get_device()) {}
+
+  ~LaunchMetadata() {
+    for (void* allocation : usm_allocations) {
+      if (allocation != nullptr) {
+        sycl::free(allocation, context);
+      }
+    }
+  }
+
+  template <class T>
+  T* copy_to_shared(const std::vector<T>& source) {
+    if (source.empty()) {
+      return nullptr;
+    }
+    auto* destination = sycl::malloc_shared<T>(source.size(), device, context);
+    TORCH_CHECK(destination != nullptr,
+                "failed to allocate oneMKL grouped-GEMM descriptor in shared USM");
+    std::copy(source.begin(), source.end(), destination);
+    usm_allocations.push_back(destination);
+    return destination;
+  }
+};
+
+std::mutex pending_mutex;
+std::vector<std::shared_ptr<LaunchMetadata>> pending_launches;
+
+void reap_completed_launches() {
+  std::lock_guard<std::mutex> lock(pending_mutex);
+  auto keep = pending_launches.begin();
+  for (auto it = pending_launches.begin(); it != pending_launches.end(); ++it) {
+    const auto status = (*it)->event.get_info<
+        sycl::info::event::command_execution_status>();
+    if (status != sycl::info::event_command_status::complete) {
+      *keep++ = std::move(*it);
+    }
+  }
+  pending_launches.erase(keep, pending_launches.end());
+}
+
+void retain_launch(std::shared_ptr<LaunchMetadata> launch) {
+  std::lock_guard<std::mutex> lock(pending_mutex);
+  pending_launches.push_back(std::move(launch));
+}
+
+void check_bf16_matrix_batch(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 3, name, " must have shape [experts, rows, columns]");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor grouped_gemm_bf16(const at::Tensor& activations,
+                             const at::Tensor& weights,
+                             const std::vector<int64_t>& group_rows) {
+  check_bf16_matrix_batch(activations, "activations");
+  check_bf16_matrix_batch(weights, "weights");
+  TORCH_CHECK(activations.device() == weights.device(),
+              "activations and weights must share an XPU device");
+  const int64_t experts = activations.size(0);
+  const int64_t max_rows = activations.size(1);
+  const int64_t k = activations.size(2);
+  const int64_t n = weights.size(2);
+  TORCH_CHECK(weights.size(0) == experts && weights.size(1) == k,
+              "weights must have shape [experts, activation_columns, output_columns]");
+  TORCH_CHECK(static_cast<int64_t>(group_rows.size()) == experts,
+              "group_rows must contain one host row count per expert");
+  TORCH_CHECK(k > 0 && n > 0, "K and N must be positive");
+
+  auto output = at::zeros({experts, max_rows, n}, activations.options());
+  if (experts == 0 || max_rows == 0) {
+    return output;
+  }
+
+  auto& queue = c10::xpu::getCurrentXPUStream(activations.get_device()).queue();
+  auto metadata = std::make_shared<LaunchMetadata>(queue);
+  metadata->trans_a.reserve(experts);
+  metadata->trans_b.reserve(experts);
+  metadata->m.reserve(experts);
+  metadata->n.reserve(experts);
+  metadata->k.reserve(experts);
+  metadata->alpha.reserve(experts);
+  metadata->beta.reserve(experts);
+  metadata->a.reserve(experts);
+  metadata->b.reserve(experts);
+  metadata->c.reserve(experts);
+  metadata->lda.reserve(experts);
+  metadata->ldb.reserve(experts);
+  metadata->ldc.reserve(experts);
+  metadata->group_size.reserve(experts);
+
+  std::map<int64_t, std::vector<int64_t>> experts_by_rows;
+  for (int64_t expert = 0; expert < experts; ++expert) {
+    const int64_t rows = group_rows[expert];
+    TORCH_CHECK(rows >= 0 && rows <= max_rows,
+                "each group_rows value must be in [0, activations.size(1)]");
+    if (rows == 0) {
+      continue;
+    }
+    experts_by_rows[rows].push_back(expert);
+  }
+  if (experts_by_rows.empty()) {
+    return output;
+  }
+
+  const auto* activation_ptr =
+      reinterpret_cast<const BFloat16*>(activations.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const BFloat16*>(weights.data_ptr());
+  auto* output_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+  for (const auto& [rows, group_experts] : experts_by_rows) {
+    metadata->trans_a.push_back(Transpose::nontrans);
+    metadata->trans_b.push_back(Transpose::nontrans);
+    metadata->m.push_back(rows);
+    metadata->n.push_back(n);
+    metadata->k.push_back(k);
+    metadata->alpha.push_back(1.0f);
+    metadata->beta.push_back(0.0f);
+    metadata->group_size.push_back(static_cast<int64_t>(group_experts.size()));
+    for (const int64_t expert : group_experts) {
+      metadata->a.push_back(activation_ptr + expert * max_rows * k);
+      metadata->b.push_back(weight_ptr + expert * k * n);
+      metadata->c.push_back(output_ptr + expert * max_rows * n);
+      metadata->lda.push_back(k);
+      metadata->ldb.push_back(n);
+      metadata->ldc.push_back(n);
+    }
+  }
+
+  // oneMKL's pointer-array grouped API requires descriptor arrays accessible
+  // to the GPU backend, rather than C++ host-vector memory.  Preserve every
+  // allocation until the returned event completes.
+  const auto* trans_a = metadata->copy_to_shared(metadata->trans_a);
+  const auto* trans_b = metadata->copy_to_shared(metadata->trans_b);
+  const auto* m = metadata->copy_to_shared(metadata->m);
+  const auto* n_values = metadata->copy_to_shared(metadata->n);
+  const auto* k_values = metadata->copy_to_shared(metadata->k);
+  const auto* alpha = metadata->copy_to_shared(metadata->alpha);
+  // oneMKL's legacy pointer-array signature takes mutable pointer-array
+  // storage (`const T**`), although it never writes the matrix pointers.
+  // Do not add a top-level const here: that changes the type to
+  // `const T * const *` and rejects the overload.
+  auto* a = metadata->copy_to_shared(metadata->a);
+  auto* b = metadata->copy_to_shared(metadata->b);
+  const auto* lda = metadata->copy_to_shared(metadata->lda);
+  const auto* ldb = metadata->copy_to_shared(metadata->ldb);
+  const auto* beta = metadata->copy_to_shared(metadata->beta);
+  auto* c = metadata->copy_to_shared(metadata->c);
+  const auto* ldc = metadata->copy_to_shared(metadata->ldc);
+  const auto* group_size = metadata->copy_to_shared(metadata->group_size);
+
+  reap_completed_launches();
+  // The current PyTorch XPU stream may be out of order.  Make the oneMKL
+  // launch wait for all producers already enqueued on it, without a host
+  // synchronization.
+  const auto producer_ready = queue.ext_oneapi_submit_barrier();
+  metadata->event = oneapi::mkl::blas::row_major::gemm_batch(
+      queue, trans_a, trans_b, m, n_values, k_values, alpha, a, lda, b, ldb, beta,
+      c, ldc, static_cast<int64_t>(metadata->m.size()), group_size,
+      {producer_ready});
+  // The shared-USM descriptor arrays and tensor storage remain live until the
+  // event completes.  The next launch reaps completed lists.
+  retain_launch(std::move(metadata));
+  return output;
+}
+
+int64_t reap_grouped_gemm_launches() {
+  reap_completed_launches();
+  std::lock_guard<std::mutex> lock(pending_mutex);
+  return static_cast<int64_t>(pending_launches.size());
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("grouped_gemm_bf16", &aurora_moe::grouped_gemm_bf16,
+             "Raw exact ragged grouped BF16 GEMM through oneMKL");
+  module.def("reap_grouped_gemm_launches", &aurora_moe::reap_grouped_gemm_launches,
+             "Reap completed oneMKL grouped GEMM metadata");
+}

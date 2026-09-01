@@ -78,11 +78,12 @@ class LocalTokenDispatcher(Configurable):
         # application) into a shared helper — it's duplicated in
         # AllToAllTokenDispatcher.dispatch.
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
+        # Keep routing counts integral.  Besides being the natural contract for
+        # repeat counts, bincount avoids the XPU histc path (which has caused
+        # stale/corrupt repeat_interleave sizes in long-running EP jobs).
+        num_tokens_per_expert = torch.bincount(
             selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+            minlength=self.num_experts,
         )
 
         # Reorder the token indices to match the order of the experts
@@ -239,11 +240,9 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         # application) into a shared helper — it's duplicated in
         # LocalTokenDispatcher.dispatch.
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
+        num_tokens_per_expert = torch.bincount(
             selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+            minlength=self.num_experts,
         )
 
         # Reorder the token indices to match the order of the experts
@@ -278,14 +277,22 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
             num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
                 num_tokens_per_expert_group
             )
-            # non_blocking=True is safe in eager, but under torch.compile the
-            # async D2H transfer can race with the subsequent .tolist()/.item()
-            # calls, producing stale values and failing unbacked-symint guards.
-            non_blocking = not torch.compiler.is_compiling()
+            # Preserve the tiny count vector in an ordinary allocator-owned
+            # tensor before launching the much larger payload collective.
+            # On Aurora, exhausting oneCCL's ZE IPC handle cache has been seen
+            # to overwrite/reuse the metadata receive allocation after its
+            # host split sums were already read.  The clone keeps shape-driving
+            # state independent of the following collective.
+            num_tokens_per_expert_group = num_tokens_per_expert_group.clone()
+            # Both split lists are consumed immediately by the variable-size
+            # all-to-all.  Aurora's XPU D2H copy is not ordered by a following
+            # Python ``tolist()`` in every eager path, so make both transfers
+            # blocking.  A stale split can allocate a routed buffer whose size
+            # disagrees with the device count tensor.
             input_splits = (
                 num_tokens_per_expert.view(ep_size, -1)
                 .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=non_blocking)
+                .to(torch.device("cpu"), non_blocking=False)
             )
             # NOTE: this would incur a device-to-host sync
             output_splits = (
@@ -342,7 +349,12 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         Output layout: (e0,r0), (e0,r1), ..., (e1,r0), (e1,r1), ...  (expert-major)
         """
         device = num_tokens_per_expert_group.device
-        total = num_tokens_per_expert_group.sum()
+        # The variable-size all-to-all already allocated this tensor from the
+        # host output-split list, so its first dimension is the authoritative,
+        # host-known routed-token total.  Passing it as output_size avoids the
+        # repeat_interleave implementation reading an asynchronous XPU scalar
+        # to construct an unbacked SymInt.
+        total = routed_input.shape[0]
 
         # [R, E] matrix of token counts per (rank, expert)
         t_mat = num_tokens_per_expert_group.view(ep_size, num_local_experts)
@@ -359,12 +371,12 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         # For each output position, find its input position:
         #   output[p] = input[input_starts[seg] + (p - output_starts[seg])]
         seg_ids = torch.arange(segment_lens.shape[0], device=device).repeat_interleave(
-            segment_lens
+            segment_lens, output_size=total
         )
         output_starts = segment_lens.cumsum(0) - segment_lens
         permuted_indices = (
             input_starts[seg_ids]
-            + torch.arange(total, device=device)
+            + torch.arange(seg_ids.shape[0], device=device)
             - output_starts[seg_ids]
         )
 

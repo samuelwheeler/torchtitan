@@ -19,6 +19,7 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed.fsdp import set_fsdp_gradient_sync
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
 from torchtitan.experiments.ft.manager import FTManager, maybe_semi_sync_training
 from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
@@ -399,7 +400,16 @@ class FaultTolerantTrainer(Trainer):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for microbatch_idx, (input_dict, labels) in enumerate(microbatches):
+            if (
+                self.gradient_accumulation_steps > 1
+                and parallel_dims.dp_cp_enabled
+                and not parallel_dims.pp_enabled
+            ):
+                set_fsdp_gradient_sync(
+                    self.model_parts,
+                    microbatch_idx == self.gradient_accumulation_steps - 1,
+                )
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):

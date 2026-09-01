@@ -12,6 +12,7 @@ from typing import Any, cast, TypeAlias
 import torch
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
+from torch.distributed.tensor import DTensor
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.metrics import MetricsProcessor
@@ -25,6 +26,28 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
 ValidationContext: TypeAlias = Callable[[], AbstractContextManager[None]]
+
+
+def _normalize_validation_loss(
+    local_loss_sum: torch.Tensor,
+    local_valid_tokens: torch.Tensor,
+    parallel_dims: ParallelDims,
+) -> float:
+    """Return token-normalized validation loss over all DP and CP ranks."""
+    if isinstance(local_loss_sum, DTensor):
+        local_loss_sum = local_loss_sum.full_tensor()
+
+    if parallel_dims.dp_cp_enabled:
+        loss_mesh = parallel_dims.get_mesh("loss")
+        global_loss_sum = dist_utils.dist_sum(local_loss_sum, loss_mesh)
+        global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, loss_mesh)
+    else:
+        global_loss_sum = float(local_loss_sum.item())
+        global_valid_tokens = float(local_valid_tokens.item())
+
+    if global_valid_tokens <= 0:
+        raise ValueError("Validation batch contains no valid tokens")
+    return global_loss_sum / global_valid_tokens
 
 
 class BaseValidator(Configurable):
@@ -233,6 +256,7 @@ class Validator(BaseValidator):
         parallel_dims = self.parallel_dims
 
         accumulated_losses = []
+        accumulated_valid_tokens = []
         device_type = utils.device_type
         num_steps = 0
 
@@ -262,15 +286,6 @@ class Validator(BaseValidator):
             # Count valid tokens for this batch
             local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=device_type)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
-
-            # All-reduce token count across DP ranks to get global token count
-            if parallel_dims.dp_enabled:
-                batch_mesh = parallel_dims.get_mesh("batch")
-                global_valid_tokens = dist_utils.dist_sum(
-                    local_valid_tokens, batch_mesh, None
-                )
-            else:
-                global_valid_tokens = local_valid_tokens.float()
 
             if parallel_dims.pp_enabled:
                 assert self.pp_schedule is not None
@@ -310,18 +325,18 @@ class Validator(BaseValidator):
                     predictions = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     loss_sum = self.loss_fn(predictions, labels)
 
-            accumulated_losses.append(loss_sum.detach() / global_valid_tokens)
+            accumulated_losses.append(loss_sum.detach())
+            accumulated_valid_tokens.append(local_valid_tokens)
             num_steps += 1
 
-        # Compute average loss
-        loss = torch.sum(torch.stack(accumulated_losses))
-        loss /= num_steps
-        if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_sum(
-                loss, parallel_dims.get_optional_mesh("loss")
-            )
-        else:
-            global_avg_loss = float(loss.item())
+        # Reduce both raw loss and valid-token totals over the same DP x CP
+        # loss mesh. This keeps CP shards from being normalized independently
+        # and correctly weights validation batches with different padding.
+        local_loss_sum = torch.sum(torch.stack(accumulated_losses))
+        local_valid_tokens = torch.sum(torch.stack(accumulated_valid_tokens))
+        global_avg_loss = _normalize_validation_loss(
+            local_loss_sum, local_valid_tokens, parallel_dims
+        )
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 

@@ -1,0 +1,349 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// PyTorch-stream wrapper around SYCL*TLA's PVC grouped-MoE GEMM building
+// blocks.  The included SYCL*TLA headers retain their own BSD-3-Clause
+// notices.  This wrapper intentionally takes all problem extents at runtime.
+// It must be compiled in the oneAPI compiler's default SYCL language mode.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <cute/tensor.hpp>
+#include <cute/util/compat.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/sycl.hpp>
+
+#include "cutlass/kernel_hardware_info.h"
+#include "moe_grouped_gemm.hpp"
+#include "moe_tile_scheduler.hpp"
+
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+
+#pragma clang diagnostic ignored "-Wpass-failed"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+namespace aurora_moe {
+
+namespace {
+
+using namespace cute;
+using namespace MoE;
+
+using Element = cutlass::bfloat16_t;
+using ProblemShape = MoE::ProblemShape;
+using TileScheduler = typename MoE::PersistentTileSchedulerXeMoE<ProblemShape>;
+using RasterOrderOptions = typename TileScheduler::RasterOrderOptions;
+
+// SYCL*TLA supports both explicit 2D-copy atom specializations and automatic
+// copy-atom selection.  Keep both kernel specializations available for an
+// on-device A/B comparison.  In particular, the automatic selection lets
+// SYCL*TLA choose a copy/store atom compatible with the active device/runtime.
+enum class TlaCopyAtomMode { Auto, Explicit };
+
+TlaCopyAtomMode tla_copy_atom_mode() {
+  const char* value = std::getenv("AURORA_MOE_TLA_COPY_ATOMS");
+  if (value == nullptr || std::strcmp(value, "auto") == 0) {
+    return TlaCopyAtomMode::Auto;
+  }
+  TORCH_CHECK(std::strcmp(value, "explicit") == 0,
+              "AURORA_MOE_TLA_COPY_ATOMS must be `auto` or `explicit`, got `",
+              value, "`");
+  return TlaCopyAtomMode::Explicit;
+}
+
+const char* tla_copy_atom_mode_name(TlaCopyAtomMode mode) {
+  return mode == TlaCopyAtomMode::Auto ? "auto" : "explicit";
+}
+
+class TlaGroupedGemmAutoKernel;
+class TlaGroupedGemmExplicitKernel;
+class TlaScratchGemmAutoKernel;
+class TlaScratchGemmExplicitKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+template <class TA, class TB>
+auto choose_tiled_mma(TA* a, TB* b) {
+  using TAType = cutlass::platform::remove_cv_t<TA>;
+  using TBType = cutlass::platform::remove_cv_t<TB>;
+  auto op = XE_DPAS_TT<8, float, TAType, TBType>{};
+  // A fixed tile is an implementation specialization only: M, N, K, number
+  // of groups, and each group's row count remain runtime values.
+  using WorkgroupTile = Shape<_256, _128, _32>;
+  using SubgroupLayout = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
+  using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>,
+                                      Layout<WorkgroupTile>,
+                                      SubgroupLayout>::TiledMMA;
+  return MMA{};
+}
+
+}  // namespace
+
+// a: [sum(group_rows), K], b: [groups, K, N], group_rows: [groups] int32.
+// Rows in a must be grouped contiguously by the corresponding expert.  This
+// matches the expert-sorted packing performed by the route kernels.
+at::Tensor grouped_gemm_bf16(const at::Tensor& a, const at::Tensor& b,
+                             const at::Tensor& group_rows) {
+  const auto copy_atom_mode = tla_copy_atom_mode();
+  check_xpu_contiguous(a, "a");
+  check_xpu_contiguous(b, "b");
+  check_xpu_contiguous(group_rows, "group_rows");
+  TORCH_CHECK(a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16,
+              "a and b must have dtype torch.bfloat16");
+  TORCH_CHECK(group_rows.scalar_type() == at::kInt,
+              "group_rows must have dtype torch.int32");
+  TORCH_CHECK(a.dim() == 2, "a must have shape [rows, K]");
+  TORCH_CHECK(b.dim() == 3, "b must have shape [groups, K, N]");
+  TORCH_CHECK(group_rows.dim() == 1, "group_rows must have shape [groups]");
+  TORCH_CHECK(a.device() == b.device() && a.device() == group_rows.device(),
+              "a, b, and group_rows must share an XPU device");
+  TORCH_CHECK(b.size(0) == group_rows.numel(),
+              "b.size(0) must equal group_rows.numel()");
+  TORCH_CHECK(a.size(1) == b.size(1), "a and b K dimensions must match");
+  TORCH_CHECK(a.size(1) > 0 && b.size(2) > 0,
+              "K and N must be positive");
+
+  const int64_t total_rows = a.size(0);
+  const int32_t groups = static_cast<int32_t>(b.size(0));
+  const int32_t k = static_cast<int32_t>(a.size(1));
+  const int32_t n = static_cast<int32_t>(b.size(2));
+  TORCH_CHECK(groups > 0, "at least one expert group is required");
+  auto output = at::empty({total_rows, n}, a.options());
+  if (total_rows == 0) {
+    return output;
+  }
+
+  auto* activations = reinterpret_cast<const Element*>(a.data_ptr());
+  auto* weights = reinterpret_cast<const Element*>(b.data_ptr());
+  auto* outputs = reinterpret_cast<Element*>(output.data_ptr());
+  auto* rows = group_rows.data_ptr<int32_t>();
+
+  const int device_id = a.get_device();
+  auto& queue = c10::xpu::getCurrentXPUStream(device_id).queue();
+  // SYCL*TLA's compatibility device manager owns a separate default queue.
+  // In a PyTorch process that queue need not describe PyTorch's selected XPU,
+  // which can yield a zero-sized persistent launch.  Query the actual current
+  // PyTorch stream's device instead.
+  const auto stream_device = queue.get_device();
+  const int slice_count = static_cast<int>(
+      stream_device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+      stream_device.get_info<
+          sycl::ext::intel::info::device::gpu_subslices_per_slice>());
+  TORCH_CHECK(slice_count > 0,
+              "the current PyTorch XPU stream reports no GPU slices");
+  cutlass::KernelHardwareInfo hardware{device_id, slice_count};
+  auto dummy_problem = cute::Shape<int, int, int>{1, k, n};
+  auto dummy_group_problem =
+      cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>{
+          1, &dummy_problem, nullptr};
+  using WorkgroupTile = cute::Shape<cute::_256, cute::_128, cute::_32>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  auto scheduler_params =
+      TileScheduler::to_underlying_arguments(
+          dummy_group_problem, WorkgroupTile{}, ClusterShape{}, hardware,
+          TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+  auto grid = TileScheduler::get_grid_shape(
+      scheduler_params, dummy_group_problem, WorkgroupTile{}, ClusterShape{},
+      hardware, TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+
+  auto mma = choose_tiled_mma(activations, weights);
+  const auto threads = cute::size(mma);
+  sycl::range<3> local{1, 1, static_cast<size_t>(threads)};
+  sycl::range<3> global{static_cast<size_t>(grid.z) * local[0],
+                        static_cast<size_t>(grid.y) * local[1],
+                        static_cast<size_t>(grid.x) * local[2]};
+
+  if (std::getenv("AURORA_MOE_TLA_DEBUG") != nullptr) {
+    std::cerr << "aurora_moe_tla launch device=" << device_id
+              << " slices=" << slice_count << " groups=" << groups
+              << " K=" << k << " N=" << n << " grid=" << grid.x << ","
+              << grid.y << "," << grid.z << " local=" << local[0] << ","
+              << local[1] << "," << local[2] << " global=" << global[0]
+              << "," << global[1] << "," << global[2]
+              << " copy_atoms=" << tla_copy_atom_mode_name(copy_atom_mode)
+              << std::endl;
+  }
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties properties{syclex::sub_group_size<16>,
+                                 intelex::grf_size<256>};
+  const bool debug_sentinel = std::getenv("AURORA_MOE_TLA_DEBUG") != nullptr;
+
+  if (copy_atom_mode == TlaCopyAtomMode::Auto) {
+    auto event = queue.parallel_for<TlaGroupedGemmAutoKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto item) {
+          // If no scheduler work is considered valid, this leaves a
+          // recognizable marker in the final output element.  A valid GEMM
+          // overwrites it.
+          if (debug_sentinel && item.get_group(0) == 0 &&
+              item.get_group(1) == 0 && item.get_group(2) == 0 &&
+              item.get_local_linear_id() == 0) {
+            // Store a small tail trace: a launch sentinel followed by the
+            // first few device-resident row counts.  This is overwritten by
+            // valid GEMM work and is only enabled for diagnostics.
+            const int64_t tail = total_rows * n - 1;
+            outputs[tail] = Element(1.0f);
+            for (int32_t expert = 0; expert < groups && expert < 7; ++expert) {
+              outputs[tail - 1 - expert] =
+                  Element(static_cast<float>(rows[expert]));
+            }
+            TileScheduler diagnostic_scheduler{
+                scheduler_params, const_cast<int32_t*>(rows), n, k, groups};
+            auto initial = diagnostic_scheduler.initial_work_tile_info(
+                cute::Shape<cute::_1, cute::_1, cute::_1>{});
+            outputs[tail - 8] = Element(initial.is_valid() ? 1.0f : 0.0f);
+            outputs[tail - 9] = Element(static_cast<float>(initial.M_idx));
+            outputs[tail - 10] = Element(static_cast<float>(initial.N_idx));
+            outputs[tail - 11] = Element(static_cast<float>(initial.L_idx));
+          }
+          // Let SYCL*TLA choose the 2D copy and store atoms for this device.
+          MoE::MoEGEMM<void, void, void, 'R', 'R', 'R'>(
+              activations, weights, static_cast<const void*>(nullptr), outputs,
+              mma, rows, groups, n, k, scheduler_params);
+        });
+    // Diagnostic mode keeps all launcher-local state alive until completion.
+    // The normal path remains asynchronous on PyTorch's current stream.
+    if (debug_sentinel) {
+      event.wait_and_throw();
+    }
+  } else {
+    auto event = queue.parallel_for<TlaGroupedGemmExplicitKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto item) {
+          // If no scheduler work is considered valid, this leaves a
+          // recognizable marker in the final output element.  A valid GEMM
+          // overwrites it.
+          if (debug_sentinel && item.get_group(0) == 0 &&
+              item.get_group(1) == 0 && item.get_group(2) == 0 &&
+              item.get_local_linear_id() == 0) {
+            // Store a small tail trace: a launch sentinel followed by the
+            // first few device-resident row counts.  This is overwritten by
+            // valid GEMM work and is only enabled for diagnostics.
+            const int64_t tail = total_rows * n - 1;
+            outputs[tail] = Element(1.0f);
+            for (int32_t expert = 0; expert < groups && expert < 7; ++expert) {
+              outputs[tail - 1 - expert] =
+                  Element(static_cast<float>(rows[expert]));
+            }
+            TileScheduler diagnostic_scheduler{
+                scheduler_params, const_cast<int32_t*>(rows), n, k, groups};
+            auto initial = diagnostic_scheduler.initial_work_tile_info(
+                cute::Shape<cute::_1, cute::_1, cute::_1>{});
+            outputs[tail - 8] = Element(initial.is_valid() ? 1.0f : 0.0f);
+            outputs[tail - 9] = Element(static_cast<float>(initial.M_idx));
+            outputs[tail - 10] = Element(static_cast<float>(initial.N_idx));
+            outputs[tail - 11] = Element(static_cast<float>(initial.L_idx));
+          }
+          MoE::MoEGEMM<cute::XE_LOAD_2D<16, 32, 32, 16>,
+                       cute::XE_LOAD_2D_VNNI<16, 32, 16, 16>,
+                       cute::XE_STORE_2D<16, 8, 32>, 'R', 'R', 'R'>(
+              activations, weights, static_cast<const void*>(nullptr), outputs,
+              mma, rows, groups, n, k, scheduler_params);
+        });
+    // Diagnostic mode keeps all launcher-local state alive until completion.
+    // The normal path remains asynchronous on PyTorch's current stream.
+    if (debug_sentinel) {
+      event.wait_and_throw();
+    }
+  }
+  return output;
+}
+
+// This is a boundary diagnostic: it exercises the exact TLA kernel through
+// the PyTorch extension, but gives it native SYCL USM allocations rather than
+// PyTorch allocator pointers.  It is intentionally small and synchronous.
+at::Tensor tla_scratch_probe(bool use_tla_default_queue) {
+  const auto copy_atom_mode = tla_copy_atom_mode();
+  constexpr int32_t m = 256;
+  constexpr int32_t k = 256;
+  constexpr int32_t n = 384;
+  auto queue = use_tla_default_queue
+                   ? compat::get_default_queue()
+                   : c10::xpu::getCurrentXPUStream(0).queue();
+  auto* a = sycl::malloc_device<Element>(static_cast<size_t>(m) * k, queue);
+  auto* b = sycl::malloc_device<Element>(static_cast<size_t>(k) * n, queue);
+  auto* d = sycl::malloc_device<Element>(static_cast<size_t>(m) * n, queue);
+  auto* rows = sycl::malloc_device<int32_t>(1, queue);
+  TORCH_CHECK(a != nullptr && b != nullptr && d != nullptr && rows != nullptr,
+              "SYCL USM allocation failed in TLA diagnostic");
+
+  queue.fill(a, Element(1.0f), static_cast<size_t>(m) * k);
+  queue.fill(b, Element(1.0f), static_cast<size_t>(k) * n);
+  queue.fill(d, Element(0.0f), static_cast<size_t>(m) * n);
+  queue.fill(rows, m, 1);
+  queue.wait_and_throw();
+
+  const auto device = queue.get_device();
+  const int slice_count = static_cast<int>(
+      device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+      device.get_info<
+          sycl::ext::intel::info::device::gpu_subslices_per_slice>());
+  cutlass::KernelHardwareInfo hardware{0, slice_count};
+  auto dummy_problem = cute::Shape<int, int, int>{1, k, n};
+  auto dummy_group_problem =
+      cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>{
+          1, &dummy_problem, nullptr};
+  using WorkgroupTile = cute::Shape<cute::_256, cute::_128, cute::_32>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  auto scheduler_params = TileScheduler::to_underlying_arguments(
+      dummy_group_problem, WorkgroupTile{}, ClusterShape{}, hardware,
+      TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+  auto grid = TileScheduler::get_grid_shape(
+      scheduler_params, dummy_group_problem, WorkgroupTile{}, ClusterShape{},
+      hardware, TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+  auto mma = choose_tiled_mma(a, b);
+  const auto threads = cute::size(mma);
+  sycl::range<3> local{1, 1, static_cast<size_t>(threads)};
+  sycl::range<3> global{static_cast<size_t>(grid.z) * local[0],
+                        static_cast<size_t>(grid.y) * local[1],
+                        static_cast<size_t>(grid.x) * local[2]};
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties properties{syclex::sub_group_size<16>,
+                                 intelex::grf_size<256>};
+  if (copy_atom_mode == TlaCopyAtomMode::Auto) {
+    queue.parallel_for<TlaScratchGemmAutoKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto) {
+          MoE::MoEGEMM<void, void, void, 'R', 'R', 'R'>(
+              a, b, static_cast<const void*>(nullptr), d, mma, rows, 1, n, k,
+              scheduler_params);
+        }).wait_and_throw();
+  } else {
+    queue.parallel_for<TlaScratchGemmExplicitKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto) {
+          MoE::MoEGEMM<cute::XE_LOAD_2D<16, 32, 32, 16>,
+                       cute::XE_LOAD_2D_VNNI<16, 32, 16, 16>,
+                       cute::XE_STORE_2D<16, 8, 32>, 'R', 'R', 'R'>(
+              a, b, static_cast<const void*>(nullptr), d, mma, rows, 1, n, k,
+              scheduler_params);
+        }).wait_and_throw();
+  }
+
+  auto host = at::empty({m, n},
+                        at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU));
+  queue.memcpy(host.data_ptr(), d, static_cast<size_t>(m) * n * sizeof(Element))
+      .wait_and_throw();
+  sycl::free(a, queue);
+  sycl::free(b, queue);
+  sycl::free(d, queue);
+  sycl::free(rows, queue);
+  return host;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("grouped_gemm_bf16", &aurora_moe::grouped_gemm_bf16,
+             "Grouped BF16 GEMM via SYCL*TLA on XPU");
+  module.def("tla_scratch_probe", &aurora_moe::tla_scratch_probe,
+             "TLA grouped GEMM using native SYCL allocations");
+}

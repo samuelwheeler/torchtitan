@@ -30,6 +30,7 @@ Differences vs upstream `parallelize_deepseekv3`:
   FSDP world size.
 """
 
+import os
 from typing import Any
 
 import ezpz
@@ -68,7 +69,57 @@ from torchtitan.distributed.tensor_parallel import (
     NoParallel,
 )
 from torchtitan.experiments.ezpz.moe import moeModel
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.tools.logging import logger
+
+
+def _use_ep_replicate_module(
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+) -> bool:
+    """Select node-local EP plus parameter-specific replicated DP.
+
+    ``dp_shard`` supplies the 12 ranks that are reshaped into the EP mesh; it
+    does not imply parameter sharding in this mode.  Shared parameters reduce
+    over the full batch mesh, while each EP expert shard reduces only over the
+    same local-tile coordinate on other nodes.
+    """
+
+    if not parallelism.enable_data_parallel_replicate_module:
+        return False
+    invalid = {
+        "tensor_parallel": parallel_dims.tp,
+        "pipeline_parallel": parallel_dims.pp,
+        "context_parallel": parallel_dims.cp,
+    }
+    invalid = {name: degree for name, degree in invalid.items() if degree != 1}
+    if invalid:
+        raise ValueError(
+            "MoE EP ReplicateModule initially requires TP=PP=CP=1, got "
+            f"{invalid}"
+        )
+    if parallel_dims.ep <= 1 or parallel_dims.dp_shard != parallel_dims.ep:
+        raise ValueError(
+            "MoE EP ReplicateModule requires expert_parallel_degree > 1 and "
+            "data_parallel_shard_degree == expert_parallel_degree"
+        )
+    if parallel_dims.dp_shard * parallel_dims.tp // parallel_dims.ep != 1:
+        raise ValueError("MoE EP ReplicateModule requires efsdp degree one")
+    if training.enable_cpu_offload:
+        raise ValueError("MoE EP ReplicateModule does not yet support CPU offload")
+    if parallelism.enable_fsdp_async_all_reduce:
+        raise ValueError(
+            "MoE EP ReplicateModule does not use the FSDP async-all-reduce path"
+        )
+    if (
+        parallelism.pipeline_parallel_fsdp_overlap
+        or parallelism.pipeline_parallel_fsdp_overlap_policy != "bulk"
+    ):
+        raise ValueError(
+            "MoE EP ReplicateModule requires the bulk pipeline overlap policy"
+        )
+    return True
 
 
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
@@ -130,6 +181,43 @@ def parallelize_moe(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
+    use_ep_replicate_module = _use_ep_replicate_module(
+        parallel_dims, training, parallelism
+    )
+    aurora_full_backends = {
+        getattr(
+            getattr(getattr(block, "moe", None), "experts", None),
+            "compute_backend",
+            None,
+        )
+        for block in model.layers.values()
+    } & {"aurora_full_loop", "aurora_full_sonic"}
+    uses_aurora_full_runtime = bool(aurora_full_backends)
+    if uses_aurora_full_runtime:
+        if parallel_dims.tp_enabled:
+            raise NotImplementedError(
+                "Aurora full MoE runtime does not yet support tensor parallelism"
+            )
+        if not parallel_dims.ep_enabled:
+            raise ValueError("Aurora full MoE runtime requires expert parallelism")
+        if training.mixed_precision_param != "bfloat16":
+            raise ValueError("Aurora full MoE runtime requires BF16 parameters")
+        for block in model.layers.values():
+            if not block.moe_enabled:
+                continue
+            if block.moe.experts.num_experts % parallel_dims.ep:
+                raise ValueError(
+                    f"num_experts ({block.moe.experts.num_experts}) must be "
+                    f"divisible by expert_parallel_degree ({parallel_dims.ep})"
+                )
+        if (
+            "aurora_full_sonic" in aurora_full_backends
+            and os.environ.get("AURORA_MOE_ALLTOALLV") != "1"
+        ):
+            raise RuntimeError(
+                "Aurora full Sonic requires AURORA_MOE_ALLTOALLV=1"
+            )
+
     # CP: wrap inner attention forward BEFORE parallelize() so CP logic
     # runs inside the local_map boundary on local tensors.
     if parallel_dims.cp_enabled:
@@ -142,6 +230,7 @@ def parallelize_moe(
         apply_cp_to_forward(
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
+            parallelism.context_parallel_rotate_method,
         )
 
     # TP via the config-based sharding API. The model's sharding_config
@@ -159,6 +248,7 @@ def parallelize_moe(
             model,
             tp_mesh=parallel_dims.get_optional_mesh("tp"),
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
+            enable_sp=parallelism.enable_sequence_parallel,
         )
 
     model_compile_enabled = (
@@ -166,11 +256,22 @@ def parallelize_moe(
     )
 
     if ac_config.mode != "none":
+        if uses_aurora_full_runtime and ac_config.mode != "selective":
+            raise ValueError(
+                "Aurora full MoE runtime requires selective attention-only "
+                "activation checkpointing"
+            )
         apply_ac(
             model,
             ac_config,
             model_compile_enabled=model_compile_enabled,
             base_folder=dump_folder,
+            # The optimized routed+shared runtime uses nested autograd to
+            # overlap its two backward branches. Wrapping the complete block
+            # makes selective AC attempt a second traversal of one cache.
+            # Checkpoint attention instead; keep dynamic MoE routing and its
+            # nested backward outside the checkpoint region.
+            checkpoint_submodule="attention" if uses_aurora_full_runtime else None,
         )
 
     if model_compile_enabled:
@@ -183,36 +284,53 @@ def parallelize_moe(
             block.compile(backend=compile_config.backend)
             model.layers.register_module(layer_id, block)
 
-    dp_mesh_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-
-    edp_mesh = None
-    if parallel_dims.ep_enabled:
-        edp_mesh_names = (
-            ["dp_replicate", "efsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["efsdp"]
+    if use_ep_replicate_module:
+        apply_ep_replicate(
+            model,
+            batch_mesh=parallel_dims.get_mesh("batch"),
+            expert_dp_mesh=parallel_dims.get_optional_mesh("dp_replicate"),
+            expert_mp_mesh=parallel_dims.get_mesh("efsdp"),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         )
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
-    apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=parallel_dims.ep,
-        edp_mesh=edp_mesh,
-    )
-
-    if parallel_dims.dp_replicate_enabled:
-        logger.info("Applied HSDP to the model")
+        logger.info(
+            "Applied node-local EP%d plus inter-node ReplicateModule DP%d",
+            parallel_dims.ep,
+            parallel_dims.dp_replicate,
+        )
     else:
-        logger.info("Applied FSDP to the model")
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+
+        edp_mesh = None
+        if parallel_dims.ep_enabled:
+            edp_mesh_names = (
+                ["dp_replicate", "efsdp"]
+                if parallel_dims.dp_replicate_enabled
+                else ["efsdp"]
+            )
+            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
+            edp_mesh=edp_mesh,
+        )
+
+        if parallel_dims.dp_replicate_enabled:
+            logger.info("Applied HSDP to the model")
+        else:
+            logger.info("Applied FSDP to the model")
 
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the model")
@@ -220,6 +338,76 @@ def parallelize_moe(
     logger.info(f"\n+{summarize_model(model)}")
 
     return model
+
+
+def apply_ep_replicate(
+    model: nn.Module,
+    *,
+    batch_mesh: DeviceMesh,
+    expert_dp_mesh: DeviceMesh | None,
+    expert_mp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+) -> None:
+    """Apply heterogeneous replicated DP to a node-local-EP MoE model.
+
+    Expert weights have already been sharded over EP by ``apply_moe_ep_tp``.
+    They reduce only over corresponding EP ranks on other nodes.  All other
+    parameters reduce over every independent input-data rank in ``batch``.
+
+    A one-node validation has no expert-DP collective.  A degree-one FSDP2
+    wrapper on the real ``efsdp`` mesh still materializes its local expert
+    shard in the requested mixed precision.
+    """
+
+    from torch.distributed._composable.replicate_with_fsdp import replicate
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        cast_forward_inputs=False,
+    )
+    config = {"mp_policy": mp_policy}
+
+    local_expert_counts = []
+    for transformer_block in model.layers.values():
+        if not transformer_block.moe_enabled:
+            continue
+        experts = transformer_block.moe.experts
+        expert_param = next(experts.parameters())
+        local_expert_counts.append(expert_param.to_local().shape[0])
+        if expert_dp_mesh is None:
+            fully_shard(experts, mesh=expert_mp_mesh, **config)
+        else:
+            replicate(experts, mesh=expert_dp_mesh, **config)
+
+    if not local_expert_counts or any(count <= 0 for count in local_expert_counts):
+        raise ValueError("EP ReplicateModule found no valid local routed experts")
+    if len(set(local_expert_counts)) != 1:
+        raise ValueError(
+            f"inconsistent local expert counts across layers: {local_expert_counts}"
+        )
+
+    shared_config = {"mesh": batch_mesh, **config}
+    if model.tok_embeddings is not None:
+        replicate(model.tok_embeddings, **shared_config)
+    for transformer_block in model.layers.values():
+        replicate(transformer_block, **shared_config)
+    if model.norm is not None and model.lm_head is not None:
+        replicate([model.norm, model.lm_head], **shared_config)
+    replicate(model, **shared_config)
+
+    disable_fsdp_gradient_division(model)
+    logger.info(
+        "EP ReplicateModule topology: batch_size=%d expert_dp_size=%d "
+        "expert_mp_size=%d local_experts=%d batch_ranks=%s expert_dp_ranks=%s",
+        batch_mesh.size(),
+        1 if expert_dp_mesh is None else expert_dp_mesh.size(),
+        expert_mp_mesh.size(),
+        local_expert_counts[0],
+        batch_mesh.mesh.tolist(),
+        None if expert_dp_mesh is None else expert_dp_mesh.mesh.tolist(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +591,7 @@ def apply_moe_ep_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh | None,
     ep_mesh: DeviceMesh | None,
+    enable_sp: bool = True,
 ):
     """Apply MoE expert/tensor parallelism plans to MoE-enabled blocks.
 
@@ -412,6 +601,7 @@ def apply_moe_ep_tp(
     handled internally by the LocalTokenDispatcher class at model build.
     """
     assert ep_mesh is not None or tp_mesh is not None
+    sp_layout = Shard(1) if enable_sp else Replicate()
 
     for transformer_block in model.layers.values():
         if not transformer_block.moe_enabled:
@@ -420,11 +610,12 @@ def apply_moe_ep_tp(
         if tp_mesh is not None:
             moe_layer_plan = {
                 "moe": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1),),
+                    input_layouts=(sp_layout,),
                     desired_input_layouts=(Replicate(),),
                     use_local_input=False,
                     output_layouts=(Partial(),),
-                    desired_output_layouts=(Shard(1),),
+                    desired_output_layouts=(sp_layout,),
+                    use_local_output=False,
                 ),
                 "moe.router.gate": NoParallel(
                     local_output_grad_placements=(Partial(),),
@@ -458,6 +649,12 @@ def apply_moe_ep_tp(
         else:
             experts_mesh = ep_mesh
             experts_plan = ExpertParallel()
+            dispatcher = transformer_block.moe.experts.token_dispatcher
+            if tp_mesh is not None and isinstance(
+                dispatcher, AllToAllTokenDispatcher
+            ):
+                dispatcher.sp_size = tp_mesh.size()
+                dispatcher.sp_rank = tp_mesh._sym_get_coordinate(0)
 
         parallelize_module(
             module=transformer_block.moe.experts,

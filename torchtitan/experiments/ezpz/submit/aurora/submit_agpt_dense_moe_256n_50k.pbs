@@ -1,0 +1,342 @@
+#!/bin/bash --login
+#PBS -A AuroraGPT
+#PBS -N CODEX_AGPT256
+#PBS -l select=256
+#PBS -l walltime=12:00:00
+#PBS -l filesystems=home:flare
+#PBS -l place=scatter
+#PBS -q prod
+#PBS -k doe
+#PBS -j oe
+
+set -eo pipefail
+module load oneapi/release/2025.3.1 hdf5 pti-gpu mpifileutils
+set -u
+
+ROOT=${TT_ROOT:-/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan}
+INPUT_DIR=${TT_INPUT_DIR:?missing frozen input directory}
+ARCHIVE_SHA=${TT_SOURCE_ARCHIVE_SHA256:?missing source archive hash}
+SNAPSHOT_ID=${TT_SNAPSHOT_ID:?missing snapshot ID}
+CASE=${TT_TRAIN_CASE:?missing dense or moe case}
+DATA_CACHE=${TT_DATA_CACHE_PATH:?missing validated BlendCorpus cache path}
+CASE_TIMEOUT=${TT_CASE_TIMEOUT:-39000}
+EXPECTED_STEPS=50000
+MOE_WARMUP_STEPS=${TT_MOE_WARMUP_STEPS:-0}
+MOE_WARMUP_TIMEOUT=${TT_MOE_WARMUP_TIMEOUT:-3000}
+MOE_EXPERT_GEMM=${TT_MOE_EXPERT_GEMM:-onemkl}
+MOE_EXPERT_DW=${TT_MOE_EXPERT_DW:-onemkl}
+MOE_L0_MIN_CAPACITY_ELEMENTS=${TT_MOE_L0_MIN_CAPACITY_ELEMENTS:-0}
+MOE_EP_TRANSPORT=${TT_MOE_EP_TRANSPORT:-xccl}
+MOE_PHASE_SHARED=${TT_MOE_PHASE_SHARED:-0}
+case "${MOE_WARMUP_STEPS}:${MOE_WARMUP_TIMEOUT}" in
+    *[!0-9:]*|:*|*::*|*:) echo "invalid numeric MoE warm-up setting" >&2; exit 2 ;;
+esac
+test "${MOE_WARMUP_TIMEOUT}" -gt 0
+case "${MOE_EP_TRANSPORT}:${MOE_PHASE_SHARED}" in
+    xccl:0|l0:0|l0:1) ;;
+    *) echo "unsupported MoE transport/phase setting ${MOE_EP_TRANSPORT}:${MOE_PHASE_SHARED}" >&2; exit 2 ;;
+esac
+case "${MOE_L0_MIN_CAPACITY_ELEMENTS}" in
+    ''|*[!0-9]*) echo "invalid L0 capacity ${MOE_L0_MIN_CAPACITY_ELEMENTS}" >&2; exit 2 ;;
+esac
+case "${MOE_EXPERT_GEMM}:${MOE_EXPERT_DW}" in
+    onemkl:onemkl|torch:torch) ;;
+    *) echo "unsupported expert backend pair ${MOE_EXPERT_GEMM}:${MOE_EXPERT_DW}" >&2; exit 2 ;;
+esac
+case "${CASE}" in
+    dense)
+        MODULE=ezpz.agpt
+        CONFIG=agpt_2b_50k_from_json
+        CONFIG_REL=torchtitan/experiments/ezpz/moe_runs/agpt_dense_2b_50k_hsdp256_50k.json
+        ;;
+    moe)
+        MODULE=ezpz.moe
+        CONFIG=agpt_2b_50k_moe_sdpa_aurora_full_sonic_from_json
+        CONFIG_REL=torchtitan/experiments/ezpz/moe_runs/agpt_moe_2b_50k_ep12_dp256_50k.json
+        ;;
+    *) echo "invalid TT_TRAIN_CASE=${CASE}" >&2; exit 2 ;;
+esac
+
+JOB_KEY=${PBS_JOBID%%.*}
+RUN_ROOT=${ROOT}/outputs/agpt_dense_moe_256n_50k/${SNAPSHOT_ID}/${CASE}
+JOB_OUT=${RUN_ROOT}/jobs/${JOB_KEY}
+TRAIN_OUT=${RUN_ROOT}/train
+SOURCE=${JOB_OUT}/source
+ARCHIVE=${INPUT_DIR}/source.tar.gz
+LOG=${JOB_OUT}/train.log
+mkdir -p "${JOB_OUT}" "${TRAIN_OUT}"
+PREEXISTING_CHECKPOINT=0
+if find "${TRAIN_OUT}/checkpoint" -mindepth 2 -maxdepth 2 \
+    -name .metadata -print -quit 2>/dev/null | grep -q .; then
+    PREEXISTING_CHECKPOINT=1
+fi
+if test -s "${TRAIN_OUT}/checkpoint/step-${EXPECTED_STEPS}/.metadata"; then
+    printf 'CASE_STATUS case=%s already_complete=1 step=%s output=%s\n' \
+        "${CASE}" "${EXPECTED_STEPS}" "${TRAIN_OUT}"
+    exit 0
+fi
+test "${DATA_CACHE}" = "$(realpath "${DATA_CACHE}")"
+test -d "${DATA_CACHE}"
+test "${INPUT_DIR}" = "$(realpath "${INPUT_DIR}")"
+test "$(sha256sum "${ARCHIVE}" | awk '{print $1}')" = "${ARCHIVE_SHA}"
+test ! -e "${SOURCE}"
+mkdir "${SOURCE}"
+tar -xzf "${ARCHIVE}" --no-same-owner -C "${SOURCE}"
+cp "${INPUT_DIR}/source.manifest.sha256" "${JOB_OUT}/source.manifest.sha256"
+
+NNODES=$(sort -u "${PBS_NODEFILE}" | wc -l)
+WORLD_SIZE=$((NNODES * 12))
+test "${NNODES}" -eq 256
+test "${WORLD_SIZE}" -eq 3072
+export WORLD_SIZE
+export NODE_VENV=/tmp/CODEX_AGPT256_${JOB_KEY}_venv
+export NODE_VENV_TAR=/tmp/CODEX_AGPT256_${JOB_KEY}_venv.tar.gz
+export VENV_TAR=${TT_VENV_TAR:-${ROOT}/.venv.tar.gz}
+export VENV_SHA=$(sha256sum "${VENV_TAR}" | awk '{print $1}')
+mpiexec --envall --np "${NNODES}" --ppn 1 --hostfile "${PBS_NODEFILE}" \
+    --no-vni --cpu-bind "list:2-9" bash -c '
+        set -euo pipefail
+        test ! -e "${NODE_VENV}"
+        test ! -e "${NODE_VENV}.partial"
+        test ! -e "${NODE_VENV_TAR}"
+    '
+mpiexec --envall --np "$((NNODES * 2))" --ppn 2 --hostfile "${PBS_NODEFILE}" \
+    --no-vni --cpu-bind "list:2-5:6-9" dbcast "${VENV_TAR}" "${NODE_VENV_TAR}"
+mpiexec --envall --np "${NNODES}" --ppn 1 --hostfile "${PBS_NODEFILE}" \
+    --no-vni --cpu-bind "list:2-9" bash -c '
+        set -euo pipefail
+        partial=${NODE_VENV}.partial
+        test "$(sha256sum "${NODE_VENV_TAR}" | awk '\''{print $1}'\'')" = "${VENV_SHA}"
+        mkdir "${partial}"
+        tar -xzf "${NODE_VENV_TAR}" --strip-components=1 -C "${partial}"
+        test -x "${partial}/bin/python3"
+        mv "${partial}" "${NODE_VENV}"
+        rm -f "${NODE_VENV_TAR}"
+    '
+export VIRTUAL_ENV=${NODE_VENV}
+export PATH=${VIRTUAL_ENV}/bin:${PATH}
+export PYTHONPATH=${SOURCE}:${SOURCE}/vendor/aurora_moe_dropin/src${PYTHONPATH:+:${PYTHONPATH}}
+export TT_CONFIG_JSON=${SOURCE}/${CONFIG_REL}
+hash -r
+
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export ONEAPI_DEVICE_SELECTOR="opencl:gpu;level_zero:gpu"
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=1800
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_CONFIGURATION_PATH=""
+export CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_OP_SYNC=1
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=100000
+export FI_MR_CACHE_MONITOR=userfaultfd
+export MPIR_CVAR_ENABLE_GPU=1
+export PYTHONUNBUFFERED=1
+export LOG_RANK=0
+unset TORCH_XCCL_BLOCKING_WAIT TORCH_XCCL_HIGH_PRIORITY
+
+if test "${CASE}" = moe; then
+    CACHE=${TT_MOE_KERNEL_CACHE:-${ROOT}/outputs/moe_full_runtime_tt_1layer/kernel_cache_py213}
+    export TORCH_EXTENSIONS_DIR=${CACHE}
+    export AURORA_MOE_SYCL_BUILD_DIR=${CACHE}
+    export AURORA_MOE_L0_IPC_BUILD_DIR=${CACHE}
+    export AURORA_MOE_L0_IPC_PREBUILT=1
+    export AURORA_MOE_ONE_MKL_EXACT_OPS_SO=${CACHE}/one_mkl_exact_expert/aurora_moe_one_mkl_exact_expert.so
+    export AURORA_MOE_SWIGLU_OPS_SO=${CACHE}/swiglu_ops/aurora_moe_swiglu_ops.so
+    export AURORA_MOE_EP_ROUTE_OPS_SO=${CACHE}/ep_route_ops/aurora_moe_ep_route_ops.so
+    export AURORA_MOE_SEGMENT_EXPERT_REORDER_OPS_SO=${CACHE}/segment_expert_reorder/aurora_moe_segment_expert_reorder.so
+    for so in "${AURORA_MOE_ONE_MKL_EXACT_OPS_SO}" "${AURORA_MOE_SWIGLU_OPS_SO}" \
+        "${AURORA_MOE_EP_ROUTE_OPS_SO}" "${AURORA_MOE_SEGMENT_EXPERT_REORDER_OPS_SO}"; do
+        test -s "${so}"
+    done
+    export AURORA_MOE_ALLTOALLV=1
+    export AURORA_MOE_SEGMENTED_SONIC=1
+    export AURORA_MOE_SEGMENTED_EXPERT_MAJOR=1
+    export AURORA_MOE_SEGMENTED_FUSED_SCORE_PAYLOAD=1
+    export AURORA_MOE_EXPERT_MAJOR_GEMM=${MOE_EXPERT_GEMM}
+    export AURORA_MOE_EXPERT_MAJOR_DW=${MOE_EXPERT_DW}
+    export AURORA_MOE_EXPERT_MAJOR_REORDER=row_parallel
+    export AURORA_MOE_EXPERT_MAJOR_DOWN_BACKWARD=reordered
+    export AURORA_MOE_SEGMENTED_POINTWISE=sycl
+    export AURORA_MOE_ONEMKL_FUSE_UP_GATE_DX=1
+    export AURORA_MOE_EXPERT_MAJOR_PACKED_UP_GATE=0
+    export AURORA_MOE_JOINT_ROUTED_SHARED_AUTOGRAD=1
+    if test "${MOE_EP_TRANSPORT}" = l0; then
+        for so in "${CACHE}"/level_zero_ipc*/aurora_moe_level_zero_ipc*.so; do
+            test -s "${so}"
+        done
+        export AURORA_MOE_L0_IPC_ALLTOALLV=1
+        export AURORA_MOE_L0_IPC_ALLTOALLV_CCL_TYPED_STORE=1
+        export AURORA_MOE_L0_IPC_ALLTOALLV_MIN_CAPACITY_ELEMENTS=${MOE_L0_MIN_CAPACITY_ELEMENTS}
+    else
+        unset AURORA_MOE_L0_IPC_ALLTOALLV
+        unset AURORA_MOE_L0_IPC_ALLTOALLV_CCL_TYPED_STORE
+        unset AURORA_MOE_L0_IPC_ALLTOALLV_MIN_CAPACITY_ELEMENTS
+    fi
+    if test "${MOE_PHASE_SHARED}" = 1; then
+        export AURORA_MOE_PHASE_SHARED_EXPERTS=1
+        export AURORA_MOE_PHASE_SHARED_FORWARD_REORDER=1
+        export AURORA_MOE_PHASE_SHARED_A4_SUBMIT_WAIT=1
+    else
+        unset AURORA_MOE_PHASE_SHARED_EXPERTS
+        unset AURORA_MOE_PHASE_SHARED_FORWARD_REORDER
+        unset AURORA_MOE_PHASE_SHARED_A4_SUBMIT_WAIT
+    fi
+fi
+
+DATA_LIST=${TT_DATA_LIST:-/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/torchtitan/experiments/ezpz/data-lists/aurora/dolma_v1_7_llama2_live.txt}
+TOKENIZER=${TT_TOKENIZER:-/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/assets/hf/llama-2-32k-sp/tokenizer.model}
+DATA_LIST_SHA=${TT_DATA_LIST_SHA256:-ded7678c8c94820d73ea654e98c47f4cc60d60d80bb3b70e1a5b1793c375be53}
+TOKENIZER_SHA=${TT_TOKENIZER_SHA256:-9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347}
+test "$(sha256sum "${DATA_LIST}" | awk '{print $1}')" = "${DATA_LIST_SHA}"
+test "$(sha256sum "${TOKENIZER}" | awk '{print $1}')" = "${TOKENIZER_SHA}"
+TOKENIZER_DIR=$(dirname "${TOKENIZER}")
+
+export MASTER_ADDR=$(head -n 1 "${PBS_NODEFILE}")
+export MASTER_PORT=29654
+CPU_BIND="verbose,list:2-4:10-12:18-20:26-28:34-36:42-44:54-56:62-64:70-72:78-80:86-88:94-96"
+printf 'AGPT_DM256 schema=1 case=%s nodes=256 tiles=3072 seq=2048 local_batch=1 global_batch=3072 tokens_per_step=6291456 steps=50000 total_tokens=314572800000 model_seed=20260722 data_seed=42 optimizer=AdamW_fused lr=2.2e-4 warmup=1000 checkpoint_interval=500 compile=0 CCL_OP_SYNC=%s snapshot=%s archive_sha256=%s output=%s\n' \
+    "${CASE}" "${CCL_OP_SYNC}" "${SNAPSHOT_ID}" "${ARCHIVE_SHA}" "${TRAIN_OUT}" | tee "${LOG}"
+printf 'AGPT_DM256_RUNTIME case_timeout_s=%s moe_warmup_steps=%s moe_warmup_timeout_s=%s moe_expert_gemm=%s moe_expert_dw=%s moe_ep_transport=%s moe_phase_shared=%s moe_l0_min_capacity_elements=%s data_cache=%s\n' \
+    "${CASE_TIMEOUT}" "${MOE_WARMUP_STEPS}" "${MOE_WARMUP_TIMEOUT}" \
+    "${MOE_EXPERT_GEMM}" "${MOE_EXPERT_DW}" "${MOE_EP_TRANSPORT}" "${MOE_PHASE_SHARED}" \
+    "${MOE_L0_MIN_CAPACITY_ELEMENTS}" "${DATA_CACHE}" | tee -a "${LOG}"
+cd "${SOURCE}"
+python3 -c "from torchtitan.experiments.ezpz.${MODULE#ezpz.}.config_registry import ${CONFIG}"
+
+# The optimized MoE path encounters cold oneMKL/SYCL expert shapes at runtime.
+# Exercise them on every allocated tile in an unmeasured process, then rebuild
+# all training state from the configured seeds and step 0 below.  A separate
+# dump folder ensures a continuation job cannot consume or create checkpoints
+# during warm-up.
+if test "${CASE}" = moe -a "${MOE_WARMUP_STEPS}" -gt 0; then
+    WARMUP_LOG=${JOB_OUT}/warmup.log
+    export MASTER_PORT=29653
+    if test "${MOE_EP_TRANSPORT}" = l0; then
+        export AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET=/tmp/CODEX_AGPT256_${JOB_KEY}_warmup
+    fi
+    export TORCHTITAN_REQUIRE_WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
+    unset WANDB_RUN_GROUP WANDB_RUN_NAME WANDB_RUN_ID WANDB_RUN_JOB_TYPE WANDB_RESUME
+    printf 'MOE_COLD_WARMUP_START steps=%s output=%s\n' \
+        "${MOE_WARMUP_STEPS}" "${JOB_OUT}/warmup" | tee "${WARMUP_LOG}"
+    set +e
+    timeout --foreground --kill-after=60s "${MOE_WARMUP_TIMEOUT}s" \
+        mpiexec --envall --np "${WORLD_SIZE}" --ppn 12 --hostfile "${PBS_NODEFILE}" \
+          --no-vni --cpu-bind "${CPU_BIND}" bash -c '
+            export RANK=${PALS_RANKID}
+            export LOCAL_RANK=${PALS_LOCAL_RANKID}
+            export LOCAL_WORLD_SIZE=${PALS_LOCAL_SIZE:-12}
+            python3 -u -m torchtitan.experiments.ezpz.train \
+              --module="$1" --config="$2" --dump-folder="$3" \
+              --dataloader.data-cache-path="$4" --training.steps="$5" \
+              --dataloader.dataset-path="$6" --hf-assets-path="$7" \
+              --metrics.no-enable_wandb --metrics.log-freq=1 \
+              --metrics.disable-color-printing --checkpoint.no-enable
+          ' bash "${MODULE}" "${CONFIG}" "${JOB_OUT}/warmup" "${DATA_CACHE}" \
+          "${MOE_WARMUP_STEPS}" "${DATA_LIST}" "${TOKENIZER_DIR}" \
+          2>&1 | tee -a "${WARMUP_LOG}"
+    warmup_rc=${PIPESTATUS[0]}
+    set -e
+    test "${warmup_rc}" -eq 0
+    grep -q 'Training completed' "${WARMUP_LOG}"
+    ! grep -q 'Traceback (most recent call last)' "${WARMUP_LOG}"
+    python3 - "${WARMUP_LOG}" "${MOE_WARMUP_STEPS}" <<'PY'
+import re
+import sys
+
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", open(sys.argv[1], errors="replace").read())
+steps = [int(value) for value in re.findall(r"step:\s*(\d+)", text)]
+assert steps and steps[-1] == int(sys.argv[2]), (steps[-5:], sys.argv[2])
+PY
+    printf 'MOE_COLD_WARMUP_STATUS rc=0 completed=1 steps=%s\n' \
+        "${MOE_WARMUP_STEPS}" | tee -a "${WARMUP_LOG}"
+fi
+
+export MASTER_PORT=29654
+if test "${CASE}" = moe -a "${MOE_EP_TRANSPORT}" = l0; then
+    export AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET=/tmp/CODEX_AGPT256_${JOB_KEY}_train
+else
+    unset AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET
+fi
+unset WANDB_MODE WANDB_DISABLED
+export TORCHTITAN_REQUIRE_WANDB=1
+export WANDB_PROJECT=${WANDB_PROJECT:-torchtitan.ezpz.train}
+export WANDB_RUN_GROUP=CODEX_AGPT_DM256_50K_${SNAPSHOT_ID}
+export WANDB_RUN_NAME=${WANDB_RUN_GROUP}_${CASE}
+export WANDB_RUN_ID=${WANDB_RUN_GROUP}-${CASE}
+export WANDB_RUN_JOB_TYPE=agpt_${CASE}_256n_50k
+export WANDB_RESUME=allow
+python3 - <<'PY'
+import wandb
+
+viewer = wandb.Api(timeout=60).viewer
+print(f"WANDB_PREFLIGHT version={wandb.__version__} user={viewer.username}", flush=True)
+PY
+printf 'CLEAN_TRAIN_START case=%s step_source=checkpoint_or_0 model_seed=20260722 data_seed=42\n' \
+    "${CASE}" | tee -a "${LOG}"
+set +e
+timeout --foreground --kill-after=60s "${CASE_TIMEOUT}s" \
+    mpiexec --envall --np "${WORLD_SIZE}" --ppn 12 --hostfile "${PBS_NODEFILE}" \
+      --no-vni --cpu-bind "${CPU_BIND}" bash -c '
+        export RANK=${PALS_RANKID}
+        export LOCAL_RANK=${PALS_LOCAL_RANKID}
+        export LOCAL_WORLD_SIZE=${PALS_LOCAL_SIZE:-12}
+        python3 -u -m torchtitan.experiments.ezpz.train \
+          --module="$1" --config="$2" --dump-folder="$3" \
+          --dataloader.data-cache-path="$4" --dataloader.dataset-path="$5" \
+          --hf-assets-path="$6" --metrics.disable-color-printing
+      ' bash "${MODULE}" "${CONFIG}" "${TRAIN_OUT}" "${DATA_CACHE}" \
+      "${DATA_LIST}" "${TOKENIZER_DIR}" 2>&1 | tee -a "${LOG}"
+rc=${PIPESTATUS[0]}
+set -e
+if test "${CASE}" = moe -a "${MOE_WARMUP_STEPS}" -gt 0 \
+    -a "${PREEXISTING_CHECKPOINT}" -eq 0; then
+    python3 - "${WARMUP_LOG}" "${LOG}" <<'PY'
+import re
+import sys
+
+ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+metric = re.compile(
+    r"step:\s*(\d+)\s+loss:\s*([0-9.eE+-]+)\s+grad_norm:\s*([0-9.eE+-]+)"
+)
+
+def read(path):
+    text = ansi.sub("", open(path, errors="replace").read())
+    return {int(step): (float(loss), float(grad)) for step, loss, grad in metric.findall(text)}
+
+warmup = read(sys.argv[1])
+training = read(sys.argv[2])
+common = sorted(set(warmup) & set(training))
+assert common and common[0] == 1, common
+max_loss = max(abs(warmup[step][0] - training[step][0]) for step in common)
+max_grad = max(abs(warmup[step][1] - training[step][1]) for step in common)
+assert max_loss <= 0.005, max_loss
+assert max_grad <= 0.05, max_grad
+print(
+    f"MOE_CLEAN_RESTART_CORRECTNESS common_steps={common} "
+    f"max_loss_delta={max_loss:.8g} max_grad_norm_delta={max_grad:.8g}",
+    flush=True,
+)
+PY
+elif test "${CASE}" = moe -a "${PREEXISTING_CHECKPOINT}" -eq 1; then
+    printf 'MOE_CLEAN_RESTART_CORRECTNESS skipped=checkpoint_resume\n' | tee -a "${LOG}"
+fi
+if test "${rc}" -eq 0; then
+    grep -q 'Training completed' "${LOG}"
+    grep -Eq 'step:[[:space:]]+50000([^0-9]|$)' "${LOG}"
+    printf 'CASE_STATUS case=%s rc=0 completed=1 step=50000 output=%s\n' \
+        "${CASE}" "${TRAIN_OUT}" | tee -a "${LOG}"
+elif test "${rc}" -eq 124; then
+    ! grep -Eq 'Traceback \(most recent call last\)|out of memory|AssertionError|CCL ERROR' "${LOG}"
+    latest=$(find "${TRAIN_OUT}/checkpoint" -mindepth 2 -maxdepth 2 \
+        -name .metadata -printf '%h\n' | sed 's|.*/step-||' | sort -n | tail -n 1)
+    test -n "${latest}"
+    test "${latest}" -ge 500
+    printf 'CASE_STATUS case=%s rc=124 completed=0 resumable=1 checkpoint_step=%s output=%s\n' \
+        "${CASE}" "${latest}" "${TRAIN_OUT}" | tee -a "${LOG}"
+else
+    printf 'CASE_STATUS case=%s rc=%s completed=0 resumable=0 output=%s\n' \
+        "${CASE}" "${rc}" "${TRAIN_OUT}" | tee -a "${LOG}"
+    exit "${rc}"
+fi

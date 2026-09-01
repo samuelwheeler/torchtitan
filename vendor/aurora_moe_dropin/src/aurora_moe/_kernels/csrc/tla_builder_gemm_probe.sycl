@@ -1,0 +1,149 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Isolated SYCL*TLA CollectiveBuilder GEMM discriminator.  This deliberately
+// does not replace the production diagnostic wrapper.  It exposes alpha and
+// beta plus an explicit C tensor so a failed run can be localized to the
+// epilogue/store path or the MMA mainloop.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/fusion/xe_callbacks.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/gemm/kernel/tile_scheduler.hpp>
+#include <cutlass/kernel_hardware_info.h>
+
+#include <sycl/sycl.hpp>
+
+#include <climits>
+#include <cstdint>
+
+#pragma clang diagnostic ignored "-Wpass-failed"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+namespace aurora_moe {
+namespace {
+
+using namespace cute;
+
+using Element = cutlass::bfloat16_t;
+using TileShape = Shape<_256, _256, _32>;
+using ClusterShape = Shape<_1, _1, _1>;
+using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp, TileShape,
+    ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, float,
+    float, Element, cutlass::layout::ColumnMajor, 8, Element,
+    cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::epilogue::fusion::LinearCombination<Element, float, Element,
+                                                 float>>::CollectiveOp;
+using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp, Element,
+    cutlass::layout::RowMajor, 8, Element, cutlass::layout::RowMajor, 8,
+    float, TileShape, ClusterShape, cutlass::gemm::collective::StageCountAuto,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>, Mainloop, Epilogue,
+    cutlass::gemm::PersistentScheduler>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2 && tensor.is_contiguous(), name,
+              " must be a contiguous rank-two tensor");
+}
+
+int stream_slice_count(sycl::queue& queue) {
+  const auto device = queue.get_device();
+  return static_cast<int>(
+      device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+      device.get_info<
+          sycl::ext::intel::info::device::gpu_subslices_per_slice>());
+}
+
+void record_current_stream(const at::Tensor& tensor) {
+  tensor.record_stream(
+      c10::xpu::getCurrentXPUStream(tensor.get_device()).unwrap());
+}
+
+}  // namespace
+
+at::Tensor builder_gemm_probe_bf16(const at::Tensor& a, const at::Tensor& b,
+                                   const at::Tensor& c, double alpha,
+                                   double beta) {
+  check_bf16_matrix(a, "a");
+  check_bf16_matrix(b, "b");
+  check_bf16_matrix(c, "c");
+  TORCH_CHECK(a.device() == b.device() && a.device() == c.device(),
+              "a, b, and c must share a device");
+  TORCH_CHECK(a.size(1) == b.size(0), "a and b K dimensions must match");
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(1);
+  TORCH_CHECK(c.size(0) == m && c.size(1) == n,
+              "c must have shape [M, N]");
+  TORCH_CHECK(m > 0 && n > 0 && k > 0, "M, N, and K must be positive");
+  TORCH_CHECK(m <= INT32_MAX && n <= INT32_MAX && k <= INT32_MAX,
+              "GEMM extent exceeds int32 range");
+
+  auto output = at::empty({m, n}, a.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(a.get_device()).queue();
+  const int slices = stream_slice_count(queue);
+  TORCH_CHECK(slices > 0, "the current XPU stream reports no GPU slices");
+  cutlass::KernelHardwareInfo hardware{a.get_device(), slices};
+  const auto* a_ptr = reinterpret_cast<const Element*>(a.data_ptr());
+  const auto* b_ptr = reinterpret_cast<const Element*>(b.data_ptr());
+  const auto* c_ptr = reinterpret_cast<const Element*>(c.data_ptr());
+  auto* d_ptr = reinterpret_cast<Element*>(output.data_ptr());
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1},
+      {a_ptr, {k, Int<1>{}, 0}, b_ptr, {Int<1>{}, n, 0}},
+      {{static_cast<float>(alpha), static_cast<float>(beta)}, c_ptr,
+       {Int<1>{}, m, 0}, d_ptr, {n, Int<1>{}, 0}},
+      hardware};
+  Gemm gemm;
+  const auto supported = gemm.can_implement(args);
+  TORCH_CHECK(supported == cutlass::Status::kSuccess,
+              "SYCL*TLA CollectiveBuilder GEMM cannot implement this shape, status ",
+              static_cast<int>(supported));
+  const size_t workspace_size = gemm.get_workspace_size(args);
+  auto workspace = workspace_size == 0
+                       ? at::Tensor{}
+                       : at::empty({static_cast<int64_t>(workspace_size)},
+                                   a.options().dtype(at::kByte));
+  void* workspace_ptr = workspace_size == 0 ? nullptr : workspace.data_ptr();
+  const auto initialized = gemm.initialize(args, workspace_ptr, &queue);
+  TORCH_CHECK(initialized == cutlass::Status::kSuccess,
+              "SYCL*TLA CollectiveBuilder GEMM initialization failed with status ",
+              static_cast<int>(initialized));
+  const auto launched = gemm(&queue);
+  TORCH_CHECK(launched == cutlass::Status::kSuccess,
+              "SYCL*TLA CollectiveBuilder GEMM launch failed with status ",
+              static_cast<int>(launched));
+  record_current_stream(a);
+  record_current_stream(b);
+  record_current_stream(c);
+  record_current_stream(output);
+  if (workspace_size != 0) {
+    record_current_stream(workspace);
+  }
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("builder_gemm_probe_bf16", &aurora_moe::builder_gemm_probe_bf16,
+             "Isolated SYCL*TLA CollectiveBuilder BF16 GEMM discriminator");
+}

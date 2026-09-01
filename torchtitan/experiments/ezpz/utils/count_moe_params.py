@@ -93,7 +93,17 @@ if __name__ == "__main__":
     )
     print(header)
     print("-" * len(header))
-    for name in ["debugmodel", "500M", "2B", "4B", "7B", "10B_2B"]:
+    for name in [
+        "debugmodel",
+        "500M",
+        "2B",
+        "4B",
+        "7B",
+        "10B_2B",
+        "10B_2B_50K_sdpa",
+        "10B_2B_50K_sdpa_for_loop",
+        "10B_2B_50K_sdpa_aurora_sycl",
+    ]:
         cfg = moe_configs[name]()
         t, a = count_params(name)
         num_e = 0

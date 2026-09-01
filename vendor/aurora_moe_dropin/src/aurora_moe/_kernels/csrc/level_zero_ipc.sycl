@@ -1,0 +1,345 @@
+// Minimal Level Zero IPC bridge for same-node XPU peer-copy diagnostics.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUFunctions.h>
+#include <c10/xpu/XPUStream.h>
+#include <level_zero/ze_api.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <limits>
+#include <optional>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+namespace py = pybind11;
+
+namespace aurora_moe {
+namespace {
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_ze(ze_result_t status, const char* operation) {
+  TORCH_CHECK(status == ZE_RESULT_SUCCESS, operation,
+              " failed with Level Zero status ", static_cast<int64_t>(status));
+}
+
+ze_context_handle_t ze_context() {
+  auto& context = c10::xpu::get_device_context();
+  return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context);
+}
+
+ze_device_handle_t ze_device(int device_index) {
+  c10::xpu::check_device_index(device_index);
+  auto& device = c10::xpu::get_raw_device(device_index);
+  return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device);
+}
+
+sycl::queue& current_queue(int device_index) {
+  return c10::xpu::getCurrentXPUStream(device_index).queue();
+}
+
+int64_t checked_i64(size_t value, const char* name) {
+  TORCH_CHECK(value <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+              name, " exceeds int64 range");
+  return static_cast<int64_t>(value);
+}
+
+int duplicate_fd_via_pidfd(int remote_pid, int remote_fd) {
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
+  TORCH_CHECK(remote_pid > 0,
+              "pidfd IPC import requires a positive exporter PID");
+  TORCH_CHECK(remote_fd >= 0,
+              "pidfd IPC import requires an exporter file descriptor embedded "
+              "in the Level Zero handle");
+  const int pidfd =
+      static_cast<int>(::syscall(SYS_pidfd_open, remote_pid, 0));
+  TORCH_CHECK(pidfd >= 0, "pidfd_open failed for exporter PID ", remote_pid,
+              ": ", std::strerror(errno));
+  const int duplicated =
+      static_cast<int>(::syscall(SYS_pidfd_getfd, pidfd, remote_fd, 0));
+  const int duplicate_errno = errno;
+  static_cast<void>(::close(pidfd));
+  TORCH_CHECK(duplicated >= 0, "pidfd_getfd failed for exporter PID ",
+              remote_pid, " file descriptor ", remote_fd, ": ",
+              std::strerror(duplicate_errno));
+  return duplicated;
+#else
+  TORCH_CHECK(false,
+              "this Linux build does not expose pidfd_open/pidfd_getfd syscalls");
+#endif
+}
+
+bool enable_pidfd_parent_tracer() {
+#if defined(PR_SET_PTRACER)
+  // Match oneCCL's narrow setup for its default pidfd exchange mode.  This
+  // permits the rank launcher parent to trace this rank when required by the
+  // system's Yama policy; it intentionally does not grant PR_SET_PTRACER_ANY.
+  return ::prctl(PR_SET_PTRACER, ::getppid(), 0, 0, 0) == 0;
+#else
+  return false;
+#endif
+}
+
+std::vector<at::Tensor> peer_access_matrix() {
+  const int count = c10::xpu::device_count_ensure_non_zero();
+  auto options = at::TensorOptions().device(at::kCPU).dtype(at::kLong);
+  auto access = at::empty({count, count}, options);
+  auto status = at::empty({count, count}, options);
+  auto* access_ptr = access.data_ptr<int64_t>();
+  auto* status_ptr = status.data_ptr<int64_t>();
+  std::vector<ze_device_handle_t> devices;
+  devices.reserve(count);
+  for (int index = 0; index < count; ++index) {
+    devices.push_back(ze_device(index));
+  }
+  for (int source = 0; source < count; ++source) {
+    for (int peer = 0; peer < count; ++peer) {
+      ze_bool_t can_access = 0;
+      const ze_result_t result =
+          zeDeviceCanAccessPeer(devices[source], devices[peer], &can_access);
+      const int offset = source * count + peer;
+      status_ptr[offset] = static_cast<int64_t>(result);
+      access_ptr[offset] =
+          result == ZE_RESULT_SUCCESS ? static_cast<int64_t>(can_access) : -1;
+    }
+  }
+  return {access, status};
+}
+
+class IpcExport {
+ public:
+  explicit IpcExport(const at::Tensor& tensor) : tensor_(tensor) {
+    check_xpu_contiguous(tensor_, "tensor");
+    device_index_ = tensor_.get_device();
+    void* base = nullptr;
+    size_t allocation_bytes = 0;
+    context_ = ze_context();
+    check_ze(zeMemGetAddressRange(context_, tensor_.data_ptr(), &base,
+                                  &allocation_bytes),
+             "zeMemGetAddressRange");
+    const auto base_address = reinterpret_cast<uintptr_t>(base);
+    const auto tensor_address = reinterpret_cast<uintptr_t>(tensor_.data_ptr());
+    TORCH_CHECK(tensor_address >= base_address,
+                "Level Zero allocation base is above the tensor pointer");
+    offset_bytes_ = tensor_address - base_address;
+    const size_t tensor_bytes =
+        static_cast<size_t>(tensor_.numel()) * tensor_.element_size();
+    TORCH_CHECK(offset_bytes_ <= allocation_bytes &&
+                    tensor_bytes <= allocation_bytes - offset_bytes_,
+                "tensor extent is outside its Level Zero allocation");
+    allocation_bytes_ = allocation_bytes;
+    check_ze(zeMemGetIpcHandle(context_, base, &handle_), "zeMemGetIpcHandle");
+    handle_live_ = true;
+    uint64_t raw_fd = 0;
+    check_ze(zeMemGetFileDescriptorFromIpcHandleExp(context_, handle_, &raw_fd),
+             "zeMemGetFileDescriptorFromIpcHandleExp");
+    TORCH_CHECK(raw_fd <= static_cast<uint64_t>(std::numeric_limits<int>::max()),
+                "Level Zero IPC file descriptor exceeds int range");
+    fd_ = static_cast<int>(raw_fd);
+  }
+
+  IpcExport(const IpcExport&) = delete;
+  IpcExport& operator=(const IpcExport&) = delete;
+
+  ~IpcExport() {
+    if (handle_live_) {
+      static_cast<void>(zeMemPutIpcHandle(context_, handle_));
+    }
+  }
+
+  int fd() const {
+    TORCH_CHECK(handle_live_, "IPC export is closed");
+    return fd_;
+  }
+
+  int64_t tensor_offset_bytes() const {
+    TORCH_CHECK(handle_live_, "IPC export is closed");
+    return checked_i64(offset_bytes_, "tensor offset");
+  }
+
+  int64_t allocation_bytes() const {
+    TORCH_CHECK(handle_live_, "IPC export is closed");
+    return checked_i64(allocation_bytes_, "allocation size");
+  }
+
+  py::bytes handle_bytes() const {
+    TORCH_CHECK(handle_live_, "IPC export is closed");
+    return py::bytes(handle_.data, ZE_MAX_IPC_HANDLE_SIZE);
+  }
+
+  void close() {
+    TORCH_CHECK(handle_live_, "IPC export is already closed");
+    check_ze(zeMemPutIpcHandle(context_, handle_), "zeMemPutIpcHandle");
+    handle_live_ = false;
+    tensor_ = at::Tensor();
+  }
+
+ private:
+  at::Tensor tensor_;
+  ze_context_handle_t context_{nullptr};
+  ze_ipc_mem_handle_t handle_{};
+  size_t offset_bytes_{0};
+  size_t allocation_bytes_{0};
+  int device_index_{-1};
+  int fd_{-1};
+  bool handle_live_{false};
+};
+
+class IpcImport {
+ public:
+  IpcImport(const py::bytes& handle_bytes,
+            int received_fd,
+            int device_index,
+            bool bias_uncached = false,
+            int remote_pid = -1,
+            bool use_pidfd = false,
+            int ipc_bias_flags = -1)
+      : device_index_(device_index), received_fd_(received_fd) {
+    c10::xpu::check_device_index(device_index_);
+    const std::string bytes = handle_bytes;
+    TORCH_CHECK(bytes.size() == ZE_MAX_IPC_HANDLE_SIZE,
+                "IPC handle has an unexpected byte count");
+    std::memcpy(handle_.data, bytes.data(), ZE_MAX_IPC_HANDLE_SIZE);
+    int exporter_fd = -1;
+    std::memcpy(&exporter_fd, handle_.data, sizeof(exporter_fd));
+    if (use_pidfd) {
+      // Unlike the default SCM_RIGHTS exchange, this follows the oneCCL
+      // pidfd route: duplicate the exporter-local FD encoded in the handle
+      // directly from the exporting rank, then patch the serialized handle
+      // with the receiver-local duplicate before opening it.
+      close_received_fd_noexcept();
+      received_fd_ = duplicate_fd_via_pidfd(remote_pid, exporter_fd);
+    }
+    TORCH_CHECK(received_fd_ >= 0 && ::fcntl(received_fd_, F_GETFD) >= 0,
+                "IPC import requires a valid receiver-local file descriptor");
+    // The serialized handle contains an FD number valid only in the exporter.
+    // Both SCM_RIGHTS and pidfd_getfd create a receiver-local duplicate.
+    std::memcpy(handle_.data, &received_fd_, sizeof(received_fd_));
+    context_ = ze_context();
+    const ze_ipc_memory_flags_t flags =
+        ipc_bias_flags >= 0
+            ? static_cast<ze_ipc_memory_flags_t>(ipc_bias_flags)
+            : (bias_uncached ? ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED
+                             : ZE_IPC_MEMORY_FLAG_BIAS_CACHED);
+    TORCH_CHECK(flags == 0 || flags == ZE_IPC_MEMORY_FLAG_BIAS_CACHED ||
+                    flags == ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED,
+                "IPC import bias flags must be Level Zero default (0), cached (1), "
+                "or uncached (2), got ", flags);
+    const ze_result_t status =
+        zeMemOpenIpcHandle(context_, ze_device(device_index_), handle_, flags, &mapping_);
+    if (status != ZE_RESULT_SUCCESS) {
+      close_received_fd_noexcept();
+      check_ze(status, "zeMemOpenIpcHandle");
+    }
+    mapping_live_ = true;
+  }
+
+  IpcImport(const IpcImport&) = delete;
+  IpcImport& operator=(const IpcImport&) = delete;
+
+  ~IpcImport() {
+    if (mapping_live_) {
+      static_cast<void>(zeMemCloseIpcHandle(context_, mapping_));
+    }
+    close_received_fd_noexcept();
+  }
+
+  void copy_to(const at::Tensor& destination, int64_t source_offset_bytes,
+               int64_t bytes) {
+    check_xpu_contiguous(destination, "destination");
+    TORCH_CHECK(mapping_live_, "IPC import is closed");
+    TORCH_CHECK(destination.get_device() == device_index_,
+                "destination does not use this IPC import's XPU device");
+    TORCH_CHECK(source_offset_bytes >= 0 && bytes >= 0,
+                "source offset and byte count must be nonnegative");
+    const size_t destination_bytes =
+        static_cast<size_t>(destination.numel()) * destination.element_size();
+    TORCH_CHECK(static_cast<uint64_t>(bytes) <= destination_bytes,
+                "peer copy exceeds destination tensor extent");
+    auto* source = static_cast<char*>(mapping_) + source_offset_bytes;
+    events_.push_back(current_queue(device_index_).memcpy(
+        destination.data_ptr(), source, static_cast<size_t>(bytes)));
+  }
+
+  void synchronize() {
+    TORCH_CHECK(mapping_live_, "IPC import is closed");
+    current_queue(device_index_).wait_and_throw();
+    events_.clear();
+  }
+
+  uint64_t mapping_address() const {
+    TORCH_CHECK(mapping_live_, "IPC import is closed");
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapping_));
+  }
+
+  void close() {
+    TORCH_CHECK(mapping_live_, "IPC import is already closed");
+    synchronize();
+    check_ze(zeMemCloseIpcHandle(context_, mapping_), "zeMemCloseIpcHandle");
+    mapping_live_ = false;
+    close_received_fd();
+  }
+
+ private:
+  void close_received_fd() {
+    const int fd = std::exchange(received_fd_, -1);
+    TORCH_CHECK(fd >= 0, "IPC import file descriptor is already closed");
+    TORCH_CHECK(::close(fd) == 0, "close failed for IPC import file descriptor");
+  }
+
+  void close_received_fd_noexcept() noexcept {
+    if (received_fd_ >= 0) {
+      static_cast<void>(::close(std::exchange(received_fd_, -1)));
+    }
+  }
+
+  ze_context_handle_t context_{nullptr};
+  ze_ipc_mem_handle_t handle_{};
+  void* mapping_{nullptr};
+  int device_index_{-1};
+  int received_fd_{-1};
+  bool mapping_live_{false};
+  std::vector<sycl::event> events_;
+};
+
+}  // namespace
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  using aurora_moe::IpcExport;
+  using aurora_moe::IpcImport;
+  module.def("peer_access_matrix", &aurora_moe::peer_access_matrix,
+             "Return Level Zero peer-access values and status codes");
+  module.def("enable_pidfd_parent_tracer", &aurora_moe::enable_pidfd_parent_tracer,
+             "Apply oneCCL's narrow parent-tracer setup for pidfd IPC");
+  py::class_<IpcExport>(module, "IpcExport")
+      .def(py::init<const at::Tensor&>())
+      .def("fd", &IpcExport::fd)
+      .def("tensor_offset_bytes", &IpcExport::tensor_offset_bytes)
+      .def("allocation_bytes", &IpcExport::allocation_bytes)
+      .def("handle_bytes", &IpcExport::handle_bytes)
+      .def("close", &IpcExport::close);
+  py::class_<IpcImport>(module, "IpcImport")
+      .def(py::init<const py::bytes&, int, int, bool, int, bool, int>(),
+           py::arg("handle_bytes"), py::arg("received_fd"),
+           py::arg("device_index"), py::arg("bias_uncached") = false,
+           py::arg("remote_pid") = -1, py::arg("use_pidfd") = false,
+           py::arg("ipc_bias_flags") = -1)
+      .def("copy_to", &IpcImport::copy_to)
+      .def("synchronize", &IpcImport::synchronize)
+      .def("mapping_address", &IpcImport::mapping_address)
+      .def("close", &IpcImport::close);
+}

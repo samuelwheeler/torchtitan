@@ -150,7 +150,7 @@ class WandBLogger(BaseLogger):
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
+            name=os.getenv("WANDB_RUN_NAME", os.getenv("WANDB_NAME", None)),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=os.getenv("WANDB_RUN_TAGS", None),
@@ -213,9 +213,7 @@ def ensure_pp_loss_visible(
         return
 
     # Calculate the rank where loss is visible (first rank of the last pipeline stage)
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
-    loss_visible_rank = (world_size // pp_size) * (pp_size - 1)
+    loss_visible_rank = parallel_dims.pipeline_last_stage_first_rank
 
     # Check if the loss-visible rank is included in LOG_RANK environment variable
     env_logged_ranks = os.environ.get("LOG_RANK", "").split(",")
@@ -252,10 +250,7 @@ def _get_metrics_rank(
     if pp_schedule == "ZBVZeroBubble":
         return 0
 
-    # Calculate first rank of the last pipeline stage
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
-    return (world_size // pp_size) * (pp_size - 1)
+    return parallel_dims.pipeline_last_stage_first_rank
 
 
 class MetricsProcessor(Configurable):
@@ -441,6 +436,10 @@ class MetricsProcessor(Configurable):
                     )
                 else:
                     logger.error(f"Failed to create WandB logger: {e}")
+                if os.getenv("TORCHTITAN_REQUIRE_WANDB") == "1":
+                    raise RuntimeError(
+                        "W&B logging is required for this run but initialization failed"
+                    ) from e
 
         if config.enable_tensorboard:
             logger.debug("Creating TensorBoard logger")

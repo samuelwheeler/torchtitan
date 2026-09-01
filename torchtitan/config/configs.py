@@ -57,14 +57,15 @@ class TrainingConfig:
     """
     torch dtype to use for parameters when applying mixed precision via fully_shard or torch.autocast.
     This feature takes effect via fully_shard when data_parallel_shard_degree > 1 or
-    context_parallel_degree > 1; it takes effect via torch.autocast when data_replicate_degree >= 1
-    and no other parallelism is enabled, i.e. under DDP or single-device training.
+    context_parallel_degree > 1. It takes effect via torch.autocast for native DDP
+    and for AGPT's explicit wrapper-free TP/PP control.
     """
 
-    mixed_precision_reduce: Literal["float32"] = "float32"
+    mixed_precision_reduce: Literal["bfloat16", "float32"] = "float32"
     """
-    torch dtype to use for reductions when applying mixed precision via FSDP.
-    This feature only takes effect when data_parallel_shard_degree > 1
+    torch dtype to use for reductions when applying mixed precision through
+    FSDP2/HSDP or ReplicateModule. Float32 is the conservative default;
+    bfloat16 is an opt-in communication-volume/performance tradeoff.
     """
 
     gc_freq: int = 50
@@ -104,6 +105,69 @@ class ParallelismConfig:
     only `data_parallel_shard_degree` can be negative. 1 means disabled.
     """
 
+    enable_data_parallel_replicate_module: bool = False
+    """
+    Use PyTorch's experimental FSDP2 ReplicateModule implementation. For AGPT
+    this selects pure replicated data parallelism. For MoE it selects
+    node-local EP plus parameter-specific replicated DP: routed experts reduce
+    across corresponding EP ranks on other nodes and shared parameters reduce
+    across the full batch mesh. The default keeps the fully_shard path.
+    """
+
+    enable_data_parallel_native_ddp: bool = False
+    """
+    Use native ``DistributedDataParallel`` for pure replicated AGPT data
+    parallelism. This experimental path keeps FP32 master parameters and
+    gradients. Its forward compute policy is selected separately below. It is
+    disabled by default and supports either no model parallelism or a guarded
+    one-stage-per-rank Schedule1F1B pipeline. TP, CP, EP, and outer gradient
+    accumulation remain unsupported.
+    """
+
+    disable_degree_one_fsdp: bool = False
+    """
+    Skip AGPT's degree-one FSDP2 wrappers when no data, context, or expert
+    parallelism is active. This is a default-off pure TP/PP control that keeps
+    FP32 master parameters and uses explicit BF16 autocast for model compute.
+    It is intentionally incompatible with CPU offload and every data-parallel
+    backend or pipeline-FSDP-overlap policy.
+    """
+
+    native_ddp_compute_policy: Literal[
+        "autocast",
+        "ddp_mixed_precision",
+        "ddp_mixed_precision_xpu_overlap",
+    ] = "autocast"
+    """
+    Native DDP forward/backward compute policy. ``autocast`` retains FP32
+    parameter storage during forward and is not dtype-equivalent to FSDP for
+    embeddings and residuals. ``ddp_mixed_precision`` uses DDP's experimental
+    BF16 parameter-copy path with FP32 gradient reduction and optimizer state.
+    ``ddp_mixed_precision_xpu_overlap`` keeps those dtype semantics but replaces
+    a blocking private PyTorch communication hook with a pinned-version XPU
+    stream implementation. It is experimental and rejected off the validated
+    Aurora software/environment combination.
+    """
+
+    native_ddp_bucket_cap_mb: float = 25.0
+    """Gradient bucket capacity for the native DDP backend, in MiB."""
+
+    native_ddp_bucketize_first_iteration: bool = False
+    """
+    Apply ``native_ddp_bucket_cap_mb`` when DDP constructs its initial
+    reduction buckets. By default PyTorch deliberately uses one whole-model
+    bucket on the first backward and rebuilds by gradient readiness afterward.
+    This option uses the pinned DDP ``bucket_cap_mb_list`` API to avoid that
+    initial full-model collective while retaining the normal later rebuild.
+    """
+
+    enable_fsdp_async_all_reduce: bool = False
+    """
+    Use an experimental nonblocking FSDP2 all-reduce for the replicated
+    dimension of AGPT DDP/HSDP. This is exact-PyTorch-version guarded and
+    currently limited to XPU float32 SUM reductions without CPU offload.
+    """
+
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """
     `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
@@ -136,6 +200,15 @@ class ParallelismConfig:
     Pipeline Parallelism degree, or number of ranks. 1 means disabled.
     If using looped schedules, this still specifies the number of physical ranks, not the number
     of stages. Stages per rank are inferred from split points degree, and schedule.
+    """
+
+    pipeline_parallel_mesh_order: Literal["pp_first", "dp_first"] = "pp_first"
+    """
+    Rank order used when constructing meshes that include pipeline parallelism.
+
+    ``pp_first`` preserves the default TorchTitan layout. ``dp_first`` places
+    all model-parallel ranks for one data-parallel replica contiguously, which
+    is useful when TP and PP should remain within a node while DP spans nodes.
     """
 
     module_fqns_per_model_part: list[list[str]] | None = None
@@ -176,6 +249,35 @@ class ParallelismConfig:
     and split_points = number of stages - 1
     """
 
+    pipeline_parallel_fsdp_overlap: bool = False
+    """
+    Enable layer-wise FSDP gradient communication during the final microbatch
+    backward of a 1F1B pipeline step. This avoids the default PyTorch pipeline
+    behavior that defers all FSDP gradient reductions until after backward.
+
+    This experimental path is limited to full-backward 1F1B schedules and one
+    pipeline schedule invocation per optimizer step.
+
+    Deprecated compatibility alias for
+    ``pipeline_parallel_fsdp_overlap_policy="deferred"``. New experiments
+    should use the explicit policy below.
+    """
+
+    pipeline_parallel_fsdp_overlap_policy: Literal[
+        "bulk", "deferred", "pp_first"
+    ] = "bulk"
+    """
+    Select FSDP2 gradient reduction placement for full-backward 1F1B. ``bulk``
+    retains PyTorch's default post-pipeline reduction. ``deferred`` is the
+    existing experiment that launches layer-wise reductions in every stage's
+    final microbatch backward and defers their waits. ``pp_first`` launches
+    layer-wise reductions only on stage zero; sending stages first submit the
+    final upstream gradient send, then launch data-parallel reduction.
+
+    Both experimental policies are exact-PyTorch-version guarded and require
+    one pipeline schedule invocation per optimizer step.
+    """
+
     pipeline_parallel_schedule_csv: str | None = ""
     """
     Specify the path to the pipeline parallel schedule csv file to use.
@@ -207,6 +309,11 @@ class ParallelismConfig:
             raise ValueError(
                 "context_parallel_load_balancer cannot be an empty string. "
                 "Use None to disable load balancing."
+            )
+        if self.context_parallel_rotate_method not in {"allgather", "alltoall"}:
+            raise ValueError(
+                "context_parallel_rotate_method must be 'allgather' or 'alltoall', "
+                f"got {self.context_parallel_rotate_method!r}"
             )
 
     context_parallel_rotate_method: Literal["allgather", "alltoall"] = "allgather"

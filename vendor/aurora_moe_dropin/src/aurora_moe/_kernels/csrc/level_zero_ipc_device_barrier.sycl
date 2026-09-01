@@ -1,0 +1,335 @@
+// Persistent Level Zero IPC control-counter barrier for isolated diagnostics.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+constexpr int64_t kSlots = 3;
+constexpr int64_t kCacheLineBytes = 64;
+constexpr int64_t kCounterStrideWords = kCacheLineBytes / sizeof(uint64_t);
+constexpr int64_t kMaxWorldSize = 256;
+// Aurora has at most twelve GPU tiles on a node.  This matches oneCCL's
+// host-captured peer-pointer representation without making the counter
+// protocol itself depend on a particular MoE configuration.
+constexpr int64_t kMaxNodeRanks = 12;
+constexpr int64_t kDiagnosticStampWord = 1;
+
+class IpcDeviceBarrierDeviceTableKernel;
+class IpcDeviceBarrierHostPointersKernel;
+class IpcDeviceBarrierArriveOnlyKernel;
+class IpcDeviceBarrierPointerStampKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+size_t work_group_size(int64_t world_size) {
+  size_t size = 32;
+  while (size < static_cast<size_t>(world_size)) {
+    size <<= 1;
+  }
+  TORCH_CHECK(size <= static_cast<size_t>(kMaxWorldSize),
+              "IPC device barrier world size exceeds one workgroup");
+  return size;
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+void check_local_counters(const at::Tensor& local_counters) {
+  check_xpu_contiguous(local_counters, "local_counters");
+  TORCH_CHECK(local_counters.scalar_type() == at::kLong,
+              "local_counters must have dtype torch.int64");
+  TORCH_CHECK(local_counters.dim() == 2 && local_counters.size(0) == kSlots &&
+                  local_counters.size(1) == kCounterStrideWords,
+              "local_counters must have shape [3, 8] with one counter per cache line");
+  const auto local_address = reinterpret_cast<uintptr_t>(local_counters.data_ptr());
+  TORCH_CHECK(local_address % kCacheLineBytes == 0,
+              "local_counters must start at a cache-line aligned address");
+}
+
+void check_world_size(int64_t world_size) {
+  TORCH_CHECK(world_size >= 2 && world_size <= kMaxWorldSize,
+              "world_size must be in [2, 256]");
+}
+
+std::array<uintptr_t, kMaxNodeRanks> host_pointer_array(
+    const std::vector<int64_t>& remote_counter_addresses,
+    const at::Tensor& local_counters,
+    int64_t world_size,
+    int64_t rank) {
+  check_world_size(world_size);
+  TORCH_CHECK(world_size <= kMaxNodeRanks,
+              "host-captured IPC pointer barriers support at most ",
+              kMaxNodeRanks, " ranks");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside world_size");
+  TORCH_CHECK(remote_counter_addresses.size() ==
+                  static_cast<size_t>(world_size),
+              "host pointer list must contain one pointer per rank");
+  std::array<uintptr_t, kMaxNodeRanks> pointers{};
+  for (int64_t index = 0; index < world_size; ++index) {
+    const auto address = static_cast<uintptr_t>(remote_counter_addresses[index]);
+    TORCH_CHECK(address % kCacheLineBytes == 0,
+                "host pointer list contains a non-cache-line-aligned address");
+    pointers[index] = address;
+  }
+  TORCH_CHECK(pointers[rank] ==
+                  reinterpret_cast<uintptr_t>(local_counters.data_ptr()),
+              "host pointer list self entry does not equal local control storage");
+  return pointers;
+}
+
+}  // namespace
+
+void enqueue_ipc_device_barrier(const at::Tensor& local_counters,
+                                const at::Tensor& remote_counter_ptrs,
+                                int64_t world_size,
+                                int64_t ordinal) {
+  check_local_counters(local_counters);
+  check_xpu_contiguous(remote_counter_ptrs, "remote_counter_ptrs");
+  TORCH_CHECK(remote_counter_ptrs.scalar_type() == at::kLong,
+              "remote_counter_ptrs must have dtype torch.int64");
+  TORCH_CHECK(local_counters.device() == remote_counter_ptrs.device(),
+              "local_counters and remote_counter_ptrs must share an XPU device");
+  TORCH_CHECK(remote_counter_ptrs.dim() == 1,
+              "remote_counter_ptrs must be rank 1");
+  check_world_size(world_size);
+  TORCH_CHECK(remote_counter_ptrs.numel() == world_size,
+              "remote_counter_ptrs must contain one pointer per rank");
+  TORCH_CHECK(ordinal >= 0, "ordinal must be nonnegative");
+
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(remote_counter_ptrs.data_ptr()) % alignof(int64_t) == 0,
+              "remote_counter_ptrs is not int64 aligned");
+
+  const uint64_t round = static_cast<uint64_t>(ordinal / kSlots) + 1;
+  TORCH_CHECK(round <= std::numeric_limits<uint64_t>::max() /
+                         static_cast<uint64_t>(world_size),
+              "ordinal would overflow the IPC barrier counter");
+  const uint64_t expected = round * static_cast<uint64_t>(world_size);
+  const int64_t slot = ordinal % kSlots;
+  const auto* remote_bases = remote_counter_ptrs.data_ptr<int64_t>();
+  auto* local_base = reinterpret_cast<uint64_t*>(local_counters.data_ptr<int64_t>());
+  const size_t local_size = work_group_size(world_size);
+  auto& queue = current_queue(local_counters);
+  const auto predecessor = queue.ext_oneapi_submit_barrier();
+
+  queue.submit([=](sycl::handler& handler) {
+    handler.depends_on(predecessor);
+    handler.parallel_for<IpcDeviceBarrierDeviceTableKernel>(
+        sycl::nd_range<1>(sycl::range<1>(local_size), sycl::range<1>(local_size)),
+        [=](sycl::nd_item<1> item) {
+          const size_t lane = item.get_local_linear_id();
+          // These counters are written through Level Zero IPC mappings on
+          // other tiles.  A device-scope fence is insufficient: SPIR-V
+          // Device scope does not formally cover the peer payload mappings.
+          sycl::atomic_fence(sycl::memory_order::release,
+                             sycl::memory_scope::system);
+          if (lane < static_cast<size_t>(world_size)) {
+            const uintptr_t base = static_cast<uintptr_t>(remote_bases[lane]);
+            auto* remote = reinterpret_cast<uint64_t*>(base);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                counter(remote[slot * kCounterStrideWords]);
+            counter.fetch_add(1, sycl::memory_order::release);
+          }
+
+          item.barrier(sycl::access::fence_space::global_and_local);
+
+          if (lane == 0) {
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                local_counter(local_base[slot * kCounterStrideWords]);
+            uint64_t observed = local_counter.load(sycl::memory_order::acquire);
+            while (observed < expected) {
+              observed = local_counter.load(sycl::memory_order::acquire);
+            }
+            sycl::atomic_fence(sycl::memory_order::acquire,
+                               sycl::memory_scope::system);
+          }
+
+          item.barrier(sycl::access::fence_space::global_and_local);
+        });
+  });
+}
+
+void enqueue_ipc_device_barrier_host_ptrs(
+    const at::Tensor& local_counters,
+    const std::vector<int64_t>& remote_counter_addresses,
+    int64_t world_size,
+    int64_t rank,
+    int64_t ordinal) {
+  check_local_counters(local_counters);
+  TORCH_CHECK(ordinal >= 0, "ordinal must be nonnegative");
+  const auto remote_bases = host_pointer_array(remote_counter_addresses,
+                                                local_counters,
+                                                world_size,
+                                                rank);
+  const uint64_t round = static_cast<uint64_t>(ordinal / kSlots) + 1;
+  TORCH_CHECK(round <= std::numeric_limits<uint64_t>::max() /
+                         static_cast<uint64_t>(world_size),
+              "ordinal would overflow the IPC barrier counter");
+  const uint64_t expected = round * static_cast<uint64_t>(world_size);
+  const int64_t slot = ordinal % kSlots;
+  const size_t local_size = work_group_size(world_size);
+  auto& queue = current_queue(local_counters);
+  const auto predecessor = queue.ext_oneapi_submit_barrier();
+
+  queue.submit([=](sycl::handler& handler) {
+    handler.depends_on(predecessor);
+    handler.parallel_for<IpcDeviceBarrierHostPointersKernel>(
+        sycl::nd_range<1>(sycl::range<1>(local_size), sycl::range<1>(local_size)),
+        [=](sycl::nd_item<1> item) {
+          const size_t lane = item.get_local_linear_id();
+          sycl::atomic_fence(sycl::memory_order::release,
+                             sycl::memory_scope::system);
+          if (lane < static_cast<size_t>(world_size)) {
+            auto* remote = reinterpret_cast<uint64_t*>(remote_bases[lane]);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                counter(remote[slot * kCounterStrideWords]);
+            counter.fetch_add(1, sycl::memory_order::release);
+          }
+
+          item.barrier(sycl::access::fence_space::global_and_local);
+
+          if (lane == 0) {
+            auto* self = reinterpret_cast<uint64_t*>(remote_bases[rank]);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                local_counter(self[slot * kCounterStrideWords]);
+            uint64_t observed = local_counter.load(sycl::memory_order::acquire);
+            while (observed < expected) {
+              observed = local_counter.load(sycl::memory_order::acquire);
+            }
+            sycl::atomic_fence(sycl::memory_order::acquire,
+                               sycl::memory_scope::system);
+          }
+
+          item.barrier(sycl::access::fence_space::global_and_local);
+        });
+  });
+}
+
+void enqueue_ipc_device_barrier_arrive_only(const at::Tensor& local_counters,
+                                             const at::Tensor& remote_counter_ptrs,
+                                             int64_t world_size,
+                                             int64_t slot) {
+  check_local_counters(local_counters);
+  check_xpu_contiguous(remote_counter_ptrs, "remote_counter_ptrs");
+  TORCH_CHECK(remote_counter_ptrs.scalar_type() == at::kLong,
+              "remote_counter_ptrs must have dtype torch.int64");
+  TORCH_CHECK(local_counters.device() == remote_counter_ptrs.device(),
+              "local_counters and remote_counter_ptrs must share an XPU device");
+  TORCH_CHECK(remote_counter_ptrs.dim() == 1 &&
+                  remote_counter_ptrs.numel() == world_size,
+              "remote_counter_ptrs must contain one pointer per rank");
+  check_world_size(world_size);
+  TORCH_CHECK(slot >= 0 && slot < kSlots, "slot is outside the three-slot protocol");
+
+  const auto* remote_bases = remote_counter_ptrs.data_ptr<int64_t>();
+  const size_t local_size = work_group_size(world_size);
+  auto& queue = current_queue(local_counters);
+  const auto predecessor = queue.ext_oneapi_submit_barrier();
+  queue.submit([=](sycl::handler& handler) {
+    handler.depends_on(predecessor);
+    handler.parallel_for<IpcDeviceBarrierArriveOnlyKernel>(
+        sycl::nd_range<1>(sycl::range<1>(local_size), sycl::range<1>(local_size)),
+        [=](sycl::nd_item<1> item) {
+          const size_t lane = item.get_local_linear_id();
+          sycl::atomic_fence(sycl::memory_order::release,
+                             sycl::memory_scope::system);
+          if (lane < static_cast<size_t>(world_size)) {
+            const uintptr_t base = static_cast<uintptr_t>(remote_bases[lane]);
+            auto* remote = reinterpret_cast<uint64_t*>(base);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                counter(remote[slot * kCounterStrideWords]);
+            counter.fetch_add(1, sycl::memory_order::release);
+          }
+        });
+  });
+}
+
+void stamp_ipc_device_barrier_device_ptrs(const at::Tensor& local_counters,
+                                          const at::Tensor& remote_counter_ptrs,
+                                          int64_t world_size,
+                                          bool active,
+                                          int64_t stamp) {
+  check_local_counters(local_counters);
+  check_xpu_contiguous(remote_counter_ptrs, "remote_counter_ptrs");
+  TORCH_CHECK(remote_counter_ptrs.scalar_type() == at::kLong,
+              "remote_counter_ptrs must have dtype torch.int64");
+  TORCH_CHECK(local_counters.device() == remote_counter_ptrs.device(),
+              "local_counters and remote_counter_ptrs must share an XPU device");
+  TORCH_CHECK(remote_counter_ptrs.dim() == 1 &&
+                  remote_counter_ptrs.numel() == world_size,
+              "remote_counter_ptrs must contain one pointer per rank");
+  check_world_size(world_size);
+  TORCH_CHECK(stamp > 0, "diagnostic stamp must be positive");
+
+  const auto* remote_bases = remote_counter_ptrs.data_ptr<int64_t>();
+  const size_t local_size = work_group_size(world_size);
+  const uint64_t value = static_cast<uint64_t>(stamp);
+  auto& queue = current_queue(local_counters);
+  const auto predecessor = queue.ext_oneapi_submit_barrier();
+  queue.submit([=](sycl::handler& handler) {
+    handler.depends_on(predecessor);
+    handler.parallel_for<IpcDeviceBarrierPointerStampKernel>(
+        sycl::nd_range<1>(sycl::range<1>(local_size), sycl::range<1>(local_size)),
+        [=](sycl::nd_item<1> item) {
+          const size_t lane = item.get_local_linear_id();
+          sycl::atomic_fence(sycl::memory_order::release,
+                             sycl::memory_scope::system);
+          if (active && lane < static_cast<size_t>(world_size)) {
+            const uintptr_t base = static_cast<uintptr_t>(remote_bases[lane]);
+            auto* remote = reinterpret_cast<uint64_t*>(base);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                marker(remote[kDiagnosticStampWord]);
+            marker.store(value, sycl::memory_order::release);
+          }
+        });
+  });
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("slots") = aurora_moe::kSlots;
+  module.attr("counter_stride_words") = aurora_moe::kCounterStrideWords;
+  module.def("enqueue_ipc_device_barrier", &aurora_moe::enqueue_ipc_device_barrier,
+             "Enqueue one monotonic IPC counter barrier on the current XPU stream");
+  module.def("enqueue_ipc_device_barrier_host_ptrs",
+             &aurora_moe::enqueue_ipc_device_barrier_host_ptrs,
+             "Enqueue a host-captured-pointer IPC barrier on the current XPU stream");
+  module.def("enqueue_ipc_device_barrier_arrive_only",
+             &aurora_moe::enqueue_ipc_device_barrier_arrive_only,
+             "Enqueue remote IPC counter arrivals without a device wait");
+  module.def("stamp_ipc_device_barrier_device_ptrs",
+             &aurora_moe::stamp_ipc_device_barrier_device_ptrs,
+             "Stamp each target through the XPU-resident IPC pointer table");
+}

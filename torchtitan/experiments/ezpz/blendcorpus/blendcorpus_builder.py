@@ -41,6 +41,58 @@ def _import_blendcorpus_modules():
     )
 
 
+def _build_pretraining_data_loader_for_dp(
+    build_pretraining_data_loader,
+    bc_mpu,
+    dataset,
+    consumed_samples: int,
+    config,
+    *,
+    dp_rank: int,
+    dp_world_size: int,
+):
+    """Build a BlendCorpus loader using TorchTitan's batch-DP coordinates."""
+    if dp_world_size < 1:
+        raise ValueError(f"dp_world_size must be positive, got {dp_world_size}")
+    if not 0 <= dp_rank < dp_world_size:
+        raise ValueError(
+            f"dp_rank must be in [0, {dp_world_size}), got {dp_rank}"
+        )
+
+    # BlendCorpus derives sampler coordinates from its legacy Megatron groups.
+    # Those groups use a different rank order than TorchTitan's dp_first mesh,
+    # so temporarily expose the explicit batch-mesh coordinates while the
+    # sampler is constructed. The returned loader has already captured them.
+    original_rank = bc_mpu.get_data_parallel_rank
+    original_world_size = bc_mpu.get_data_parallel_world_size
+    bc_mpu.get_data_parallel_rank = lambda: dp_rank
+    bc_mpu.get_data_parallel_world_size = lambda: dp_world_size
+    try:
+        return build_pretraining_data_loader(dataset, consumed_samples, config)
+    finally:
+        bc_mpu.get_data_parallel_rank = original_rank
+        bc_mpu.get_data_parallel_world_size = original_world_size
+
+
+def _validate_pretokenized_batch(tokens: torch.Tensor, expected_vocab_size: int):
+    """Return the token range, rejecting IDs outside the expected vocabulary."""
+    if expected_vocab_size < 1:
+        raise ValueError(
+            f"expected_vocab_size must be positive, got {expected_vocab_size}"
+        )
+    if tokens.numel() < 1:
+        raise ValueError("pretokenized BlendCorpus batch is empty")
+    minimum = int(tokens.min().item())
+    maximum = int(tokens.max().item())
+    if minimum < 0 or maximum >= expected_vocab_size:
+        raise ValueError(
+            "pretokenized BlendCorpus token range "
+            f"[{minimum}, {maximum}] is outside expected vocabulary "
+            f"[0, {expected_vocab_size})"
+        )
+    return minimum, maximum
+
+
 class BlendCorpusDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
@@ -61,6 +113,7 @@ class BlendCorpusDataLoader(BaseDataLoader):
         provide_attention_mask: bool = False
         eod_token_id: int | None = None
         data_cache_path: str = ".cache/blendcorpus"
+        seed: int = 42
 
         train_iters: int | None = None
 
@@ -109,7 +162,6 @@ class BlendCorpusDataLoader(BaseDataLoader):
         parallel_dims = kwargs.get("parallel_dims")
         tp_degree = getattr(parallel_dims, "tp", 1)
         pp_degree = getattr(parallel_dims, "pp", 1)
-        cp_degree = getattr(parallel_dims, "cp", 1)
 
         requested_global_batch_size = kwargs.get("global_batch_size")
         if not requested_global_batch_size or requested_global_batch_size <= 0:
@@ -139,13 +191,15 @@ class BlendCorpusDataLoader(BaseDataLoader):
             seq_length=seq_len,
             train_iters=train_iters,
             eval_iters=0,
-            seed=42,
+            seed=int(config.seed),
             data_impl="mmap",
             micro_batch_size=int(local_batch_size),
             global_batch_size=int(requested_global_batch_size),
             tensor_model_parallel_size=int(tp_degree),
             pipeline_model_parallel_size=int(pp_degree),
-            sequence_parallel_size=int(cp_degree),
+            # BlendCorpus's sequence parallelism is a legacy DeepSpeed mode,
+            # not TorchTitan context parallelism. TT applies CP after loading.
+            sequence_parallel_size=1,
             num_workers=int(config.num_workers),
             pin_memory=bool(config.pin_memory),
             split=config.split,
@@ -230,8 +284,35 @@ class BlendCorpusDataLoader(BaseDataLoader):
 
         logger.info("Rank %d: blendcorpus datasets ready.", rank)
         self._train_ds = train_ds
-        self._build_pretraining_data_loader = build_pretraining_data_loader
-        self._loader = build_pretraining_data_loader(train_ds, 0, self._bc_cfg)
+        expected_vocab = os.environ.get(
+            "TORCHTITAN_EXPECTED_TOKEN_VOCAB_SIZE", ""
+        ).strip()
+        self._expected_token_vocab_size = (
+            int(expected_vocab) if expected_vocab else None
+        )
+        if (
+            self._expected_token_vocab_size is not None
+            and self._expected_token_vocab_size < 1
+        ):
+            raise ValueError(
+                "TORCHTITAN_EXPECTED_TOKEN_VOCAB_SIZE must be positive"
+            )
+        self._reported_token_range = False
+        self._rank = rank
+
+        def build_loader(dataset, consumed_samples, loader_config):
+            return _build_pretraining_data_loader_for_dp(
+                build_pretraining_data_loader,
+                bc_mpu,
+                dataset,
+                consumed_samples,
+                loader_config,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+            )
+
+        self._build_pretraining_data_loader = build_loader
+        self._loader = build_loader(train_ds, 0, self._bc_cfg)
         self._consumed_samples = 0
 
         try:
@@ -255,6 +336,19 @@ class BlendCorpusDataLoader(BaseDataLoader):
 
         for batch in self._loader:
             tokens = batch["text"].long()
+            if self._expected_token_vocab_size is not None:
+                minimum, maximum = _validate_pretokenized_batch(
+                    tokens, self._expected_token_vocab_size
+                )
+                if self._rank == 0 and not self._reported_token_range:
+                    logger.info(
+                        "Pretokenized batch contract validated: range=[%d, %d], "
+                        "expected_token_vocab_size=%d",
+                        minimum,
+                        maximum,
+                        self._expected_token_vocab_size,
+                    )
+                    self._reported_token_range = True
             input_ids = tokens[:, :-1].contiguous()
             labels = tokens[:, 1:].contiguous()
             yield {"input": input_ids}, labels

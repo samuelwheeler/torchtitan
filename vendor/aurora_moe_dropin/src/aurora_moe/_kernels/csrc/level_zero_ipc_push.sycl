@@ -1,0 +1,826 @@
+// Persistent Level Zero IPC all-to-all push kernel for isolated diagnostics.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+class IpcPushPairsKernel;
+class IpcPushTailKernel;
+template <size_t N>
+class IpcPushFastPrefixKernel;
+template <size_t N>
+class IpcPushFastBodyKernel;
+template <size_t N>
+class IpcPushFastTailKernel;
+template <size_t N>
+class IpcPushCclPrefixKernel;
+template <size_t N>
+class IpcPushCclBodyKernel;
+template <size_t N>
+class IpcPushCclTailKernel;
+template <size_t N>
+class IpcPushCclTypedAlignedKernel;
+template <size_t N>
+class IpcPushCclTypedPrefixKernel;
+template <size_t N>
+class IpcPushCclTypedBodyKernel;
+template <size_t N>
+class IpcPushCclTypedTailKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+}  // namespace
+
+void push_alltoall_bf16_pairs(const at::Tensor& send,
+                              const at::Tensor& receive,
+                              const at::Tensor& remote_receive_ptrs,
+                              int64_t rank,
+                              int64_t elements_per_peer) {
+  check_bf16_matrix(send, "send");
+  check_bf16_matrix(receive, "receive");
+  check_xpu_contiguous(remote_receive_ptrs, "remote_receive_ptrs");
+  TORCH_CHECK(remote_receive_ptrs.scalar_type() == at::kLong,
+              "remote_receive_ptrs must have dtype torch.int64");
+  TORCH_CHECK(remote_receive_ptrs.dim() == 1,
+              "remote_receive_ptrs must be rank 1");
+  TORCH_CHECK(send.device() == receive.device() &&
+                  send.device() == remote_receive_ptrs.device(),
+              "send, receive, and remote_receive_ptrs must share an XPU device");
+  TORCH_CHECK(send.size(0) == receive.size(0),
+              "send and receive world dimensions must match");
+  TORCH_CHECK(send.size(1) == receive.size(1),
+              "send and receive staging capacities must match");
+
+  const int64_t world_size = send.size(0);
+  const int64_t capacity_elements = send.size(1);
+  TORCH_CHECK(world_size >= 2, "IPC all-to-all requires at least two ranks");
+  TORCH_CHECK(remote_receive_ptrs.numel() == world_size,
+              "remote_receive_ptrs must contain one address per rank");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside the world");
+  TORCH_CHECK(elements_per_peer > 0 && elements_per_peer <= capacity_elements,
+              "elements_per_peer is outside staging capacity");
+  TORCH_CHECK(capacity_elements % 2 == 0,
+              "staging capacity must be even for 32-bit BF16 copies");
+
+  const auto* send_words = reinterpret_cast<const uint32_t*>(send.data_ptr());
+  const auto* remote_bases = remote_receive_ptrs.data_ptr<int64_t>();
+  const int64_t words_per_row = capacity_elements / 2;
+  const int64_t full_words = elements_per_peer / 2;
+  auto& queue = current_queue(send);
+
+  if (full_words) {
+    queue.parallel_for<IpcPushPairsKernel>(
+        sycl::range<1>(static_cast<size_t>(full_words)), [=](sycl::id<1> item) {
+          const int64_t word = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (int64_t destination = 0; destination < world_size; ++destination) {
+            const auto address = static_cast<uintptr_t>(remote_bases[destination]);
+            auto* destination_words = reinterpret_cast<uint32_t*>(address);
+            destination_words[rank * words_per_row + word] =
+                send_words[destination * words_per_row + word];
+          }
+        });
+  }
+
+  if (elements_per_peer % 2) {
+    const auto* send_halves = reinterpret_cast<const uint16_t*>(send.data_ptr());
+    const int64_t tail = elements_per_peer - 1;
+    queue.parallel_for<IpcPushTailKernel>(sycl::range<1>(static_cast<size_t>(world_size)),
+                                          [=](sycl::id<1> item) {
+      const int64_t destination = static_cast<int64_t>(item[0]);
+      const auto address = static_cast<uintptr_t>(remote_bases[destination]);
+      auto* destination_halves = reinterpret_cast<uint16_t*>(address);
+      destination_halves[rank * capacity_elements + tail] =
+          send_halves[destination * capacity_elements + tail];
+    });
+  }
+}
+
+template <size_t N>
+void push_alltoall_bf16_fast_impl(
+    const at::Tensor& send,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  using bf16 = sycl::ext::oneapi::bfloat16;
+  constexpr int64_t kVectorElements = 4;
+  constexpr size_t kVectorBytes = kVectorElements * sizeof(bf16);
+
+  const int64_t capacity_elements = send.size(1);
+  const auto* source = reinterpret_cast<const bf16*>(send.data_ptr());
+  std::array<uintptr_t, N> receive_bases{};
+  std::array<int64_t, N> prefix_counts{};
+  std::array<int64_t, N> vector_counts{};
+  std::array<int64_t, N> tail_starts{};
+  std::array<int64_t, N> tail_counts{};
+  int64_t max_prefix = 0;
+  int64_t max_vectors = 0;
+  int64_t max_tail = 0;
+
+  for (size_t destination = 0; destination < N; ++destination) {
+    const auto base =
+        static_cast<uintptr_t>(remote_receive_addresses[destination]);
+    TORCH_CHECK(base % alignof(bf16) == 0,
+                "remote receive pointer is not BF16 aligned");
+    receive_bases[destination] = base;
+    const auto output_address =
+        base + static_cast<uintptr_t>(rank * capacity_elements * sizeof(bf16));
+    const size_t misalignment = output_address % kVectorBytes;
+    int64_t prefix = misalignment
+                         ? static_cast<int64_t>((kVectorBytes - misalignment) / sizeof(bf16))
+                         : 0;
+    prefix = std::min(prefix, elements_per_peer);
+    const int64_t vectors = (elements_per_peer - prefix) / kVectorElements;
+    const int64_t tail_start = prefix + vectors * kVectorElements;
+    const int64_t tail = elements_per_peer - tail_start;
+    prefix_counts[destination] = prefix;
+    vector_counts[destination] = vectors;
+    tail_starts[destination] = tail_start;
+    tail_counts[destination] = tail;
+    max_prefix = std::max(max_prefix, prefix);
+    max_vectors = std::max(max_vectors, vectors);
+    max_tail = std::max(max_tail, tail);
+  }
+
+  auto& queue = current_queue(send);
+  if (max_prefix) {
+    queue.parallel_for<IpcPushFastPrefixKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(max_prefix)), [=](sycl::id<1> item) {
+          const int64_t index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            if (index < prefix_counts[destination]) {
+              auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+              output[rank * capacity_elements + index] =
+                  source[destination * capacity_elements + index];
+            }
+          }
+        });
+  }
+  if (max_vectors) {
+    queue.parallel_for<IpcPushFastBodyKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(max_vectors)), [=](sycl::id<1> item) {
+          const int64_t vector_index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            if (vector_index < vector_counts[destination]) {
+              const int64_t start =
+                  prefix_counts[destination] + vector_index * kVectorElements;
+              sycl::vec<bf16, kVectorElements> value;
+#pragma unroll
+              for (int64_t lane = 0; lane < kVectorElements; ++lane) {
+                value[lane] = source[destination * capacity_elements + start + lane];
+              }
+              auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+              *reinterpret_cast<sycl::vec<bf16, kVectorElements>*>(
+                  static_cast<void*>(output + rank * capacity_elements + start)) = value;
+            }
+          }
+        });
+  }
+  if (max_tail) {
+    queue.parallel_for<IpcPushFastTailKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(max_tail)), [=](sycl::id<1> item) {
+          const int64_t tail_index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            if (tail_index < tail_counts[destination]) {
+              const int64_t index = tail_starts[destination] + tail_index;
+              auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+              output[rank * capacity_elements + index] =
+                  source[destination * capacity_elements + index];
+            }
+          }
+        });
+  }
+}
+
+void push_alltoall_bf16_fast(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_bf16_matrix(send, "send");
+  check_bf16_matrix(receive, "receive");
+  TORCH_CHECK(send.device() == receive.device(),
+              "send and receive must share an XPU device");
+  TORCH_CHECK(send.sizes() == receive.sizes(),
+              "send and receive staging shapes must match");
+  const int64_t world_size = send.size(0);
+  const int64_t capacity_elements = send.size(1);
+  TORCH_CHECK(world_size >= 2 && world_size <= 12,
+              "fast IPC all-to-all supports dynamic world sizes in [2, 12]");
+  TORCH_CHECK(remote_receive_addresses.size() == static_cast<size_t>(world_size),
+              "remote_receive_addresses must contain one address per rank");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside the world");
+  TORCH_CHECK(elements_per_peer > 0 && elements_per_peer <= capacity_elements,
+              "elements_per_peer is outside staging capacity");
+  TORCH_CHECK(capacity_elements % 2 == 0,
+              "staging capacity must be even for BF16 vector copies");
+
+  switch (world_size) {
+    case 2: return push_alltoall_bf16_fast_impl<2>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 3: return push_alltoall_bf16_fast_impl<3>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 4: return push_alltoall_bf16_fast_impl<4>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 5: return push_alltoall_bf16_fast_impl<5>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 6: return push_alltoall_bf16_fast_impl<6>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 7: return push_alltoall_bf16_fast_impl<7>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 8: return push_alltoall_bf16_fast_impl<8>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 9: return push_alltoall_bf16_fast_impl<9>(
+                send, remote_receive_addresses, rank, elements_per_peer);
+    case 10: return push_alltoall_bf16_fast_impl<10>(
+                 send, remote_receive_addresses, rank, elements_per_peer);
+    case 11: return push_alltoall_bf16_fast_impl<11>(
+                 send, remote_receive_addresses, rank, elements_per_peer);
+    case 12: return push_alltoall_bf16_fast_impl<12>(
+                 send, remote_receive_addresses, rank, elements_per_peer);
+    default: TORCH_CHECK(false, "unsupported IPC all-to-all world size");
+  }
+}
+
+template <size_t N>
+void push_alltoall_bf16_ccl_equiv_impl(
+    const at::Tensor& send,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  using bf16 = sycl::ext::oneapi::bfloat16;
+  constexpr int64_t kVectorElements = 4;
+  constexpr size_t kVectorBytes = kVectorElements * sizeof(bf16);
+  constexpr size_t kAlignmentBytes = 128;
+  constexpr int64_t kMaxPeel = kAlignmentBytes / sizeof(bf16);
+  constexpr int64_t kPeelVectors = kAlignmentBytes / kVectorBytes;
+
+  const int64_t capacity_elements = send.size(1);
+  const auto* source = reinterpret_cast<const bf16*>(send.data_ptr());
+  std::array<uintptr_t, N> receive_bases{};
+  std::array<int64_t, N> peel_counts{};
+  for (size_t destination = 0; destination < N; ++destination) {
+    const auto base =
+        static_cast<uintptr_t>(remote_receive_addresses[destination]);
+    TORCH_CHECK(base % alignof(bf16) == 0,
+                "remote receive pointer is not BF16 aligned");
+    receive_bases[destination] = base;
+    const auto output_address =
+        base + static_cast<uintptr_t>(rank * capacity_elements * sizeof(bf16));
+    peel_counts[destination] = static_cast<int64_t>(
+        (kAlignmentBytes - output_address % kAlignmentBytes) / sizeof(bf16));
+  }
+  const int64_t aligned_vectors_before_peel = elements_per_peer / kVectorElements;
+  const int64_t aligned_vectors =
+      aligned_vectors_before_peel >= kPeelVectors
+          ? aligned_vectors_before_peel - kPeelVectors
+          : 0;
+  const int64_t tail_count =
+      elements_per_peer - aligned_vectors * kVectorElements;
+
+  auto& current = current_queue(send);
+  sycl::queue out_of_order(current.get_context(), current.get_device());
+  if (kMaxPeel) {
+    out_of_order.parallel_for<IpcPushCclPrefixKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(kMaxPeel)), [=](sycl::id<1> item) {
+          const int64_t index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            if (index < peel_counts[destination] && index < elements_per_peer) {
+              auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+              output[rank * capacity_elements + index] =
+                  source[destination * capacity_elements + index];
+            }
+          }
+        });
+  }
+  if (aligned_vectors) {
+    out_of_order.parallel_for<IpcPushCclBodyKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(aligned_vectors)), [=](sycl::id<1> item) {
+          const int64_t vector_index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            const int64_t start =
+                peel_counts[destination] + vector_index * kVectorElements;
+            sycl::vec<bf16, kVectorElements> value;
+#pragma unroll
+            for (int64_t lane = 0; lane < kVectorElements; ++lane) {
+              value[lane] = source[destination * capacity_elements + start + lane];
+            }
+            auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+            *reinterpret_cast<sycl::vec<bf16, kVectorElements>*>(
+                static_cast<void*>(output + rank * capacity_elements + start)) = value;
+          }
+        });
+  }
+  if (tail_count) {
+    out_of_order.parallel_for<IpcPushCclTailKernel<N>>(
+        sycl::range<1>(static_cast<size_t>(tail_count)), [=](sycl::id<1> item) {
+          const int64_t tail_index = static_cast<int64_t>(item[0]);
+#pragma unroll
+          for (size_t destination = 0; destination < N; ++destination) {
+            const int64_t index =
+                peel_counts[destination] + aligned_vectors * kVectorElements + tail_index;
+            if (index < elements_per_peer) {
+              auto* output = reinterpret_cast<bf16*>(receive_bases[destination]);
+              output[rank * capacity_elements + index] =
+                  source[destination * capacity_elements + index];
+            }
+          }
+        });
+  }
+  out_of_order.wait_and_throw();
+}
+
+void push_alltoall_bf16_ccl_equiv(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_bf16_matrix(send, "send");
+  check_bf16_matrix(receive, "receive");
+  TORCH_CHECK(send.device() == receive.device() && send.sizes() == receive.sizes(),
+              "send and receive staging tensors must match");
+  TORCH_CHECK(send.size(0) == 12,
+              "the oneCCL-equivalence probe requires 12 local Aurora tiles");
+  TORCH_CHECK(remote_receive_addresses.size() == 12,
+              "oneCCL-equivalence probe requires 12 receive pointers");
+  TORCH_CHECK(rank >= 0 && rank < 12, "rank is outside the world");
+  TORCH_CHECK(elements_per_peer > 0 && elements_per_peer <= send.size(1),
+              "elements_per_peer is outside staging capacity");
+  push_alltoall_bf16_ccl_equiv_impl<12>(
+      send, remote_receive_addresses, rank, elements_per_peer);
+}
+
+template <size_t N>
+std::vector<sycl::event> submit_alltoall_bf16_ccl_typed_impl(
+    const at::Tensor& send,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank_value,
+    int64_t elements_value,
+    size_t send_stride,
+    size_t receive_stride,
+    sycl::queue& current,
+    const sycl::event& producer,
+    sycl::queue* persistent_out_of_order) {
+  // This follows oneCCL's alltoall_vec_write structure: typed captured
+  // pointer arrays, a 128-byte front peel, four-BF16 vector body, and tail.
+  // The source and destination strides are explicit.  The normal persistent
+  // path uses the retained staging capacity for both; the opt-in direct-input
+  // path uses a compact source stride and the retained destination capacity.
+  using bf16 = sycl::ext::oneapi::bfloat16;
+  constexpr size_t kVectorElements = 4;
+  constexpr size_t kVectorBytes = kVectorElements * sizeof(bf16);
+  constexpr size_t kAlignmentBytes = 128;
+  constexpr size_t kAlignmentElements = kAlignmentBytes / sizeof(bf16);
+  constexpr size_t kMaxPeelVectors = kAlignmentBytes / kVectorBytes;
+
+  const size_t count = static_cast<size_t>(elements_value);
+  const size_t rank = static_cast<size_t>(rank_value);
+  auto* local_send = reinterpret_cast<bf16*>(send.data_ptr());
+  std::array<bf16*, N> send_bufs{};
+  std::array<bf16*, N> recv_bufs{};
+  std::array<size_t, N> peel_front_count{};
+  for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+    send_bufs[buffer_index] = local_send;
+    const auto address =
+        static_cast<uintptr_t>(remote_receive_addresses[buffer_index]);
+    TORCH_CHECK(address % alignof(bf16) == 0,
+                "remote receive pointer is not BF16 aligned");
+    recv_bufs[buffer_index] = reinterpret_cast<bf16*>(address);
+    auto* peel_offset = &recv_bufs[buffer_index][rank * receive_stride];
+    const auto pointer_value = reinterpret_cast<uintptr_t>(peel_offset);
+    auto* pointer_aligned = reinterpret_cast<bf16*>(
+        (pointer_value / kAlignmentBytes + 1) * kAlignmentBytes);
+    peel_front_count[buffer_index] =
+        static_cast<size_t>(pointer_aligned - peel_offset);
+    if (peel_front_count[buffer_index] > count) {
+      peel_front_count[buffer_index] = count;
+    }
+  }
+
+  bool all_aligned =
+      reinterpret_cast<uintptr_t>(send_bufs[rank]) % kVectorBytes == 0 &&
+      (send_stride * sizeof(bf16)) % kVectorBytes == 0 &&
+      (receive_stride * sizeof(bf16)) % kVectorBytes == 0 &&
+      (count * sizeof(bf16)) % kVectorBytes == 0;
+  for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+    all_aligned = all_aligned &&
+                  peel_front_count[buffer_index] == kAlignmentElements;
+  }
+
+  std::optional<sycl::queue> transient_out_of_order;
+  sycl::queue* out_of_order = persistent_out_of_order;
+  if (out_of_order == nullptr) {
+    transient_out_of_order.emplace(current.get_context(), current.get_device());
+    out_of_order = &*transient_out_of_order;
+  } else {
+    TORCH_CHECK(out_of_order->get_context() == current.get_context(),
+                "persistent IPC push queue context differs from the current XPU stream");
+    TORCH_CHECK(out_of_order->get_device() == current.get_device(),
+                "persistent IPC push queue device differs from the current XPU stream");
+  }
+  if (all_aligned) {
+    auto event = out_of_order->submit([&](sycl::handler& cgh) {
+      cgh.depends_on(producer);
+      cgh.parallel_for<IpcPushCclTypedAlignedKernel<N>>(
+          sycl::range<1>(count / kVectorElements), [=](sycl::id<1> item) {
+            const size_t start_idx = static_cast<size_t>(item[0]) * kVectorElements;
+#pragma unroll
+            for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+              const auto data = *reinterpret_cast<sycl::vec<bf16, kVectorElements>*>(
+                  static_cast<void*>(&send_bufs[rank][
+                      buffer_index * send_stride + start_idx]));
+              *reinterpret_cast<sycl::vec<bf16, kVectorElements>*>(
+                  static_cast<void*>(&recv_bufs[buffer_index][
+                      rank * receive_stride + start_idx])) = data;
+            }
+          });
+    });
+    return {std::move(event)};
+  }
+
+  size_t aligned_loop_count = count / kVectorElements;
+  aligned_loop_count = aligned_loop_count >= kMaxPeelVectors
+                           ? aligned_loop_count - kMaxPeelVectors
+                           : 0;
+  const size_t end_loop_count = count - aligned_loop_count * kVectorElements;
+
+  std::vector<sycl::event> events;
+  events.reserve(3);
+  events.push_back(out_of_order->submit([&](sycl::handler& cgh) {
+    cgh.depends_on(producer);
+    cgh.parallel_for<IpcPushCclTypedPrefixKernel<N>>(
+        sycl::range<1>(kAlignmentElements), [=](sycl::id<1> item) {
+          const size_t index = static_cast<size_t>(item[0]);
+#pragma unroll
+          for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+            if (index < peel_front_count[buffer_index]) {
+              recv_bufs[buffer_index][rank * receive_stride + index] =
+                  send_bufs[rank][buffer_index * send_stride + index];
+            }
+          }
+        });
+  }));
+  if (aligned_loop_count) {
+    events.push_back(out_of_order->submit([&](sycl::handler& cgh) {
+      cgh.depends_on(producer);
+      cgh.parallel_for<IpcPushCclTypedBodyKernel<N>>(
+          sycl::range<1>(aligned_loop_count), [=](sycl::id<1> item) {
+            const size_t vector_index = static_cast<size_t>(item[0]);
+#pragma unroll
+            for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+              const size_t start_idx =
+                  vector_index * kVectorElements + peel_front_count[buffer_index];
+              sycl::vec<bf16, kVectorElements> data;
+#pragma unroll
+              for (size_t lane = 0; lane < kVectorElements; ++lane) {
+                data[lane] = send_bufs[rank][
+                    buffer_index * send_stride + start_idx + lane];
+              }
+              *reinterpret_cast<sycl::vec<bf16, kVectorElements>*>(
+                  static_cast<void*>(&recv_bufs[buffer_index][
+                      rank * receive_stride + start_idx])) = data;
+            }
+          });
+    }));
+  }
+  if (end_loop_count) {
+    events.push_back(out_of_order->submit([&](sycl::handler& cgh) {
+      cgh.depends_on(producer);
+      cgh.parallel_for<IpcPushCclTypedTailKernel<N>>(
+          sycl::range<1>(end_loop_count), [=](sycl::id<1> item) {
+            const size_t tail_index = static_cast<size_t>(item[0]);
+#pragma unroll
+            for (size_t buffer_index = 0; buffer_index < N; ++buffer_index) {
+              const size_t start_idx = peel_front_count[buffer_index] +
+                                       aligned_loop_count * kVectorElements;
+              const size_t loop_index = start_idx + tail_index;
+              if (loop_index < count) {
+                recv_bufs[buffer_index][rank * receive_stride + loop_index] =
+                    send_bufs[rank][buffer_index * send_stride + loop_index];
+              }
+            }
+          });
+    }));
+  }
+  return events;
+}
+
+void check_ccl_typed_inputs(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_bf16_matrix(send, "send");
+  check_bf16_matrix(receive, "receive");
+  TORCH_CHECK(send.device() == receive.device() && send.sizes() == receive.sizes(),
+              "send and receive staging tensors must match");
+  const int64_t world_size = send.size(0);
+  TORCH_CHECK(world_size >= 2 && world_size <= 12,
+              "typed oneCCL-shape IPC all-to-all supports world sizes in [2, 12]");
+  TORCH_CHECK(remote_receive_addresses.size() == static_cast<size_t>(world_size),
+              "remote_receive_addresses must contain one address per rank");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside the world");
+  TORCH_CHECK(elements_per_peer > 0 && elements_per_peer <= send.size(1),
+              "elements_per_peer is outside staging capacity");
+
+}
+
+void check_ccl_typed_direct_inputs(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_bf16_matrix(send, "send");
+  check_bf16_matrix(receive, "receive");
+  TORCH_CHECK(send.device() == receive.device(),
+              "direct send and receive must share an XPU device");
+  TORCH_CHECK(send.size(0) == receive.size(0),
+              "direct send and receive world dimensions must match");
+  const int64_t world_size = send.size(0);
+  TORCH_CHECK(world_size >= 2 && world_size <= 12,
+              "typed oneCCL-shape IPC all-to-all supports world sizes in [2, 12]");
+  TORCH_CHECK(remote_receive_addresses.size() == static_cast<size_t>(world_size),
+              "remote_receive_addresses must contain one address per rank");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside the world");
+  TORCH_CHECK(elements_per_peer > 0 && elements_per_peer == send.size(1),
+              "direct send must have exactly elements_per_peer columns");
+  TORCH_CHECK(elements_per_peer <= receive.size(1),
+              "elements_per_peer is outside receive staging capacity");
+}
+
+std::vector<sycl::event> submit_alltoall_bf16_ccl_typed(
+    const at::Tensor& send,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer,
+    size_t send_stride,
+    size_t receive_stride,
+    sycl::queue& current,
+    const sycl::event& producer,
+    sycl::queue* persistent_out_of_order = nullptr) {
+  switch (send.size(0)) {
+    case 2: return submit_alltoall_bf16_ccl_typed_impl<2>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 3: return submit_alltoall_bf16_ccl_typed_impl<3>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 4: return submit_alltoall_bf16_ccl_typed_impl<4>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 5: return submit_alltoall_bf16_ccl_typed_impl<5>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 6: return submit_alltoall_bf16_ccl_typed_impl<6>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 7: return submit_alltoall_bf16_ccl_typed_impl<7>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 8: return submit_alltoall_bf16_ccl_typed_impl<8>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 9: return submit_alltoall_bf16_ccl_typed_impl<9>(
+                send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                receive_stride, current, producer, persistent_out_of_order);
+    case 10: return submit_alltoall_bf16_ccl_typed_impl<10>(
+                 send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                 receive_stride, current, producer, persistent_out_of_order);
+    case 11: return submit_alltoall_bf16_ccl_typed_impl<11>(
+                 send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                 receive_stride, current, producer, persistent_out_of_order);
+    case 12: return submit_alltoall_bf16_ccl_typed_impl<12>(
+                 send, remote_receive_addresses, rank, elements_per_peer, send_stride,
+                 receive_stride, current, producer, persistent_out_of_order);
+    default: TORCH_CHECK(false, "unsupported IPC all-to-all world size");
+  }
+  return {};
+}
+
+class PersistentOooTypedPushQueue {
+ public:
+  PersistentOooTypedPushQueue() = default;
+  PersistentOooTypedPushQueue(const PersistentOooTypedPushQueue&) = delete;
+  PersistentOooTypedPushQueue& operator=(const PersistentOooTypedPushQueue&) = delete;
+
+  void push_alltoall_bf16_ccl_typed_async(
+      const at::Tensor& send,
+      const at::Tensor& receive,
+      const std::vector<int64_t>& remote_receive_addresses,
+      int64_t rank,
+      int64_t elements_per_peer) {
+    check_ccl_typed_inputs(
+        send, receive, remote_receive_addresses, rank, elements_per_peer);
+    auto& current = current_queue(send);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& out_of_order = queue_for_locked(send, current);
+    const auto producer = current.ext_oneapi_submit_barrier();
+    auto events = submit_alltoall_bf16_ccl_typed(
+        send, remote_receive_addresses, rank, elements_per_peer,
+        static_cast<size_t>(send.size(1)), static_cast<size_t>(receive.size(1)),
+        current, producer, &out_of_order);
+    static_cast<void>(current.ext_oneapi_submit_barrier(events));
+  }
+
+  void push_alltoall_bf16_ccl_typed_direct_async(
+      const at::Tensor& send,
+      const at::Tensor& receive,
+      const std::vector<int64_t>& remote_receive_addresses,
+      int64_t rank,
+      int64_t elements_per_peer) {
+    check_ccl_typed_direct_inputs(
+        send, receive, remote_receive_addresses, rank, elements_per_peer);
+    auto stream = c10::xpu::getCurrentXPUStream(send.get_device());
+    auto& current = stream.queue();
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& out_of_order = queue_for_locked(send, current);
+    const auto producer = current.ext_oneapi_submit_barrier();
+    auto events = submit_alltoall_bf16_ccl_typed(
+        send, remote_receive_addresses, rank, elements_per_peer,
+        static_cast<size_t>(send.size(1)), static_cast<size_t>(receive.size(1)),
+        current, producer, &out_of_order);
+    static_cast<void>(current.ext_oneapi_submit_barrier(events));
+    send.record_stream(stream);
+  }
+
+  void close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) {
+      return;
+    }
+    for (auto& item : queues_) {
+      item.second->queue.wait_and_throw();
+    }
+    queues_.clear();
+    closed_ = true;
+  }
+
+ private:
+  struct QueueState {
+    QueueState(const sycl::queue& current, int device_index,
+               const std::thread::id& owner_thread)
+        : context(current.get_context()),
+          device(current.get_device()),
+          device_index(device_index),
+          owner_thread(owner_thread),
+          queue(context, device) {}
+
+    sycl::context context;
+    sycl::device device;
+    int device_index;
+    std::thread::id owner_thread;
+    sycl::queue queue;
+  };
+
+  sycl::queue& queue_for_locked(const at::Tensor& send,
+                                const sycl::queue& current) {
+    TORCH_CHECK(!closed_, "persistent IPC typed push queue is closed");
+    const auto caller = std::this_thread::get_id();
+    auto iterator = queues_.find(caller);
+    if (iterator == queues_.end()) {
+      auto state = std::make_unique<QueueState>(
+          current, send.get_device(), caller);
+      iterator = queues_.emplace(caller, std::move(state)).first;
+    }
+    auto& state = *iterator->second;
+    TORCH_CHECK(state.owner_thread == caller,
+                "persistent IPC typed push queue thread ownership changed");
+    TORCH_CHECK(state.device_index == send.get_device(),
+                "one persistent IPC typed push queue thread cannot span XPU devices");
+    TORCH_CHECK(state.context == current.get_context(),
+                "persistent IPC typed push queue context changed on one host thread");
+    TORCH_CHECK(state.device == current.get_device(),
+                "persistent IPC typed push queue device changed on one host thread");
+    return state.queue;
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::thread::id, std::unique_ptr<QueueState>> queues_;
+  bool closed_ = false;
+};
+
+void push_alltoall_bf16_ccl_typed(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_ccl_typed_inputs(
+      send, receive, remote_receive_addresses, rank, elements_per_peer);
+  auto& current = current_queue(send);
+  const auto producer = current.ext_oneapi_submit_barrier();
+  auto events = submit_alltoall_bf16_ccl_typed(
+      send, remote_receive_addresses, rank, elements_per_peer,
+      static_cast<size_t>(send.size(1)), static_cast<size_t>(receive.size(1)),
+      current, producer);
+  sycl::event::wait_and_throw(events);
+}
+
+void push_alltoall_bf16_ccl_typed_async(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_ccl_typed_inputs(
+      send, receive, remote_receive_addresses, rank, elements_per_peer);
+  auto& current = current_queue(send);
+  const auto producer = current.ext_oneapi_submit_barrier();
+  auto events = submit_alltoall_bf16_ccl_typed(
+      send, remote_receive_addresses, rank, elements_per_peer,
+      static_cast<size_t>(send.size(1)), static_cast<size_t>(receive.size(1)),
+      current, producer);
+  // This current-stream barrier is the completion bridge: later PyTorch work
+  // observes the OOO peer writes without a host wait or a cross-queue race.
+  static_cast<void>(current.ext_oneapi_submit_barrier(events));
+}
+
+void push_alltoall_bf16_ccl_typed_direct_async(
+    const at::Tensor& send,
+    const at::Tensor& receive,
+    const std::vector<int64_t>& remote_receive_addresses,
+    int64_t rank,
+    int64_t elements_per_peer) {
+  check_ccl_typed_direct_inputs(
+      send, receive, remote_receive_addresses, rank, elements_per_peer);
+  auto stream = c10::xpu::getCurrentXPUStream(send.get_device());
+  auto& current = stream.queue();
+  const auto producer = current.ext_oneapi_submit_barrier();
+  auto events = submit_alltoall_bf16_ccl_typed(
+      send, remote_receive_addresses, rank, elements_per_peer,
+      static_cast<size_t>(send.size(1)), static_cast<size_t>(receive.size(1)),
+      current, producer);
+  // The current-stream bridge is also the ownership handoff for direct input:
+  // recording ``send`` on this stream prevents the XPU caching allocator from
+  // recycling its storage before the OOO peer reads finish.
+  static_cast<void>(current.ext_oneapi_submit_barrier(events));
+  send.record_stream(stream);
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  pybind11::class_<aurora_moe::PersistentOooTypedPushQueue>(
+      module, "PersistentOooTypedPushQueue")
+      .def(pybind11::init<>())
+      .def("push_alltoall_bf16_ccl_typed_async",
+           &aurora_moe::PersistentOooTypedPushQueue::push_alltoall_bf16_ccl_typed_async)
+      .def("push_alltoall_bf16_ccl_typed_direct_async",
+           &aurora_moe::PersistentOooTypedPushQueue::push_alltoall_bf16_ccl_typed_direct_async)
+      .def("close", &aurora_moe::PersistentOooTypedPushQueue::close);
+  module.def("push_alltoall_bf16_pairs", &aurora_moe::push_alltoall_bf16_pairs,
+             "Push equal BF16 all-to-all through persistent Level Zero IPC mappings");
+  module.def("push_alltoall_bf16_fast", &aurora_moe::push_alltoall_bf16_fast,
+             "Push equal BF16 all-to-all through captured persistent IPC mappings");
+  module.def("push_alltoall_bf16_ccl_equiv",
+             &aurora_moe::push_alltoall_bf16_ccl_equiv,
+             "Run the oneCCL 128-byte-peel push pattern on persistent IPC mappings");
+  module.def("push_alltoall_bf16_ccl_typed",
+             &aurora_moe::push_alltoall_bf16_ccl_typed,
+             "Run the dynamic typed-pointer oneCCL-shape IPC push pattern");
+  module.def("push_alltoall_bf16_ccl_typed_async",
+             &aurora_moe::push_alltoall_bf16_ccl_typed_async,
+             "Enqueue the typed IPC push and current-stream completion bridge");
+  module.def("push_alltoall_bf16_ccl_typed_direct_async",
+             &aurora_moe::push_alltoall_bf16_ccl_typed_direct_async,
+             "Enqueue the typed IPC push directly from a compact input tensor");
+}

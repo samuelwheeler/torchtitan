@@ -1,0 +1,214 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Specialized PVC grouped MoE GEMM for exact source/expert physical segments.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <cute/tensor.hpp>
+#include <cute/util/compat.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/sycl.hpp>
+
+#include "cutlass/kernel_hardware_info.h"
+#include "segmented_moe_grouped_gemm.hpp"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+
+#pragma clang diagnostic ignored "-Wpass-failed"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+namespace aurora_moe {
+namespace {
+
+using namespace cute;
+
+using Element = cutlass::bfloat16_t;
+using ProblemShape = segmented_tla::ProblemShape;
+using TileScheduler = segmented_tla::TileScheduler;
+using RasterOrderOptions = typename TileScheduler::RasterOrderOptions;
+
+enum class CopyAtomMode { Auto, Explicit };
+enum class SchedulerGridMode { Dynamic, Legacy };
+
+CopyAtomMode copy_atom_mode() {
+  const char* value = std::getenv("AURORA_MOE_SEGMENTED_SPECIALIZED_COPY_ATOMS");
+  if (value == nullptr || std::strcmp(value, "auto") == 0) {
+    return CopyAtomMode::Auto;
+  }
+  TORCH_CHECK(std::strcmp(value, "explicit") == 0,
+              "AURORA_MOE_SEGMENTED_SPECIALIZED_COPY_ATOMS must be 'auto' or 'explicit'");
+  return CopyAtomMode::Explicit;
+}
+
+SchedulerGridMode scheduler_grid_mode() {
+  const char* value = std::getenv("AURORA_MOE_SEGMENTED_SPECIALIZED_GRID");
+  if (value == nullptr || std::strcmp(value, "dynamic") == 0) {
+    return SchedulerGridMode::Dynamic;
+  }
+  TORCH_CHECK(std::strcmp(value, "legacy") == 0,
+              "AURORA_MOE_SEGMENTED_SPECIALIZED_GRID must be 'dynamic' or 'legacy'");
+  return SchedulerGridMode::Legacy;
+}
+
+class SegmentedMoETlaAutoKernel;
+class SegmentedMoETlaExplicitKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16(const at::Tensor& tensor, const char* name, int64_t dimensions) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == dimensions, name, " has an invalid rank");
+}
+
+int stream_slice_count(sycl::queue& queue) {
+  const auto device = queue.get_device();
+  return static_cast<int>(
+      device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+      device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>());
+}
+
+template <class TA, class TB>
+auto choose_tiled_mma(TA* a, TB* b) {
+  using TAType = cutlass::platform::remove_cv_t<TA>;
+  using TBType = cutlass::platform::remove_cv_t<TB>;
+  auto op = XE_DPAS_TT<8, float, TAType, TBType>{};
+  // This is a PVC implementation specialization, not a public shape
+  // restriction.  Group count, fragment rows, K, and N are all runtime.
+  using WorkgroupTile = Shape<_256, _128, _32>;
+  using SubgroupLayout = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
+  using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>,
+                                      Layout<WorkgroupTile>,
+                                      SubgroupLayout>::TiledMMA;
+  return MMA{};
+}
+
+void record_current_stream(const at::Tensor& tensor) {
+  tensor.record_stream(c10::xpu::getCurrentXPUStream(tensor.get_device()).unwrap());
+}
+
+}  // namespace
+
+at::Tensor segmented_moe_grouped_gemm_bf16(
+    const at::Tensor& activations, const at::Tensor& weights,
+    const at::Tensor& source_expert_counts) {
+  check_bf16(activations, "activations", 2);
+  check_bf16(weights, "weights", 3);
+  check_xpu_contiguous(source_expert_counts, "source_expert_counts");
+  TORCH_CHECK(source_expert_counts.scalar_type() == at::kInt &&
+                  source_expert_counts.dim() == 2,
+              "source_expert_counts must be contiguous int32 [sources, experts]");
+  TORCH_CHECK(activations.device() == weights.device() &&
+                  activations.device() == source_expert_counts.device(),
+              "segment inputs must share an XPU device");
+  const int64_t sources = source_expert_counts.size(0);
+  const int64_t experts = source_expert_counts.size(1);
+  const int64_t routes = activations.size(0);
+  const int64_t k = activations.size(1);
+  const int64_t n = weights.size(2);
+  TORCH_CHECK(sources > 0 && experts > 0 && weights.size(0) == experts,
+              "weights and source_expert_counts must agree on a positive expert count");
+  TORCH_CHECK(weights.size(1) == k && k > 0 && n > 0,
+              "activation and weight dimensions must be positive and match");
+  TORCH_CHECK(sources * experts <= std::numeric_limits<int32_t>::max() &&
+                  routes <= std::numeric_limits<int32_t>::max() &&
+                  k <= std::numeric_limits<int32_t>::max() &&
+                  n <= std::numeric_limits<int32_t>::max(),
+              "segmented specialized GEMM extent exceeds int32 limits");
+
+  auto output = at::empty({routes, n}, activations.options());
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t group_count = static_cast<int32_t>(sources * experts);
+  const int32_t local_experts = static_cast<int32_t>(experts);
+  const int32_t k_i32 = static_cast<int32_t>(k);
+  const int32_t n_i32 = static_cast<int32_t>(n);
+  const auto* activation_ptr = reinterpret_cast<const Element*>(activations.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const Element*>(weights.data_ptr());
+  auto* output_ptr = reinterpret_cast<Element*>(output.data_ptr());
+  auto* rows = source_expert_counts.data_ptr<int32_t>();
+
+  auto& queue = c10::xpu::getCurrentXPUStream(activations.get_device()).queue();
+  const int slices = stream_slice_count(queue);
+  TORCH_CHECK(slices > 0, "the current XPU stream reports no GPU slices");
+  cutlass::KernelHardwareInfo hardware{activations.get_device(), slices};
+  // The original adaptation supplied a host-visible one-row dummy problem to
+  // the upstream persistent scheduler.  Its grid heuristic consequently
+  // truncated the physical launch to only ceil(N / 128) workgroups (11 at the
+  // target), even though the device scheduler subsequently owned thousands of
+  // dynamic M tiles.  With no host shape pointer, the upstream scheduler
+  // correctly uses the PVC hardware workgroup count while our device-side
+  // scheduler still derives every actual group/M extent from ``rows``.
+  // ``legacy`` remains a diagnostic A/B only; neither choice creates padded
+  // activations or assumes fixed expert counts.
+  using GroupProblem = cutlass::gemm::GroupProblemShape<
+      cute::Shape<int, int, int>>;
+  auto dummy_problem = cute::Shape<int, int, int>{1, k_i32, n_i32};
+  const auto grid_mode = scheduler_grid_mode();
+  auto dummy_group_problem =
+      grid_mode == SchedulerGridMode::Dynamic
+      ? GroupProblem{1, nullptr, nullptr}
+      : GroupProblem{1, &dummy_problem, &dummy_problem};
+  using WorkgroupTile = cute::Shape<cute::_256, cute::_128, cute::_32>;
+  using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+  auto scheduler_params = TileScheduler::to_underlying_arguments(
+      dummy_group_problem, WorkgroupTile{}, ClusterShape{}, hardware,
+      TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+  const auto grid = TileScheduler::get_grid_shape(
+      scheduler_params, dummy_group_problem, WorkgroupTile{}, ClusterShape{},
+      hardware, TileScheduler::Arguments{1, RasterOrderOptions::AlongN});
+  auto mma = choose_tiled_mma(activation_ptr, weight_ptr);
+  const auto threads = cute::size(mma);
+  sycl::range<3> local{1, 1, static_cast<size_t>(threads)};
+  sycl::range<3> global{static_cast<size_t>(grid.z) * local[0],
+                        static_cast<size_t>(grid.y) * local[1],
+                        static_cast<size_t>(grid.x) * local[2]};
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties properties{syclex::sub_group_size<16>,
+                                 intelex::grf_size<256>};
+
+  if (copy_atom_mode() == CopyAtomMode::Auto) {
+    queue.parallel_for<SegmentedMoETlaAutoKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto) {
+          segmented_tla::SegmentedMoEGEMM<void, void, void, 'R', 'R', 'R'>(
+              activation_ptr, weight_ptr, output_ptr, mma, rows, group_count,
+              local_experts, n_i32, k_i32, scheduler_params);
+        });
+  } else {
+    queue.parallel_for<SegmentedMoETlaExplicitKernel>(
+        sycl::nd_range<3>(global, local), properties, [=](auto) {
+          segmented_tla::SegmentedMoEGEMM<
+              cute::XE_LOAD_2D<16, 32, 32, 16>,
+              cute::XE_LOAD_2D_VNNI<16, 32, 16, 16>,
+              cute::XE_STORE_2D<16, 8, 32>, 'R', 'R', 'R'>(
+              activation_ptr, weight_ptr, output_ptr, mma, rows, group_count,
+              local_experts, n_i32, k_i32, scheduler_params);
+        });
+  }
+  record_current_stream(activations);
+  record_current_stream(weights);
+  record_current_stream(source_expert_counts);
+  record_current_stream(output);
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("segmented_moe_grouped_gemm_bf16",
+             &aurora_moe::segmented_moe_grouped_gemm_bf16,
+             "Specialized source/expert segmented BF16 MoE GEMM on XPU");
+}

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
@@ -157,9 +158,20 @@ def run_lr_finder(trainer: FaultTolerantTrainer) -> None:
         in_warmup = i < warmup_steps
 
         # Run one training step; returns global_avg_loss
-        loss_val = trainer.train_step(data_iterator)
+        loss_val = trainer.train_step(data_iterator, return_global_loss=True)
+
+        # Only the last PP stage has a loss. Broadcast it through each PP mesh
+        # so every rank advances the LR sweep identically.
+        if trainer.parallel_dims.pp_enabled:
+            loss_val = dist_utils.dist_sum(
+                torch.tensor(
+                    0.0 if loss_val is None else loss_val,
+                    device=trainer.device,
+                ),
+                trainer.parallel_dims.get_mesh("pp"),
+            )
         if loss_val is None:
-            continue
+            raise RuntimeError("LR finder did not receive a global loss")
 
         if isinstance(loss_val, torch.Tensor):
             loss_val = float(loss_val.item())

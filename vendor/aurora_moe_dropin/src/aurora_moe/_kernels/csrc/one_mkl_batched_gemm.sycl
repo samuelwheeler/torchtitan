@@ -1,0 +1,142 @@
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <oneapi/mkl/blas.hpp>
+
+#include <cstdint>
+
+namespace aurora_moe {
+namespace {
+
+using BFloat16 = oneapi::mkl::bfloat16;
+
+void check_input(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 3, name, " must have shape [batch, rows, cols]");
+  TORCH_CHECK(tensor.is_contiguous(), name,
+              " must be a contiguous base tensor; use transpose flags instead of views");
+}
+
+void check_shared_a(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU,
+              "a must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16,
+              "a must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, "a must have shape [rows, cols]");
+  TORCH_CHECK(tensor.is_contiguous(), "a must be a contiguous base tensor");
+}
+
+int64_t rows_after(const at::Tensor& tensor, bool transposed) {
+  return tensor.size(transposed ? 2 : 1);
+}
+
+int64_t cols_after(const at::Tensor& tensor, bool transposed) {
+  return tensor.size(transposed ? 1 : 2);
+}
+
+}  // namespace
+
+at::Tensor gemm_bf16(const at::Tensor& a, const at::Tensor& b, bool trans_a,
+                     bool trans_b, bool batched) {
+  check_input(a, "a");
+  check_input(b, "b");
+  TORCH_CHECK(a.device() == b.device(), "a and b must be on the same XPU");
+  TORCH_CHECK(a.size(0) == b.size(0), "a and b batch dimensions must match");
+
+  const int64_t batch = a.size(0);
+  const int64_t m = rows_after(a, trans_a);
+  const int64_t k = cols_after(a, trans_a);
+  const int64_t b_k = rows_after(b, trans_b);
+  const int64_t n = cols_after(b, trans_b);
+  TORCH_CHECK(k == b_k, "inner GEMM dimensions must match");
+  TORCH_CHECK(batch > 0 && m > 0 && k > 0 && n > 0,
+              "all GEMM dimensions must be positive");
+
+  auto output = at::empty({batch, m, n}, a.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(a.get_device()).queue();
+
+  auto* a_ptr = reinterpret_cast<const BFloat16*>(a.data_ptr());
+  auto* b_ptr = reinterpret_cast<const BFloat16*>(b.data_ptr());
+  auto* out_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+  const auto mkl_trans_a = trans_a ? oneapi::mkl::transpose::trans
+                                   : oneapi::mkl::transpose::nontrans;
+  const auto mkl_trans_b = trans_b ? oneapi::mkl::transpose::trans
+                                   : oneapi::mkl::transpose::nontrans;
+  const int64_t a_stride = a.size(1) * a.size(2);
+  const int64_t b_stride = b.size(1) * b.size(2);
+  const int64_t out_stride = m * n;
+  if (batched) {
+    oneapi::mkl::blas::row_major::gemm_batch(
+        queue, mkl_trans_a, mkl_trans_b, m, n, k, 1.0f,
+        a_ptr, a.size(2), a_stride,
+        b_ptr, b.size(2), b_stride,
+        0.0f, out_ptr, n, out_stride, batch);
+  } else {
+    for (int64_t group = 0; group < batch; ++group) {
+      oneapi::mkl::blas::row_major::gemm(
+          queue, mkl_trans_a, mkl_trans_b, m, n, k, 1.0f,
+          a_ptr + group * a_stride, a.size(2),
+          b_ptr + group * b_stride, b.size(2),
+          0.0f, out_ptr + group * out_stride, n);
+    }
+  }
+  return output;
+}
+
+at::Tensor strided_batched_gemm_bf16(const at::Tensor& a, const at::Tensor& b,
+                                     bool trans_a, bool trans_b) {
+  return gemm_bf16(a, b, trans_a, trans_b, true);
+}
+
+at::Tensor gemm_loop_bf16(const at::Tensor& a, const at::Tensor& b,
+                          bool trans_a, bool trans_b) {
+  return gemm_bf16(a, b, trans_a, trans_b, false);
+}
+
+at::Tensor shared_a_gemm_bf16(const at::Tensor& a, const at::Tensor& b,
+                               bool trans_a, bool trans_b) {
+  check_shared_a(a);
+  check_input(b, "b");
+  TORCH_CHECK(a.device() == b.device(), "a and b must be on the same XPU");
+  const int64_t groups = b.size(0);
+  const int64_t m = trans_a ? a.size(1) : a.size(0);
+  const int64_t k = trans_a ? a.size(0) : a.size(1);
+  const int64_t b_k = trans_b ? b.size(2) : b.size(1);
+  const int64_t n = trans_b ? b.size(1) : b.size(2);
+  TORCH_CHECK(groups > 0 && m > 0 && k > 0 && n > 0 && k == b_k,
+              "shared-a GEMM dimensions must be positive and compatible");
+
+  auto output = at::empty({groups, m, n}, b.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(a.get_device()).queue();
+  auto* a_ptr = reinterpret_cast<const BFloat16*>(a.data_ptr());
+  auto* b_ptr = reinterpret_cast<const BFloat16*>(b.data_ptr());
+  auto* out_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+  const auto mkl_trans_a = trans_a ? oneapi::mkl::transpose::trans
+                                   : oneapi::mkl::transpose::nontrans;
+  const auto mkl_trans_b = trans_b ? oneapi::mkl::transpose::trans
+                                   : oneapi::mkl::transpose::nontrans;
+  const int64_t b_stride = b.size(1) * b.size(2);
+  const int64_t out_stride = m * n;
+  for (int64_t group = 0; group < groups; ++group) {
+    oneapi::mkl::blas::row_major::gemm(
+        queue, mkl_trans_a, mkl_trans_b, m, n, k, 1.0f,
+        a_ptr, a.size(1), b_ptr + group * b_stride, b.size(2),
+        0.0f, out_ptr + group * out_stride, n);
+  }
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("strided_batched_gemm_bf16", &aurora_moe::strided_batched_gemm_bf16,
+             "Direct oneMKL strided-batched BF16 GEMM on XPU");
+  module.def("gemm_loop_bf16", &aurora_moe::gemm_loop_bf16,
+             "Direct oneMKL loop of BF16 GEMMs on XPU");
+  module.def("shared_a_gemm_bf16", &aurora_moe::shared_a_gemm_bf16,
+             "Direct oneMKL BF16 GEMMs sharing one activation matrix on XPU");
+}

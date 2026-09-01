@@ -247,6 +247,15 @@ def make_experts_config(
     param_init: dict[str, Callable],
     score_before_experts: bool = True,
     use_grouped_mm: bool = True,
+    compute_backend: Literal[
+        "for_loop",
+        "grouped_mm",
+        "batched_mm_padded",
+        "scattermoe",
+        "aurora_sycl",
+        "aurora_full_loop",
+        "aurora_full_sonic",
+    ] | None = None,
     comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
 ) -> GroupedExperts.Config:
@@ -256,6 +265,7 @@ def make_experts_config(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
         use_grouped_mm=use_grouped_mm,
+        compute_backend=compute_backend,
         param_init=param_init,
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,

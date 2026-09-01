@@ -1,0 +1,665 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact receive-side EP route compaction and expansion.  Scatter positions
+// are unique route positions, so these kernels never require atomic updates.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace aurora_moe {
+
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr size_t kThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+class GatherRowsKernel;
+class GatherPayloadRowsKernel;
+class GatherPayloadRowsIdsKernel;
+template <bool WithIds>
+class SplitCompactPayloadKernel;
+template <bool WithIds>
+class CompactPayloadRowsFromCountsKernel;
+template <bool Expand>
+class CountMappedRowsKernel;
+class ScatterRowsKernel;
+template <class Scalar>
+class GatherScalarsKernel;
+template <class Scalar>
+class ScatterScalarsKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_positions(const at::Tensor& positions) {
+  check_xpu_contiguous(positions, "positions");
+  TORCH_CHECK(positions.scalar_type() == at::kLong,
+              "positions must have dtype torch.int64");
+  TORCH_CHECK(positions.dim() == 1, "positions must be rank 1");
+}
+
+void check_counts(const at::Tensor& counts) {
+  check_xpu_contiguous(counts, "counts");
+  TORCH_CHECK(counts.scalar_type() == at::kLong,
+              "counts must have dtype torch.int64");
+  TORCH_CHECK(counts.dim() == 1, "counts must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+template <class Scalar>
+at::Tensor gather_scalars_impl(const at::Tensor& values,
+                               const at::Tensor& positions) {
+  const int64_t count = positions.numel();
+  auto output = at::empty({count}, values.options());
+  if (count == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const Scalar*>(values.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<Scalar*>(output.data_ptr());
+  auto& queue = current_queue(values);
+  queue.parallel_for<GatherScalarsKernel<Scalar>>(
+      sycl::range<1>(static_cast<size_t>(count)), [=](sycl::id<1> index) {
+        const int64_t row = static_cast<int64_t>(index[0]);
+        out[row] = input[pos[row]];
+      });
+  return output;
+}
+
+template <class Scalar>
+at::Tensor scatter_scalars_impl(const at::Tensor& values,
+                                const at::Tensor& positions,
+                                int64_t output_rows) {
+  const int64_t count = positions.numel();
+  auto output = at::zeros({output_rows}, values.options());
+  if (count == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const Scalar*>(values.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<Scalar*>(output.data_ptr());
+  auto& queue = current_queue(values);
+  queue.parallel_for<ScatterScalarsKernel<Scalar>>(
+      sycl::range<1>(static_cast<size_t>(count)), [=](sycl::id<1> index) {
+        const int64_t row = static_cast<int64_t>(index[0]);
+        out[pos[row]] = input[row];
+      });
+  return output;
+}
+
+}  // namespace
+
+at::Tensor gather_rows_bf16(const at::Tensor& values,
+                            const at::Tensor& positions) {
+  check_bf16_matrix(values, "values");
+  check_positions(positions);
+  TORCH_CHECK(values.device() == positions.device(),
+              "values and positions must share an XPU device");
+  const int64_t count = positions.numel();
+  const int64_t columns = values.size(1);
+  auto output = at::empty({count, columns}, values.options());
+  if (count == 0 || columns == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(values);
+  const size_t groups = static_cast<size_t>(
+      (count + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<GatherRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < count; ++row) {
+          const int64_t source = pos[row];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            out[row * columns + column] = input[source * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+// Compact the valid rows of a fused transport payload without materializing
+// a strided token view.  The final payload column is returned as BF16 route
+// scores, while all preceding columns are BF16 token values.
+std::vector<at::Tensor> gather_payload_rows_bf16(
+    const at::Tensor& payload, const at::Tensor& positions) {
+  check_bf16_matrix(payload, "payload");
+  check_positions(positions);
+  TORCH_CHECK(payload.device() == positions.device(),
+              "payload and positions must share an XPU device");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must contain token columns and one score column");
+  const int64_t count = positions.numel();
+  const int64_t columns = payload.size(1) - 1;
+  const int64_t stride = columns + 1;
+  auto tokens = at::empty({count, columns}, payload.options());
+  auto scores = at::empty({count}, payload.options());
+  if (count == 0) {
+    return {tokens, scores};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  auto& queue = current_queue(payload);
+  const size_t groups = static_cast<size_t>(
+      (count + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<GatherPayloadRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < count; ++row) {
+          const int64_t source = pos[row];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            token_out[row * columns + column] = input[source * stride + column];
+          }
+          if (lane == 0) {
+            score_out[row] = input[source * stride + columns];
+          }
+        }
+      });
+  return {tokens, scores};
+}
+
+// Compact a fused token/score/local-ID payload.  The ID column is BF16 only
+// on the explicitly selected small-local-expert path, where every valid ID
+// is an integer in [0, 255] and is therefore represented exactly.  Validity
+// remains governed by the count exchange: zero-filled padding intentionally
+// cannot be identified from this column because local expert zero is valid.
+std::vector<at::Tensor> gather_payload_rows_with_ids_bf16(
+    const at::Tensor& payload, const at::Tensor& positions) {
+  check_bf16_matrix(payload, "payload");
+  check_positions(positions);
+  TORCH_CHECK(payload.device() == positions.device(),
+              "payload and positions must share an XPU device");
+  TORCH_CHECK(payload.size(1) >= 3,
+              "payload must contain token columns, one score, and one local ID");
+  const int64_t count = positions.numel();
+  const int64_t columns = payload.size(1) - 2;
+  const int64_t stride = columns + 2;
+  auto tokens = at::empty({count, columns}, payload.options());
+  auto scores = at::empty({count}, payload.options());
+  auto local_ids = at::empty({count}, positions.options());
+  if (count == 0) {
+    return {tokens, scores, local_ids};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  auto* id_out = local_ids.data_ptr<int64_t>();
+  auto& queue = current_queue(payload);
+  const size_t groups = static_cast<size_t>(
+      (count + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<GatherPayloadRowsIdsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < count; ++row) {
+          const int64_t source = pos[row];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            token_out[row * columns + column] = input[source * stride + column];
+          }
+          if (lane == 0) {
+            score_out[row] = input[source * stride + columns];
+            id_out[row] = static_cast<int64_t>(
+                static_cast<float>(input[source * stride + columns + 1]));
+          }
+        }
+      });
+  return {tokens, scores, local_ids};
+}
+
+template <bool WithIds>
+std::vector<at::Tensor> split_compact_payload_impl(const at::Tensor& payload) {
+  const int64_t rows = payload.size(0);
+  const int64_t columns = payload.size(1) - (WithIds ? 2 : 1);
+  const int64_t stride = columns + (WithIds ? 2 : 1);
+  auto tokens = at::empty({rows, columns}, payload.options());
+  auto scores = at::empty({rows}, payload.options());
+  at::Tensor local_ids;
+  int64_t* id_out = nullptr;
+  if constexpr (WithIds) {
+    local_ids = at::empty({rows}, payload.options().dtype(at::kLong));
+    id_out = local_ids.data_ptr<int64_t>();
+  }
+  if (rows == 0) {
+    if constexpr (WithIds) {
+      return {tokens, scores, local_ids};
+    }
+    return {tokens, scores};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  auto& queue = current_queue(payload);
+  const size_t groups = static_cast<size_t>(
+      (rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<SplitCompactPayloadKernel<WithIds>>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < rows; ++row) {
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            token_out[row * columns + column] = input[row * stride + column];
+          }
+          if (lane == 0) {
+            score_out[row] = input[row * stride + columns];
+            if constexpr (WithIds) {
+              id_out[row] = static_cast<int64_t>(
+                  static_cast<float>(input[row * stride + columns + 1]));
+            }
+          }
+        }
+      });
+  if constexpr (WithIds) {
+    return {tokens, scores, local_ids};
+  }
+  return {tokens, scores};
+}
+
+// Split every row of an exact non-padded alltoallv payload.  The output is
+// copied rather than exposed as strided views so the subsequent local BMM and
+// route kernels receive contiguous BF16 tensors.
+std::vector<at::Tensor> split_compact_payload_bf16(const at::Tensor& payload) {
+  check_bf16_matrix(payload, "payload");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must contain token columns and one score column");
+  return split_compact_payload_impl<false>(payload);
+}
+
+std::vector<at::Tensor> split_compact_payload_ids_bf16(
+    const at::Tensor& payload) {
+  check_bf16_matrix(payload, "payload");
+  TORCH_CHECK(payload.size(1) >= 3,
+              "payload must contain token columns, one score, and one local ID");
+  return split_compact_payload_impl<true>(payload);
+}
+
+template <bool WithIds>
+std::vector<at::Tensor> compact_payload_rows_from_counts_impl(
+    const at::Tensor& payload, const at::Tensor& recv_counts, int64_t cap,
+    int64_t output_rows) {
+  const int64_t columns = payload.size(1) - (WithIds ? 2 : 1);
+  const int64_t stride = columns + (WithIds ? 2 : 1);
+  auto tokens = at::empty({output_rows, columns}, payload.options());
+  auto scores = at::empty({output_rows}, payload.options());
+  at::Tensor local_ids;
+  int64_t* id_out = nullptr;
+  if constexpr (WithIds) {
+    local_ids = at::empty({output_rows}, recv_counts.options());
+    id_out = local_ids.data_ptr<int64_t>();
+  }
+  if (output_rows == 0) {
+    if constexpr (WithIds) {
+      return {tokens, scores, local_ids};
+    }
+    return {tokens, scores};
+  }
+
+  const int64_t sources = recv_counts.numel();
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  auto& queue = current_queue(payload);
+  const size_t groups = static_cast<size_t>(
+      (output_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<int64_t, 1> input_rows(
+        sycl::range<1>(kRowsPerWorkgroup), cgh);
+    cgh.parallel_for<CompactPayloadRowsFromCountsKernel<WithIds>>(
+        sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t base_row =
+              static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          // Resolve one padded source row per output row using four lanes,
+          // then share it with the vector-copy lanes in this workgroup.
+          if (lane < kRowsPerWorkgroup) {
+            const int64_t row = base_row + lane;
+            int64_t input_row = -1;
+            if (row < output_rows) {
+              int64_t remaining = row;
+              int64_t source = 0;
+              for (; source < sources; ++source) {
+                const int64_t source_rows = counts[source];
+                if (remaining < source_rows) {
+                  break;
+                }
+                remaining -= source_rows;
+              }
+              if (source != sources && remaining >= 0 && remaining < cap) {
+                input_row = source * cap + remaining;
+              }
+            }
+            input_rows[lane] = input_row;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t row = base_row;
+               row < base_row + kRowsPerWorkgroup && row < output_rows; ++row) {
+            const int64_t input_row = input_rows[row - base_row];
+            if (input_row < 0) {
+              continue;
+            }
+            for (int64_t column = lane; column < columns;
+                 column += static_cast<int64_t>(kThreads)) {
+              token_out[row * columns + column] = input[input_row * stride + column];
+            }
+            if (lane == 0) {
+              score_out[row] = input[input_row * stride + columns];
+              if constexpr (WithIds) {
+                id_out[row] = static_cast<int64_t>(
+                    static_cast<float>(input[input_row * stride + columns + 1]));
+              }
+            }
+          }
+        });
+  });
+  if constexpr (WithIds) {
+    return {tokens, scores, local_ids};
+  }
+  return {tokens, scores};
+}
+
+// Count-driven receive compaction.  This has the same source-major order as
+// `(arange(cap) < recv_counts[:, None]).nonzero()` followed by an index
+// gather, but does not materialize either intermediate.  `output_rows` is
+// supplied by the wrapper from the exact count sum because tensor allocation
+// needs the dynamic compact extent on the host.
+std::vector<at::Tensor> compact_payload_rows_from_counts_bf16(
+    const at::Tensor& payload, const at::Tensor& recv_counts, int64_t cap,
+    int64_t output_rows) {
+  check_bf16_matrix(payload, "payload");
+  check_counts(recv_counts);
+  TORCH_CHECK(payload.device() == recv_counts.device(),
+              "payload and recv_counts must share an XPU device");
+  TORCH_CHECK(cap >= 0 && output_rows >= 0,
+              "cap and output_rows must be nonnegative");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must contain token columns and one score column");
+  TORCH_CHECK(payload.size(0) == recv_counts.numel() * cap,
+              "payload rows must equal recv_counts.numel() * cap");
+  TORCH_CHECK(output_rows <= payload.size(0),
+              "output_rows cannot exceed padded payload rows");
+  return compact_payload_rows_from_counts_impl<false>(
+      payload, recv_counts, cap, output_rows);
+}
+
+std::vector<at::Tensor> compact_payload_rows_with_ids_from_counts_bf16(
+    const at::Tensor& payload, const at::Tensor& recv_counts, int64_t cap,
+    int64_t output_rows) {
+  check_bf16_matrix(payload, "payload");
+  check_counts(recv_counts);
+  TORCH_CHECK(payload.device() == recv_counts.device(),
+              "payload and recv_counts must share an XPU device");
+  TORCH_CHECK(cap >= 0 && output_rows >= 0,
+              "cap and output_rows must be nonnegative");
+  TORCH_CHECK(payload.size(1) >= 3,
+              "payload must contain token columns, score, and local ID");
+  TORCH_CHECK(payload.size(0) == recv_counts.numel() * cap,
+              "payload rows must equal recv_counts.numel() * cap");
+  TORCH_CHECK(output_rows <= payload.size(0),
+              "output_rows cannot exceed padded payload rows");
+  return compact_payload_rows_from_counts_impl<true>(
+      payload, recv_counts, cap, output_rows);
+}
+
+template <bool Expand>
+at::Tensor count_mapped_rows_impl(const at::Tensor& values,
+                                  const at::Tensor& recv_counts,
+                                  int64_t cap, int64_t compact_rows) {
+  const int64_t columns = values.size(1);
+  const int64_t padded_rows = recv_counts.numel() * cap;
+  auto output = Expand
+      ? at::zeros({padded_rows, columns}, values.options())
+      : at::empty({compact_rows, columns}, values.options());
+  if (compact_rows == 0 || columns == 0) {
+    return output;
+  }
+  const int64_t sources = recv_counts.numel();
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(values);
+  const size_t groups = static_cast<size_t>(
+      (compact_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<int64_t, 1> padded_rows_local(
+        sycl::range<1>(kRowsPerWorkgroup), cgh);
+    cgh.parallel_for<CountMappedRowsKernel<Expand>>(
+        sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t base_row =
+              static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          if (lane < kRowsPerWorkgroup) {
+            const int64_t row = base_row + lane;
+            int64_t padded_row = -1;
+            if (row < compact_rows) {
+              int64_t remaining = row;
+              int64_t source = 0;
+              for (; source < sources; ++source) {
+                const int64_t source_rows = counts[source];
+                if (remaining < source_rows) {
+                  break;
+                }
+                remaining -= source_rows;
+              }
+              if (source != sources && remaining >= 0 && remaining < cap) {
+                padded_row = source * cap + remaining;
+              }
+            }
+            padded_rows_local[lane] = padded_row;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t row = base_row;
+               row < base_row + kRowsPerWorkgroup && row < compact_rows; ++row) {
+            const int64_t padded_row = padded_rows_local[row - base_row];
+            if (padded_row < 0) {
+              continue;
+            }
+            for (int64_t column = lane; column < columns;
+                 column += static_cast<int64_t>(kThreads)) {
+              if constexpr (Expand) {
+                out[padded_row * columns + column] = input[row * columns + column];
+              } else {
+                out[row * columns + column] = input[padded_row * columns + column];
+              }
+            }
+          }
+        });
+  });
+  return output;
+}
+
+at::Tensor compact_rows_from_counts_bf16(const at::Tensor& values,
+                                         const at::Tensor& recv_counts,
+                                         int64_t cap, int64_t output_rows) {
+  check_bf16_matrix(values, "values");
+  check_counts(recv_counts);
+  TORCH_CHECK(values.device() == recv_counts.device(),
+              "values and recv_counts must share an XPU device");
+  TORCH_CHECK(cap >= 0 && output_rows >= 0,
+              "cap and output_rows must be nonnegative");
+  TORCH_CHECK(values.size(0) == recv_counts.numel() * cap,
+              "values rows must equal recv_counts.numel() * cap");
+  TORCH_CHECK(output_rows <= values.size(0),
+              "output_rows cannot exceed padded value rows");
+  return count_mapped_rows_impl<false>(values, recv_counts, cap, output_rows);
+}
+
+at::Tensor expand_rows_to_counts_bf16(const at::Tensor& values,
+                                      const at::Tensor& recv_counts,
+                                      int64_t cap) {
+  check_bf16_matrix(values, "values");
+  check_counts(recv_counts);
+  TORCH_CHECK(values.device() == recv_counts.device(),
+              "values and recv_counts must share an XPU device");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  TORCH_CHECK(values.size(0) <= recv_counts.numel() * cap,
+              "compact values cannot exceed padded EP rows");
+  return count_mapped_rows_impl<true>(values, recv_counts, cap, values.size(0));
+}
+
+at::Tensor scatter_rows_bf16(const at::Tensor& values,
+                             const at::Tensor& positions,
+                             int64_t output_rows) {
+  check_bf16_matrix(values, "values");
+  check_positions(positions);
+  TORCH_CHECK(values.device() == positions.device(),
+              "values and positions must share an XPU device");
+  TORCH_CHECK(values.size(0) == positions.numel(),
+              "values and positions must have the same row count");
+  TORCH_CHECK(output_rows >= positions.numel(),
+              "output_rows must cover every exact route");
+  const int64_t count = positions.numel();
+  const int64_t columns = values.size(1);
+  auto output = at::zeros({output_rows, columns}, values.options());
+  if (count == 0 || columns == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  const auto* pos = positions.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(values);
+  const size_t groups = static_cast<size_t>(
+      (count + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<ScatterRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < count; ++row) {
+          const int64_t destination = pos[row];
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            out[destination * columns + column] = input[row * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+at::Tensor gather_scalars(const at::Tensor& values,
+                          const at::Tensor& positions) {
+  check_xpu_contiguous(values, "values");
+  check_positions(positions);
+  TORCH_CHECK(values.scalar_type() == at::kBFloat16 ||
+                  values.scalar_type() == at::kFloat,
+              "values must have dtype torch.bfloat16 or torch.float32");
+  TORCH_CHECK(values.dim() == 1, "values must be rank 1");
+  TORCH_CHECK(values.device() == positions.device(),
+              "values and positions must share an XPU device");
+  if (values.scalar_type() == at::kBFloat16) {
+    return gather_scalars_impl<bf16>(values, positions);
+  }
+  return gather_scalars_impl<float>(values, positions);
+}
+
+at::Tensor scatter_scalars(const at::Tensor& values,
+                           const at::Tensor& positions,
+                           int64_t output_rows) {
+  check_xpu_contiguous(values, "values");
+  check_positions(positions);
+  TORCH_CHECK(values.scalar_type() == at::kBFloat16 ||
+                  values.scalar_type() == at::kFloat,
+              "values must have dtype torch.bfloat16 or torch.float32");
+  TORCH_CHECK(values.dim() == 1, "values must be rank 1");
+  TORCH_CHECK(values.device() == positions.device(),
+              "values and positions must share an XPU device");
+  TORCH_CHECK(values.numel() == positions.numel(),
+              "values and positions must have the same row count");
+  TORCH_CHECK(output_rows >= positions.numel(),
+              "output_rows must cover every exact route");
+  if (values.scalar_type() == at::kBFloat16) {
+    return scatter_scalars_impl<bf16>(values, positions, output_rows);
+  }
+  return scatter_scalars_impl<float>(values, positions, output_rows);
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("gather_rows_bf16", &aurora_moe::gather_rows_bf16,
+             "Gather BF16 rows by exact route positions (XPU)");
+  module.def("gather_payload_rows_bf16", &aurora_moe::gather_payload_rows_bf16,
+             "Gather BF16 token rows and scores from fused EP payload (XPU)");
+  module.def("gather_payload_rows_with_ids_bf16",
+             &aurora_moe::gather_payload_rows_with_ids_bf16,
+             "Gather BF16 token rows, scores, and exact-small IDs from EP payload (XPU)");
+  module.def("split_compact_payload_bf16",
+             &aurora_moe::split_compact_payload_bf16,
+             "Split exact non-padded BF16 token/score payload into contiguous buffers (XPU)");
+  module.def("split_compact_payload_ids_bf16",
+             &aurora_moe::split_compact_payload_ids_bf16,
+             "Split exact non-padded BF16 token/score/small-ID payload (XPU)");
+  module.def("compact_payload_rows_from_counts_bf16",
+             &aurora_moe::compact_payload_rows_from_counts_bf16,
+             "Compact BF16 token/score payload by exact receive counts (XPU)");
+  module.def("compact_payload_rows_with_ids_from_counts_bf16",
+             &aurora_moe::compact_payload_rows_with_ids_from_counts_bf16,
+             "Compact BF16 token/score/small-ID payload by exact receive counts (XPU)");
+  module.def("compact_rows_from_counts_bf16",
+             &aurora_moe::compact_rows_from_counts_bf16,
+             "Compact BF16 EP rows by exact receive counts (XPU)");
+  module.def("expand_rows_to_counts_bf16",
+             &aurora_moe::expand_rows_to_counts_bf16,
+             "Expand BF16 compact rows to exact padded EP layout (XPU)");
+  module.def("scatter_rows_bf16", &aurora_moe::scatter_rows_bf16,
+             "Scatter BF16 rows to unique exact route positions (XPU)");
+  module.def("gather_scalars", &aurora_moe::gather_scalars,
+             "Gather BF16/FP32 scalars by route positions (XPU)");
+  module.def("scatter_scalars", &aurora_moe::scatter_scalars,
+             "Scatter BF16/FP32 scalars to unique route positions (XPU)");
+}

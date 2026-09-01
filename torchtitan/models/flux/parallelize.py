@@ -42,7 +42,11 @@ def parallelize_flux(
         apply_ac(model, ac_config)
 
     if parallel_dims.cp_enabled:
-        apply_cp(model, parallel_dims.get_mesh("cp"))
+        apply_cp(
+            model,
+            parallel_dims.get_mesh("cp"),
+            parallelism.context_parallel_rotate_method,
+        )
 
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(model, compile_config)
@@ -159,7 +163,11 @@ def apply_ac(model: nn.Module, ac_config):
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
 
 
-def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
+def apply_cp(
+    model: nn.Module,
+    cp_mesh: DeviceMesh,
+    rotate_method: str = "allgather",
+) -> None:
     """
     Apply context parallelism to the Flux model.
 
@@ -167,6 +175,7 @@ def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
         model: The Flux model with double_blocks and single_blocks containing
             inner attention modules.
         cp_mesh: Device mesh for context parallel dimension
+        rotate_method: Collective used to rotate SDPA K/V shards.
 
     Note:
         - Uses SDPA attention type
@@ -190,7 +199,7 @@ def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
         attention_modules.append(single_block.inner_attention)
 
     # Apply CP using direct forward wrapping (always uses SDPA for Flux)
-    apply_cp_to_forward(attention_modules, cp_mesh)
+    apply_cp_to_forward(attention_modules, cp_mesh, rotate_method)
 
     logger.info("Applied Context Parallel to the Flux model")
 

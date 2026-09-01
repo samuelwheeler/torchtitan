@@ -17,6 +17,7 @@ from torch.distributed.tensor.experimental._attention import (
     _enable_context_parallel_dispatcher,
     _HeadTailLoadBalancer,
     _PTRRLoadBalancer,
+    set_rotate_method,
 )
 from torch.distributed.tensor.experimental._context_parallel._attention import (
     flex_cp_allgather,
@@ -35,6 +36,7 @@ from torchtitan.tools.logging import logger
 def apply_cp_to_forward(
     attention_modules: Sequence[nn.Module],
     cp_mesh: DeviceMesh,
+    rotate_method: str = "allgather",
 ) -> None:
     """Wrap inner attention ``forward`` with CP logic.
 
@@ -52,9 +54,27 @@ def apply_cp_to_forward(
     Args:
         attention_modules: Sequence of inner attention modules to apply CP to.
         cp_mesh: Device mesh for context parallel dimension.
+        rotate_method: Collective used to rotate SDPA K/V shards. Must be
+            ``"allgather"`` or ``"alltoall"``. FlexAttention currently only
+            supports ``"allgather"``.
     """
+    if not attention_modules:
+        raise ValueError("Context Parallel requires at least one attention module")
+    if rotate_method not in {"allgather", "alltoall"}:
+        raise ValueError(
+            f"Invalid Context Parallel rotate method {rotate_method!r}; "
+            "expected 'allgather' or 'alltoall'"
+        )
+
     first = attention_modules[0]
     if isinstance(first, FlexAttention):
+        if not all(isinstance(mod, FlexAttention) for mod in attention_modules):
+            raise TypeError("Context Parallel attention modules must have one type")
+        if rotate_method == "alltoall":
+            raise NotImplementedError(
+                "FlexAttention Context Parallel does not support alltoall K/V rotation"
+            )
+        set_rotate_method(rotate_method)
         for mod in attention_modules:
             original_forward = mod.forward
 
@@ -64,7 +84,7 @@ def apply_cp_to_forward(
                 def cp_forward(q, k, v, **kwargs):
                     k = k.contiguous()
                     v = v.contiguous()
-                    global_k, global_v = flex_cp_allgather(k, v, 2, pg_name)
+                    global_k, global_v = flex_cp_allgather(k, v, 1, pg_name)
                     return orig_fn(q, global_k, global_v, **kwargs)
 
                 return cp_forward
@@ -72,13 +92,21 @@ def apply_cp_to_forward(
             mod.forward = _make_cp_forward(original_forward, cp_mesh)
 
     elif isinstance(first, ScaledDotProductAttention):
+        if not all(
+            isinstance(mod, ScaledDotProductAttention) for mod in attention_modules
+        ):
+            raise TypeError("Context Parallel attention modules must have one type")
+        set_rotate_method(rotate_method)
         _enable_context_parallel_dispatcher()
 
         for mod in attention_modules:
             original_forward = mod.forward
 
             def _make_cp_forward(orig_fn, mesh):
-                placement = [Shard(2)]
+                # Q/K/V are still in model layout (B, L, H, D) here. Mark the
+                # sequence axis so the attention transpose presents Shard(2)
+                # to SDPA in its (B, H, L, D) layout.
+                placement = [Shard(1)]
 
                 def cp_forward(q, k, v, **kwargs):
                     if not isinstance(q, DTensor):
@@ -102,7 +130,10 @@ def apply_cp_to_forward(
             f"{type(first).__name__}"
         )
 
-    logger.info("Applied Context Parallel (forward wrapping) to the model")
+    logger.info(
+        "Applied Context Parallel (forward wrapping, rotate_method=%s) to the model",
+        rotate_method,
+    )
 
 
 def prepare_context_parallel_input(

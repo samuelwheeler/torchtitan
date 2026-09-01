@@ -21,6 +21,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.fsdp import set_fsdp_gradient_sync
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.trainer import Trainer as TitanTrainer
@@ -288,7 +289,16 @@ class Trainer(ForgeEngine):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for microbatch_idx, (input_dict, labels) in enumerate(microbatches):
+            if (
+                self.gradient_accumulation_steps > 1
+                and parallel_dims.dp_cp_enabled
+                and not parallel_dims.pp_enabled
+            ):
+                set_fsdp_gradient_sync(
+                    self.model_parts,
+                    microbatch_idx == self.gradient_accumulation_steps - 1,
+                )
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):

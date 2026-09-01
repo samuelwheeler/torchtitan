@@ -13,6 +13,7 @@ import torch.nn as nn
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.models.common import (
     Embedding,
+    GQAttention,
     Linear,
     RMSNorm,
     RoPE,
@@ -20,11 +21,14 @@ from torchtitan.models.common import (
 )
 from torchtitan.experiments.ezpz.agpt import (
     _default_inner_attention,
+    _depth_init as _agpt_depth_init,
     _ezpz_get_attention_config,
+    _linear_init as _agpt_linear_init,
 )
 from torchtitan.models.common.config_utils import (
     make_experts_config,
     make_ffn_config,
+    make_gqa_config,
     make_moe_config,
     make_router_config,
 )
@@ -938,6 +942,320 @@ def _10b_2b_sdpa() -> moeModel.Config:
     return cfg
 
 
+def _10b_2b_50k_sdpa() -> moeModel.Config:
+    """~10.56B total / ~2.00B active with the AGPT 50K vocabulary.
+
+    This is the MoE counterpart to ``agpt_2b_50k``: the much smaller
+    embedding/output tables are reinvested in a 31-layer transformer
+    backbone.  It retains the existing 36-expert, top-3, two-shared-expert
+    routing geometry, which divides evenly over one Aurora node's 12 tiles.
+    """
+    dim = 2048
+    n_layers = 31
+    vocab_size = 50304
+    n_heads = 16
+    moe_hidden_dim = 1408
+    num_shared_experts = 2
+    dense_hidden_dim = 10944
+    rope_dim = 64
+    num_experts = 36
+    n_dense_layers = 1
+
+    layers = _build_moe_layers(
+        n_layers=n_layers,
+        n_dense_layers=n_dense_layers,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=dense_hidden_dim,
+        moe_hidden_dim=moe_hidden_dim,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        router_top_k=3,
+        router_score_func="softmax",
+        score_before_experts=False,
+        attn_backend="sdpa",
+    )
+    return moeModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+    )
+
+
+def _10b_2b_50k_sdpa_for_loop() -> moeModel.Config:
+    cfg = _10b_2b_50k_sdpa()
+    for layer_cfg in cfg.layers:
+        if layer_cfg.moe is not None:
+            layer_cfg.moe.experts.compute_backend = "for_loop"
+            layer_cfg.moe.experts.use_grouped_mm = False
+    return cfg
+
+
+def _10b_2b_50k_sdpa_aurora_sycl() -> moeModel.Config:
+    cfg = _10b_2b_50k_sdpa()
+    for layer_cfg in cfg.layers:
+        if layer_cfg.moe is not None:
+            layer_cfg.moe.experts.compute_backend = "aurora_sycl"
+            layer_cfg.moe.experts.use_grouped_mm = False
+    return cfg
+
+
+def _10b_2b_50k_sdpa_aurora_full(backend: str) -> moeModel.Config:
+    cfg = _10b_2b_50k_sdpa()
+    for layer_cfg in cfg.layers:
+        if layer_cfg.moe is not None:
+            layer_cfg.moe.experts.compute_backend = backend
+            layer_cfg.moe.experts.use_grouped_mm = False
+    return cfg
+
+
+def _10b_2b_50k_sdpa_aurora_full_loop() -> moeModel.Config:
+    return _10b_2b_50k_sdpa_aurora_full("aurora_full_loop")
+
+
+def _10b_2b_50k_sdpa_aurora_full_sonic() -> moeModel.Config:
+    return _10b_2b_50k_sdpa_aurora_full("aurora_full_sonic")
+
+
+def _10b_2b_50k_sdpa_aurora_full_1layer(backend: str) -> moeModel.Config:
+    cfg = _10b_2b_50k_sdpa_aurora_full(backend)
+    cfg.layers = [cfg.layers[1]]
+    return cfg
+
+
+def _10b_2b_50k_sdpa_aurora_full_loop_1layer() -> moeModel.Config:
+    return _10b_2b_50k_sdpa_aurora_full_1layer("aurora_full_loop")
+
+
+def _10b_2b_50k_sdpa_aurora_full_sonic_1layer() -> moeModel.Config:
+    return _10b_2b_50k_sdpa_aurora_full_1layer("aurora_full_sonic")
+
+
+def _agpt_2b_50k_moe_sdpa(
+    expert_backend: str = "for_loop",
+) -> moeModel.Config:
+    """AGPT 2B/50K backbone with compute-matched MoE FFNs.
+
+    Attention, depth, width, RoPE, vocabulary, normalization, and parameter
+    initialization match ``agpt_2b_50k``. Every 10,496-wide dense FFN is
+    replaced by 36 routed experts (top-3) plus two shared-expert equivalents.
+    A 2,112-wide expert gives 10,560 active hidden units per token.
+    """
+    dim = 2048
+    n_layers = 24
+    n_heads = 16
+    n_kv_heads = 4
+    vocab_size = 50304
+    expert_hidden_dim = 2112
+    num_experts = 36
+    top_k = 3
+    num_shared_experts = 2
+    layers = []
+
+    for layer_id in range(n_layers):
+        linear_init = _agpt_linear_init(dim)
+        depth_init = _agpt_depth_init(dim, layer_id)
+        expert_init = {
+            "w1": linear_init["weight"],
+            "w2": depth_init["weight"],
+            "w3": depth_init["weight"],
+        }
+        layers.append(
+            moeTransformerBlock.Config(
+                attention_norm=RMSNorm.Config(
+                    normalized_shape=dim, param_init=_NORM_INIT
+                ),
+                ffn_norm=RMSNorm.Config(
+                    normalized_shape=dim, param_init=_NORM_INIT
+                ),
+                attention=make_gqa_config(
+                    dim=dim,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    wqkv_param_init=linear_init,
+                    wo_param_init=depth_init,
+                    inner_attention=_default_inner_attention(),
+                    mask_type="causal",
+                ),
+                feed_forward=None,
+                moe=make_moe_config(
+                    num_experts=num_experts,
+                    load_balance_coeff=1e-3,
+                    router=make_router_config(
+                        dim=dim,
+                        num_experts=num_experts,
+                        gate_param_init=depth_init,
+                        top_k=top_k,
+                        score_func="softmax",
+                        route_norm=False,
+                    ),
+                    experts=make_experts_config(
+                        dim=dim,
+                        hidden_dim=expert_hidden_dim,
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        score_before_experts=False,
+                        use_grouped_mm=False,
+                        compute_backend=expert_backend,
+                        comm_backend="standard",
+                        param_init=expert_init,
+                    ),
+                    shared_experts=make_ffn_config(
+                        dim=dim,
+                        hidden_dim=expert_hidden_dim * num_shared_experts,
+                        w1_param_init=linear_init,
+                        w2w3_param_init=depth_init,
+                    ),
+                ),
+            )
+        )
+
+    return moeModel.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=dim // n_heads,
+            max_seq_len=131072,
+            theta=50000,
+            backend="complex",
+            scaling="none",
+        ),
+        layers=layers,
+    )
+
+
+def _agpt_2b_50k_moe_sdpa_aurora_full_loop() -> moeModel.Config:
+    return _agpt_2b_50k_moe_sdpa("aurora_full_loop")
+
+
+def _agpt_2b_50k_moe_sdpa_aurora_full_sonic() -> moeModel.Config:
+    return _agpt_2b_50k_moe_sdpa("aurora_full_sonic")
+
+
+def _10b_2b_sdpa_1layer() -> moeModel.Config:
+    """Single-block profiling variant of 10B_2B_sdpa.
+
+    Keeps the same hidden size, head geometry, expert count, router setup,
+    and MoE dimensions as 10B_2B_sdpa, but reduces the stack to one
+    transformer block containing attention + MoE.
+    """
+    dim = 2048
+    n_layers = 1
+    vocab_size = 256128
+    n_heads = 16
+    moe_hidden_dim = 1408
+    num_shared_experts = 2
+    dense_hidden_dim = 10944
+    rope_dim = 64
+    num_experts = 36
+    n_dense_layers = 0
+
+    layers = _build_moe_layers(
+        n_layers=n_layers,
+        n_dense_layers=n_dense_layers,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=dense_hidden_dim,
+        moe_hidden_dim=moe_hidden_dim,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        router_top_k=3,
+        router_score_func="softmax",
+        score_before_experts=False,
+        attn_backend="sdpa",
+    )
+    return moeModel.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+    )
+
+
+def _10b_2b_sdpa_batched_mm_padded() -> moeModel.Config:
+    cfg = _10b_2b_sdpa()
+    for layer_cfg in cfg.layers:
+        if layer_cfg.moe is None:
+            continue
+        layer_cfg.moe.experts.compute_backend = "batched_mm_padded"
+        layer_cfg.moe.experts.use_grouped_mm = False
+    return cfg
+
+
+def _10b_2b_sdpa_scattermoe() -> moeModel.Config:
+    cfg = _10b_2b_sdpa()
+    for layer_cfg in cfg.layers:
+        if layer_cfg.moe is None:
+            continue
+        layer_cfg.moe.experts.compute_backend = "scattermoe"
+        layer_cfg.moe.experts.use_grouped_mm = False
+    return cfg
+
+
 moe_configs = {
     "debugmodel": _debugmodel,
     "debugmodel_flex_attn": _debugmodel_flex_attn,
@@ -951,6 +1269,19 @@ moe_configs = {
     "671B": _671b,
     "10B_2B": _10b_2b,
     "10B_2B_sdpa": _10b_2b_sdpa,
+    "10B_2B_50K_sdpa": _10b_2b_50k_sdpa,
+    "10B_2B_50K_sdpa_for_loop": _10b_2b_50k_sdpa_for_loop,
+    "10B_2B_50K_sdpa_aurora_sycl": _10b_2b_50k_sdpa_aurora_sycl,
+    "10B_2B_50K_sdpa_aurora_full_loop": _10b_2b_50k_sdpa_aurora_full_loop,
+    "10B_2B_50K_sdpa_aurora_full_sonic": _10b_2b_50k_sdpa_aurora_full_sonic,
+    "10B_2B_50K_sdpa_aurora_full_loop_1layer": _10b_2b_50k_sdpa_aurora_full_loop_1layer,
+    "10B_2B_50K_sdpa_aurora_full_sonic_1layer": _10b_2b_50k_sdpa_aurora_full_sonic_1layer,
+    "AGPT_2B_50K_MOE_sdpa": _agpt_2b_50k_moe_sdpa,
+    "AGPT_2B_50K_MOE_sdpa_aurora_full_loop": _agpt_2b_50k_moe_sdpa_aurora_full_loop,
+    "AGPT_2B_50K_MOE_sdpa_aurora_full_sonic": _agpt_2b_50k_moe_sdpa_aurora_full_sonic,
+    "10B_2B_sdpa_1layer": _10b_2b_sdpa_1layer,
+    "10B_2B_sdpa_batched_mm_padded": _10b_2b_sdpa_batched_mm_padded,
+    "10B_2B_sdpa_scattermoe": _10b_2b_sdpa_scattermoe,
 }
 
 moe_configs["debugmodel_hf"] = moe_configs["debugmodel"]
@@ -995,5 +1326,12 @@ def model_registry(
         parallelize_fn=parallelize_moe,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=moeStateDictAdapter,
+        # The DeepSeek adapter assumes MLA projections. Native DCP checkpoints
+        # do not require an adapter; HF conversion for this GQA-MoE flavor is
+        # intentionally disabled until it has an explicit mapping.
+        state_dict_adapter=(
+            None
+            if isinstance(config.layers[0].attention, GQAttention.Config)
+            else moeStateDictAdapter
+        ),
     )

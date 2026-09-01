@@ -1,0 +1,305 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact compact expert-major BF16 GEMMs through oneMKL.  Unlike a padded BMM,
+// every call receives only an expert's true runtime row interval.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+#include <oneapi/mkl/blas.hpp>
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using BFloat16 = oneapi::mkl::bfloat16;
+
+void check_xpu_bf16(const at::Tensor& tensor, const char* name, int64_t dimensions) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == dimensions, name, " has an invalid rank");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_rows(const std::vector<int64_t>& rows, int64_t experts,
+                int64_t total_rows) {
+  TORCH_CHECK(static_cast<int64_t>(rows.size()) == experts,
+              "expert_rows must contain one true row count per expert");
+  int64_t sum = 0;
+  for (const int64_t value : rows) {
+    TORCH_CHECK(value >= 0, "expert_rows must be non-negative");
+    sum += value;
+  }
+  TORCH_CHECK(sum == total_rows,
+              "expert_rows must sum exactly to the compact activation row count");
+}
+
+void record_current_stream(const at::Tensor& tensor) {
+  tensor.record_stream(c10::xpu::getCurrentXPUStream(tensor.get_device()).unwrap());
+}
+
+bool explicit_stream_barriers() {
+  const char* value = std::getenv("AURORA_MOE_ONEMKL_EXACT_BARRIERS");
+  if (value == nullptr || std::strcmp(value, "0") == 0) {
+    return false;
+  }
+  TORCH_CHECK(std::strcmp(value, "1") == 0,
+              "AURORA_MOE_ONEMKL_EXACT_BARRIERS must be '0' or '1'");
+  return true;
+}
+
+// Direct oneMKL calls on PyTorch's current XPU stream are the fast, validated
+// default (the same execution model as one_mkl_batched_gemm.sycl).  Keep an
+// opt-in explicit event bridge for diagnosing a future out-of-order stream
+// issue, but do not impose its queue barriers on the steady-state path.
+template <class Submit>
+void submit_after_current_stream(sycl::queue& queue, Submit&& submit) {
+  const bool use_barriers = explicit_stream_barriers();
+  std::vector<sycl::event> producer_dependencies;
+  if (use_barriers) {
+    producer_dependencies.push_back(queue.ext_oneapi_submit_barrier());
+  }
+  std::vector<sycl::event> events;
+  submit(producer_dependencies, events);
+  if (use_barriers && !events.empty()) {
+    queue.ext_oneapi_submit_barrier(events);
+  }
+}
+
+}  // namespace
+
+at::Tensor exact_expert_gemm_bf16(const at::Tensor& activations,
+                                  const at::Tensor& weights,
+                                  const std::vector<int64_t>& expert_rows) {
+  check_xpu_bf16(activations, "activations", 2);
+  check_xpu_bf16(weights, "weights", 3);
+  TORCH_CHECK(activations.device() == weights.device(),
+              "activations and weights must share an XPU device");
+  const int64_t experts = weights.size(0);
+  const int64_t k = activations.size(1);
+  const int64_t n = weights.size(2);
+  TORCH_CHECK(experts > 0 && k > 0 && n > 0 && weights.size(1) == k,
+              "weights must have shape [experts, activations.size(1), output_dim]");
+  check_rows(expert_rows, experts, activations.size(0));
+
+  auto output = at::empty({activations.size(0), n}, activations.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(activations.get_device()).queue();
+  const auto* activation_ptr = reinterpret_cast<const BFloat16*>(activations.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const BFloat16*>(weights.data_ptr());
+  auto* output_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+
+  submit_after_current_stream(queue, [&](const std::vector<sycl::event>& dependencies,
+                                         std::vector<sycl::event>& events) {
+    int64_t begin = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const int64_t rows = expert_rows[expert];
+      if (rows != 0) {
+        events.push_back(oneapi::mkl::blas::row_major::gemm(
+            queue, oneapi::mkl::transpose::nontrans,
+            oneapi::mkl::transpose::nontrans, rows, n, k, 1.0f,
+            activation_ptr + begin * k, k,
+            weight_ptr + expert * k * n, n, 0.0f,
+            output_ptr + begin * n, n, dependencies));
+      }
+      begin += rows;
+    }
+  });
+  record_current_stream(activations);
+  record_current_stream(weights);
+  record_current_stream(output);
+  return output;
+}
+
+// Exact dX-style GEMM without materializing `weights.transpose(-1, -2)`.
+// `weights` stays in its normal forward layout [expert, forward_input,
+// forward_output] (for example W_down is [expert, H, D]). Relative to this
+// backward GEMM it is [expert, output, input], while `activations` has
+// `input` columns (dY is [rows, D]). oneMKL's row-major transpose flag reads
+// the existing forward weight allocation as [input, output] directly. This is
+// deliberately a separate API rather than a heuristic: the two contracts are
+// unambiguous and both retain arbitrary runtime expert rows/dimensions.
+at::Tensor exact_expert_gemm_transposed_weight_bf16(
+    const at::Tensor& activations, const at::Tensor& weights,
+    const std::vector<int64_t>& expert_rows) {
+  check_xpu_bf16(activations, "activations", 2);
+  check_xpu_bf16(weights, "weights", 3);
+  TORCH_CHECK(activations.device() == weights.device(),
+              "activations and weights must share an XPU device");
+  const int64_t experts = weights.size(0);
+  const int64_t output_dim = weights.size(1);
+  const int64_t input_dim = weights.size(2);
+  TORCH_CHECK(experts > 0 && output_dim > 0 && input_dim > 0 &&
+                  activations.size(1) == input_dim,
+              "weights must have shape [experts, output_dim, activations.size(1)]");
+  check_rows(expert_rows, experts, activations.size(0));
+
+  auto output = at::empty({activations.size(0), output_dim}, activations.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(activations.get_device()).queue();
+  const auto* activation_ptr = reinterpret_cast<const BFloat16*>(activations.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const BFloat16*>(weights.data_ptr());
+  auto* output_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+
+  submit_after_current_stream(queue, [&](const std::vector<sycl::event>& dependencies,
+                                         std::vector<sycl::event>& events) {
+    int64_t begin = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const int64_t rows = expert_rows[expert];
+      if (rows != 0) {
+        events.push_back(oneapi::mkl::blas::row_major::gemm(
+            queue, oneapi::mkl::transpose::nontrans,
+            oneapi::mkl::transpose::trans, rows, output_dim, input_dim, 1.0f,
+            activation_ptr + begin * input_dim, input_dim,
+            weight_ptr + expert * output_dim * input_dim, input_dim, 0.0f,
+            output_ptr + begin * output_dim, output_dim, dependencies));
+      }
+      begin += rows;
+    }
+  });
+  record_current_stream(activations);
+  record_current_stream(weights);
+  record_current_stream(output);
+  return output;
+}
+
+// Exact SwiGLU dX reduction with no intermediate [routes, D] add. Each
+// expert first writes `left_activations @ left_weights.T`, then accumulates
+// `right_activations @ right_weights.T` into the same compact output. The
+// weights remain in their normal forward allocations. The explicit event
+// edge makes the beta=1 GEMM depend on its corresponding beta=0 producer even
+// if a future PyTorch current stream uses an out-of-order SYCL queue.
+at::Tensor exact_expert_sum_transposed_weight_bf16(
+    const at::Tensor& left_activations, const at::Tensor& left_weights,
+    const at::Tensor& right_activations, const at::Tensor& right_weights,
+    const std::vector<int64_t>& expert_rows) {
+  check_xpu_bf16(left_activations, "left_activations", 2);
+  check_xpu_bf16(left_weights, "left_weights", 3);
+  check_xpu_bf16(right_activations, "right_activations", 2);
+  check_xpu_bf16(right_weights, "right_weights", 3);
+  TORCH_CHECK(left_activations.device() == left_weights.device() &&
+                  left_activations.device() == right_activations.device() &&
+                  left_activations.device() == right_weights.device(),
+              "all exact expert dX operands must share an XPU device");
+  TORCH_CHECK(left_activations.size(0) == right_activations.size(0),
+              "left and right activations must share compact row count");
+  const int64_t experts = left_weights.size(0);
+  const int64_t output_dim = left_weights.size(1);
+  const int64_t left_input_dim = left_weights.size(2);
+  const int64_t right_input_dim = right_weights.size(2);
+  TORCH_CHECK(experts > 0 && output_dim > 0 && left_input_dim > 0 &&
+                  right_input_dim > 0 && right_weights.size(0) == experts &&
+                  right_weights.size(1) == output_dim &&
+                  left_activations.size(1) == left_input_dim &&
+                  right_activations.size(1) == right_input_dim,
+              "weights must be [experts, common_output_dim, activation_dim]");
+  check_rows(expert_rows, experts, left_activations.size(0));
+
+  auto output = at::empty({left_activations.size(0), output_dim},
+                          left_activations.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(left_activations.get_device()).queue();
+  const auto* left_activation_ptr =
+      reinterpret_cast<const BFloat16*>(left_activations.data_ptr());
+  const auto* left_weight_ptr = reinterpret_cast<const BFloat16*>(left_weights.data_ptr());
+  const auto* right_activation_ptr =
+      reinterpret_cast<const BFloat16*>(right_activations.data_ptr());
+  const auto* right_weight_ptr = reinterpret_cast<const BFloat16*>(right_weights.data_ptr());
+  auto* output_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+
+  submit_after_current_stream(queue, [&](const std::vector<sycl::event>& dependencies,
+                                         std::vector<sycl::event>& events) {
+    int64_t begin = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const int64_t rows = expert_rows[expert];
+      if (rows != 0) {
+        const auto first = oneapi::mkl::blas::row_major::gemm(
+            queue, oneapi::mkl::transpose::nontrans,
+            oneapi::mkl::transpose::trans, rows, output_dim, left_input_dim, 1.0f,
+            left_activation_ptr + begin * left_input_dim, left_input_dim,
+            left_weight_ptr + expert * output_dim * left_input_dim, left_input_dim,
+            0.0f, output_ptr + begin * output_dim, output_dim, dependencies);
+        events.push_back(oneapi::mkl::blas::row_major::gemm(
+            queue, oneapi::mkl::transpose::nontrans,
+            oneapi::mkl::transpose::trans, rows, output_dim, right_input_dim, 1.0f,
+            right_activation_ptr + begin * right_input_dim, right_input_dim,
+            right_weight_ptr + expert * output_dim * right_input_dim, right_input_dim,
+            1.0f, output_ptr + begin * output_dim, output_dim, {first}));
+      }
+      begin += rows;
+    }
+  });
+  record_current_stream(left_activations);
+  record_current_stream(left_weights);
+  record_current_stream(right_activations);
+  record_current_stream(right_weights);
+  record_current_stream(output);
+  return output;
+}
+
+at::Tensor exact_expert_weight_grad_bf16(
+    const at::Tensor& activations, const at::Tensor& gradients,
+    const std::vector<int64_t>& expert_rows) {
+  check_xpu_bf16(activations, "activations", 2);
+  check_xpu_bf16(gradients, "gradients", 2);
+  TORCH_CHECK(activations.device() == gradients.device(),
+              "activations and gradients must share an XPU device");
+  TORCH_CHECK(activations.size(0) == gradients.size(0),
+              "activations and gradients must share compact row count");
+  const int64_t experts = static_cast<int64_t>(expert_rows.size());
+  const int64_t input_dim = activations.size(1);
+  const int64_t output_dim = gradients.size(1);
+  TORCH_CHECK(experts > 0 && input_dim > 0 && output_dim > 0,
+              "expert count and matrix dimensions must be positive");
+  check_rows(expert_rows, experts, activations.size(0));
+
+  // Defined zero values for empty experts; active GEMMs overwrite their full
+  // independent output planes with beta=0.
+  auto output = at::zeros({experts, input_dim, output_dim}, activations.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(activations.get_device()).queue();
+  const auto* activation_ptr = reinterpret_cast<const BFloat16*>(activations.data_ptr());
+  const auto* gradient_ptr = reinterpret_cast<const BFloat16*>(gradients.data_ptr());
+  auto* output_ptr = reinterpret_cast<BFloat16*>(output.data_ptr());
+
+  submit_after_current_stream(queue, [&](const std::vector<sycl::event>& dependencies,
+                                         std::vector<sycl::event>& events) {
+    int64_t begin = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const int64_t rows = expert_rows[expert];
+      if (rows != 0) {
+        events.push_back(oneapi::mkl::blas::row_major::gemm(
+            queue, oneapi::mkl::transpose::trans,
+            oneapi::mkl::transpose::nontrans, input_dim, output_dim, rows, 1.0f,
+            activation_ptr + begin * input_dim, input_dim,
+            gradient_ptr + begin * output_dim, output_dim, 0.0f,
+            output_ptr + expert * input_dim * output_dim, output_dim, dependencies));
+      }
+      begin += rows;
+    }
+  });
+  record_current_stream(activations);
+  record_current_stream(gradients);
+  record_current_stream(output);
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("exact_expert_gemm_bf16", &aurora_moe::exact_expert_gemm_bf16,
+             "Exact compact expert-major BF16 GEMMs through oneMKL");
+  module.def("exact_expert_gemm_transposed_weight_bf16",
+             &aurora_moe::exact_expert_gemm_transposed_weight_bf16,
+             "Exact compact expert-major BF16 GEMMs reading forward weights transposed through oneMKL");
+  module.def("exact_expert_sum_transposed_weight_bf16",
+             &aurora_moe::exact_expert_sum_transposed_weight_bf16,
+             "Exact compact expert-major BF16 sum of two forward-weight-transposed oneMKL GEMMs");
+  module.def("exact_expert_weight_grad_bf16", &aurora_moe::exact_expert_weight_grad_bf16,
+             "Exact compact expert-major BF16 weight gradients through oneMKL");
+}

@@ -62,6 +62,7 @@ def parallelize_gptoss(
             # pyrefly: ignore [missing-attribute]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
+            parallelism.context_parallel_rotate_method,
         )
 
     if parallel_dims.tp_enabled:

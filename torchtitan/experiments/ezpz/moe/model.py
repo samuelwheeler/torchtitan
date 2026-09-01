@@ -15,6 +15,7 @@ from torch import nn
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
+    GQAttention,
     ScaledDotProductAttention,
 )
 from torchtitan.protocols.module import Module
@@ -215,23 +216,53 @@ class moeModel(Decoder):
                 )
             self.rope = dataclasses.replace(self.rope, max_seq_len=seq_len)
 
-            # Sync rope fields to attention for all layers.
-            # Mutate in-place — simpler than replacing each config in the list.
+            # MLA keeps additional rope metadata on each attention module.
+            # GQA consumes the shared Decoder rope cache directly.
             for layer_cfg in self.layers:
-                assert isinstance(layer_cfg.attention, Attention.Config)
-                layer_cfg.attention.rope_max_seq_len = seq_len
-                layer_cfg.attention.rope_factor = self.rope.rope_factor
-                layer_cfg.attention.rope_original_seq_len = self.rope.original_seq_len
+                attention = layer_cfg.attention
+                if isinstance(attention, Attention.Config):
+                    attention.rope_max_seq_len = seq_len
+                    attention.rope_factor = self.rope.rope_factor
+                    attention.rope_original_seq_len = self.rope.original_seq_len
+                elif not isinstance(attention, GQAttention.Config):
+                    raise TypeError(
+                        "MoE model supports MLA or GQA attention, got "
+                        f"{type(attention).__name__}."
+                    )
+
+            first_attention = self.layers[0].attention
+            tp = parallelism.tensor_parallel_degree
+            if tp > 1 and isinstance(first_attention, GQAttention.Config):
+                n_heads = first_attention.n_heads
+                n_kv_heads = first_attention.n_kv_heads or n_heads
+                if n_heads % tp != 0:
+                    raise ValueError(
+                        f"tensor_parallel_degree ({tp}) must divide n_heads ({n_heads})."
+                    )
+                if n_kv_heads % tp != 0:
+                    raise ValueError(
+                        "tensor_parallel_degree "
+                        f"({tp}) must divide n_kv_heads ({n_kv_heads})."
+                    )
 
             for layer_cfg in self.layers:
                 if layer_cfg.moe is not None:
+                    expert_compute_backend = layer_cfg.moe.experts.compute_backend
                     if (
-                        layer_cfg.moe.experts.use_grouped_mm
+                        (
+                            expert_compute_backend == "grouped_mm"
+                            or (
+                                expert_compute_backend is None
+                                and layer_cfg.moe.experts.use_grouped_mm
+                            )
+                        )
                         and not has_cuda_capability(9, 0)
                     ):
                         logger.warning(
                             "Failed to use grouped mm, which is only supported on SM90 or later",
                         )
+                        if expert_compute_backend == "grouped_mm":
+                            layer_cfg.moe.experts.compute_backend = "for_loop"
                         layer_cfg.moe.experts.use_grouped_mm = False
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
@@ -285,13 +316,27 @@ class moeModel(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            assert isinstance(self.layers[0].attention, Attention.Config)
+            attention = self.layers[0].attention
+            if isinstance(attention, Attention.Config):
+                n_heads = attention.n_heads
+                head_dims = (
+                    attention.qk_nope_head_dim
+                    + attention.qk_rope_head_dim
+                    + attention.v_head_dim
+                )
+            elif isinstance(attention, GQAttention.Config):
+                n_heads = attention.n_heads
+                head_dim = attention.head_dim or self.dim // n_heads
+                head_dims = 2 * head_dim
+            else:
+                raise TypeError(
+                    "MoE parameter accounting supports MLA or GQA attention, got "
+                    f"{type(attention).__name__}."
+                )
             return get_moe_model_nparams_and_flops(
                 self,
                 model,
-                self.layers[0].attention.n_heads,
-                self.layers[0].attention.qk_nope_head_dim
-                + self.layers[0].attention.qk_rope_head_dim
-                + self.layers[0].attention.v_head_dim,
+                n_heads,
+                head_dims,
                 seq_len,
             )

@@ -1,0 +1,51 @@
+{
+  "hf_assets_path": "/lus/flare/projects/AuroraGPT/sww/hf/hub/models--allenai--OLMo-7B-0724-hf/snapshots/1ee306df318ee15bfe4a76ebd5c002b0105b1ab6",
+  "tokenizer": {"backend": "hf"},
+  "training": {
+    "local_batch_size": 1,
+    "global_batch_size": 12,
+    "seq_len": 128,
+    "steps": 5,
+    "gc_freq": 200,
+    "dtype": "float32",
+    "mixed_precision_param": "bfloat16",
+    "mixed_precision_reduce": "float32"
+  },
+  "parallelism": {
+    "data_parallel_replicate_degree": 1,
+    "data_parallel_shard_degree": 12,
+    "tensor_parallel_degree": 1,
+    "pipeline_parallel_degree": 1,
+    "context_parallel_degree": 1,
+    "expert_parallel_degree": 12,
+    "enable_data_parallel_replicate_module": true
+  },
+  "activation_checkpoint": {"mode": "selective"},
+  "compile": {"enable": false},
+  "optimizer": {
+    "name": "AdamW",
+    "implementation": "fused",
+    "lr": 0.00022,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-8,
+    "weight_decay": 0.1
+  },
+  "lr_scheduler": {
+    "warmup_steps": 2,
+    "total_steps": 5,
+    "decay_ratio": 0.0,
+    "decay_type": "cosine",
+    "min_lr_factor": 1.0
+  },
+  "dataloader": {
+    "dataset": "c4_test",
+    "dataset_path": null,
+    "seed": 42,
+    "train_iters": 5
+  },
+  "checkpoint": {"enable": false},
+  "metrics": {"enable_wandb": false, "log_freq": 1},
+  "comm": {"init_timeout_seconds": 1800, "train_timeout_seconds": 600},
+  "debug": {"seed": 20260722, "print_config": true}
+}

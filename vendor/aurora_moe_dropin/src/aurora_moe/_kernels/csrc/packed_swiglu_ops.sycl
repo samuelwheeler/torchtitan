@@ -1,0 +1,126 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Generic packed-projection BF16 SwiGLU kernels for Aurora.
+//
+// A projection whose trailing dimension is [up | gate] with size 2H is kept
+// contiguous.  These kernels avoid materializing two H-wide contiguous slices
+// before the pointwise activation, which makes a single [D, 2H] expert
+// projection usable in an exact training path.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+class PackedSwiGluForwardKernel;
+class PackedSwiGluBackwardKernel;
+
+void check_packed_projection(const at::Tensor& projection, const char* name) {
+  TORCH_CHECK(projection.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(projection.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(projection.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(projection.dim() >= 1, name, " must have at least one dimension");
+  TORCH_CHECK(projection.size(-1) > 0 && projection.size(-1) % 2 == 0,
+              name, " trailing dimension must be a positive even [up | gate] extent");
+}
+
+std::vector<int64_t> hidden_shape(const at::Tensor& projection) {
+  std::vector<int64_t> shape(projection.sizes().begin(), projection.sizes().end());
+  shape.back() /= 2;
+  return shape;
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+}  // namespace
+
+at::Tensor packed_swiglu_forward_bf16(const at::Tensor& projection) {
+  check_packed_projection(projection, "projection");
+  auto hidden = at::empty(hidden_shape(projection), projection.options());
+  const int64_t hidden_elements = hidden.numel();
+  if (hidden_elements == 0) {
+    return hidden;
+  }
+  const int64_t hidden_dim = hidden.size(-1);
+  const int64_t packed_dim = projection.size(-1);
+  const auto* projection_ptr = reinterpret_cast<const bf16*>(projection.data_ptr());
+  auto* hidden_ptr = reinterpret_cast<bf16*>(hidden.data_ptr());
+  current_queue(projection).parallel_for<PackedSwiGluForwardKernel>(
+      sycl::range<1>(static_cast<size_t>(hidden_elements)), [=](sycl::id<1> id) {
+        const int64_t index = static_cast<int64_t>(id[0]);
+        const int64_t row = index / hidden_dim;
+        const int64_t column = index - row * hidden_dim;
+        const int64_t up_offset = row * packed_dim + column;
+        const float up = static_cast<float>(projection_ptr[up_offset]);
+        const float gate = static_cast<float>(projection_ptr[up_offset + hidden_dim]);
+        const float sigmoid = 1.0f / (1.0f + sycl::exp(-gate));
+        hidden_ptr[index] = bf16(up * gate * sigmoid);
+      });
+  return hidden;
+}
+
+at::Tensor packed_swiglu_backward_bf16(const at::Tensor& grad_hidden,
+                                       const at::Tensor& projection) {
+  check_packed_projection(projection, "projection");
+  TORCH_CHECK(grad_hidden.device() == projection.device(),
+              "grad_hidden and projection must share an XPU device");
+  TORCH_CHECK(grad_hidden.is_contiguous(), "grad_hidden must be contiguous");
+  TORCH_CHECK(grad_hidden.scalar_type() == at::kBFloat16,
+              "grad_hidden must have dtype torch.bfloat16");
+  TORCH_CHECK(grad_hidden.dim() == projection.dim(),
+              "grad_hidden rank must match projection rank");
+  TORCH_CHECK(grad_hidden.size(-1) * 2 == projection.size(-1),
+              "projection must have twice grad_hidden's trailing dimension");
+  for (int64_t dim = 0; dim + 1 < projection.dim(); ++dim) {
+    TORCH_CHECK(grad_hidden.size(dim) == projection.size(dim),
+                "grad_hidden prefix dimensions must match projection");
+  }
+
+  auto grad_projection = at::empty_like(projection);
+  const int64_t hidden_elements = grad_hidden.numel();
+  if (hidden_elements == 0) {
+    return grad_projection;
+  }
+  const int64_t hidden_dim = grad_hidden.size(-1);
+  const int64_t packed_dim = projection.size(-1);
+  const auto* grad_hidden_ptr = reinterpret_cast<const bf16*>(grad_hidden.data_ptr());
+  const auto* projection_ptr = reinterpret_cast<const bf16*>(projection.data_ptr());
+  auto* grad_projection_ptr = reinterpret_cast<bf16*>(grad_projection.data_ptr());
+  current_queue(grad_hidden).parallel_for<PackedSwiGluBackwardKernel>(
+      sycl::range<1>(static_cast<size_t>(hidden_elements)), [=](sycl::id<1> id) {
+        const int64_t index = static_cast<int64_t>(id[0]);
+        const int64_t row = index / hidden_dim;
+        const int64_t column = index - row * hidden_dim;
+        const int64_t up_offset = row * packed_dim + column;
+        const float dh = static_cast<float>(grad_hidden_ptr[index]);
+        const float up = static_cast<float>(projection_ptr[up_offset]);
+        const float gate = static_cast<float>(projection_ptr[up_offset + hidden_dim]);
+        const float sigmoid = 1.0f / (1.0f + sycl::exp(-gate));
+        grad_projection_ptr[up_offset] = bf16(dh * gate * sigmoid);
+        grad_projection_ptr[up_offset + hidden_dim] =
+            bf16(dh * up * sigmoid * (1.0f + gate * (1.0f - sigmoid)));
+      });
+  return grad_projection;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("packed_swiglu_forward_bf16", &aurora_moe::packed_swiglu_forward_bf16,
+             "Fused BF16 packed [up | gate] SwiGLU forward on XPU");
+  module.def("packed_swiglu_backward_bf16", &aurora_moe::packed_swiglu_backward_bf16,
+             "Fused BF16 packed [up | gate] SwiGLU backward on XPU");
+}

@@ -1,0 +1,393 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact-routing data movement kernels for the Aurora MoE prototype.  The
+// .sycl extension makes PyTorch's cpp_extension use its SYCL device compiler.
+// Kernels use
+// PyTorch's current XPU stream, so their inputs and outputs compose
+// asynchronously with neighboring PyTorch/XCCL work.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+namespace aurora_moe {
+
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+// These are PVC workgroup specializations, not MoE shape constraints.  The
+// loops below cover arbitrary numbers of rows and arbitrary feature widths.
+constexpr size_t kRouteThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+class RouteGatherKernel;
+class InversePermutationKernel;
+class SortedToPaddedKernel;
+class PaddedToSortedKernel;
+template <class Gate>
+class WeightedRouteReduceKernel;
+class RouteSumKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_i64(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+}
+
+void check_i32(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name,
+              " must have dtype torch.int32");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+}  // namespace
+
+// Gather token rows into route order.  route_ids[r] is the flattened
+// (token, top-k slot) index that occupies sorted route position r.
+at::Tensor route_gather_bf16(const at::Tensor& tokens,
+                             const at::Tensor& route_ids,
+                             int64_t top_k) {
+  check_bf16_matrix(tokens, "tokens");
+  check_i64(route_ids, "route_ids");
+  TORCH_CHECK(route_ids.dim() == 1, "route_ids must be rank 1");
+  TORCH_CHECK(top_k > 0, "top_k must be positive");
+
+  const int64_t routes = route_ids.numel();
+  const int64_t hidden = tokens.size(1);
+  auto output = at::empty({routes, hidden}, tokens.options());
+  if (routes == 0 || hidden == 0) {
+    return output;
+  }
+
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* ids = route_ids.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<RouteGatherKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kRouteThreads),
+                        sycl::range<1>(kRouteThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = 0; row < kRowsPerWorkgroup; ++row) {
+          const int64_t route = base_route + row;
+          if (route >= routes) {
+            continue;
+          }
+          const int64_t token = ids[route] / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kRouteThreads)) {
+            out[route * hidden + column] = input[token * hidden + column];
+          }
+        }
+      });
+  return output;
+}
+
+// Given a permutation p where sorted[i] == original[p[i]], return inv such
+// that inv[original] == sorted.  This is a collision-free scatter.
+at::Tensor inverse_permutation_i64(const at::Tensor& permutation) {
+  check_i64(permutation, "permutation");
+  TORCH_CHECK(permutation.dim() == 1, "permutation must be rank 1");
+  auto inverse = at::empty_like(permutation);
+  const int64_t count = permutation.numel();
+  if (count == 0) {
+    return inverse;
+  }
+
+  const auto* src = permutation.data_ptr<int64_t>();
+  auto* dst = inverse.data_ptr<int64_t>();
+  auto& queue = current_queue(permutation);
+  queue.parallel_for<InversePermutationKernel>(
+      sycl::range<1>(static_cast<size_t>(count)), [=](sycl::id<1> index) {
+        const int64_t sorted_position = static_cast<int64_t>(index[0]);
+        dst[src[sorted_position]] = sorted_position;
+      });
+  return inverse;
+}
+
+// Pack values in expert-sorted route order into a rectangular [expert,
+// max_rows, column] tensor.  Each input route owns a distinct output row, so
+// this is an exact scatter without atomics or capacity clipping.  Group
+// offsets are the exclusive offsets into the sorted-route dimension.
+at::Tensor sorted_to_padded_bf16(const at::Tensor& sorted_values,
+                                 const at::Tensor& sorted_experts,
+                                 const at::Tensor& group_offsets,
+                                 int64_t max_rows) {
+  check_bf16_matrix(sorted_values, "sorted_values");
+  check_i64(sorted_experts, "sorted_experts");
+  check_i32(group_offsets, "group_offsets");
+  TORCH_CHECK(sorted_experts.dim() == 1,
+              "sorted_experts must be rank 1");
+  TORCH_CHECK(group_offsets.dim() == 1 && group_offsets.numel() >= 1,
+              "group_offsets must have shape [experts + 1]");
+  TORCH_CHECK(sorted_values.device() == sorted_experts.device() &&
+                  sorted_values.device() == group_offsets.device(),
+              "all route-pack inputs must share an XPU device");
+  TORCH_CHECK(sorted_values.size(0) == sorted_experts.numel(),
+              "sorted_values and sorted_experts must have the same route count");
+  TORCH_CHECK(max_rows >= 0, "max_rows must be nonnegative");
+
+  const int64_t routes = sorted_values.size(0);
+  const int64_t columns = sorted_values.size(1);
+  const int64_t experts = group_offsets.numel() - 1;
+  auto output = at::zeros({experts, max_rows, columns}, sorted_values.options());
+  if (routes == 0 || columns == 0 || max_rows == 0) {
+    return output;
+  }
+
+  const auto* input = reinterpret_cast<const bf16*>(sorted_values.data_ptr());
+  const auto* expert_ids = sorted_experts.data_ptr<int64_t>();
+  const auto* offsets = group_offsets.data_ptr<int32_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(sorted_values);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<SortedToPaddedKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kRouteThreads),
+                        sycl::range<1>(kRouteThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t expert = expert_ids[route];
+          const int64_t row = route - static_cast<int64_t>(offsets[expert]);
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kRouteThreads)) {
+            out[(expert * max_rows + row) * columns + column] =
+                input[route * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+// The inverse of sorted_to_padded_bf16 for an arbitrary feature width.  It
+// trims only the dynamic zero-padding introduced for batched GEMM; it neither
+// changes route order nor drops any route.
+at::Tensor padded_to_sorted_bf16(const at::Tensor& padded_values,
+                                 const at::Tensor& sorted_experts,
+                                 const at::Tensor& group_offsets) {
+  check_xpu_contiguous(padded_values, "padded_values");
+  check_i64(sorted_experts, "sorted_experts");
+  check_i32(group_offsets, "group_offsets");
+  TORCH_CHECK(padded_values.scalar_type() == at::kBFloat16,
+              "padded_values must have dtype torch.bfloat16");
+  TORCH_CHECK(padded_values.dim() == 3,
+              "padded_values must have shape [experts, max_rows, columns]");
+  TORCH_CHECK(sorted_experts.dim() == 1,
+              "sorted_experts must be rank 1");
+  TORCH_CHECK(group_offsets.dim() == 1 && group_offsets.numel() >= 1,
+              "group_offsets must have shape [experts + 1]");
+  TORCH_CHECK(padded_values.device() == sorted_experts.device() &&
+                  padded_values.device() == group_offsets.device(),
+              "all route-unpack inputs must share an XPU device");
+  TORCH_CHECK(padded_values.size(0) == group_offsets.numel() - 1,
+              "padded_values expert dimension must match group_offsets");
+
+  const int64_t routes = sorted_experts.numel();
+  const int64_t max_rows = padded_values.size(1);
+  const int64_t columns = padded_values.size(2);
+  auto output = at::empty({routes, columns}, padded_values.options());
+  if (routes == 0 || columns == 0) {
+    return output;
+  }
+
+  const auto* input = reinterpret_cast<const bf16*>(padded_values.data_ptr());
+  const auto* expert_ids = sorted_experts.data_ptr<int64_t>();
+  const auto* offsets = group_offsets.data_ptr<int32_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(padded_values);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PaddedToSortedKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kRouteThreads),
+                        sycl::range<1>(kRouteThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t expert = expert_ids[route];
+          const int64_t row = route - static_cast<int64_t>(offsets[expert]);
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kRouteThreads)) {
+            out[route * columns + column] =
+                input[(expert * max_rows + row) * columns + column];
+          }
+        }
+      });
+  return output;
+}
+
+// One work item owns one output element and walks its (usually small) top-k
+// fan-in.  This preserves exact routes while avoiding the high-contention
+// index_add_ atomics used by the reference implementation.
+template <class Gate>
+at::Tensor weighted_route_reduce_impl(const at::Tensor& route_values,
+                                      const at::Tensor& route_positions,
+                                      const at::Tensor& gate_weights) {
+  TORCH_CHECK(route_positions.dim() == 2,
+              "route_positions must have shape [tokens, top_k]");
+  TORCH_CHECK(gate_weights.sizes() == route_positions.sizes(),
+              "gate_weights and route_positions must have the same shape");
+  TORCH_CHECK(route_values.device() == route_positions.device() &&
+                  route_values.device() == gate_weights.device(),
+              "all tensors must be on the same XPU device");
+
+  const int64_t tokens = route_positions.size(0);
+  const int64_t top_k = route_positions.size(1);
+  const int64_t hidden = route_values.size(1);
+  TORCH_CHECK(route_values.size(0) == tokens * top_k,
+              "route_values rows must equal tokens * top_k");
+  auto output = at::empty({tokens, hidden}, route_values.options());
+  if (tokens == 0 || hidden == 0) {
+    return output;
+  }
+
+  const auto* values = reinterpret_cast<const bf16*>(route_values.data_ptr());
+  const auto* positions = route_positions.data_ptr<int64_t>();
+  const auto* weights = reinterpret_cast<const Gate*>(gate_weights.data_ptr());
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(route_values);
+  const size_t groups = static_cast<size_t>(
+      (tokens + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<WeightedRouteReduceKernel<Gate>>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kRouteThreads),
+                        sycl::range<1>(kRouteThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_token =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t token = base_token;
+             token < base_token + kRowsPerWorkgroup && token < tokens; ++token) {
+          const int64_t base = token * top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kRouteThreads)) {
+            float sum = 0.0f;
+            for (int64_t choice = 0; choice < top_k; ++choice) {
+              const int64_t original_route = base + choice;
+              const int64_t sorted_route = positions[original_route];
+              sum += static_cast<float>(values[sorted_route * hidden + column]) *
+                     static_cast<float>(weights[original_route]);
+            }
+            out[token * hidden + column] = bf16(sum);
+          }
+        }
+      });
+  return output;
+}
+
+at::Tensor weighted_route_reduce_bf16(const at::Tensor& route_values,
+                                      const at::Tensor& route_positions,
+                                      const at::Tensor& gate_weights) {
+  check_bf16_matrix(route_values, "route_values");
+  check_i64(route_positions, "route_positions");
+  check_xpu_contiguous(gate_weights, "gate_weights");
+  TORCH_CHECK(gate_weights.scalar_type() == at::kBFloat16 ||
+                  gate_weights.scalar_type() == at::kFloat,
+              "gate_weights must have dtype torch.bfloat16 or torch.float32");
+  if (gate_weights.scalar_type() == at::kBFloat16) {
+    return weighted_route_reduce_impl<bf16>(route_values, route_positions,
+                                            gate_weights);
+  }
+  return weighted_route_reduce_impl<float>(route_values, route_positions,
+                                           gate_weights);
+}
+
+// Identical route reduction for input gradients, which have no router-gate
+// multiplier at this point in the backward pass.
+at::Tensor route_sum_bf16(const at::Tensor& route_values,
+                          const at::Tensor& route_positions) {
+  check_bf16_matrix(route_values, "route_values");
+  check_i64(route_positions, "route_positions");
+  TORCH_CHECK(route_positions.dim() == 2,
+              "route_positions must have shape [tokens, top_k]");
+  TORCH_CHECK(route_values.device() == route_positions.device(),
+              "route_values and route_positions must share an XPU device");
+
+  const int64_t tokens = route_positions.size(0);
+  const int64_t top_k = route_positions.size(1);
+  const int64_t hidden = route_values.size(1);
+  TORCH_CHECK(route_values.size(0) == tokens * top_k,
+              "route_values rows must equal tokens * top_k");
+  auto output = at::empty({tokens, hidden}, route_values.options());
+  if (tokens == 0 || hidden == 0) {
+    return output;
+  }
+
+  const auto* values = reinterpret_cast<const bf16*>(route_values.data_ptr());
+  const auto* positions = route_positions.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(route_values);
+  const size_t groups = static_cast<size_t>(
+      (tokens + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<RouteSumKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kRouteThreads),
+                        sycl::range<1>(kRouteThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_token =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t token = base_token;
+             token < base_token + kRowsPerWorkgroup && token < tokens; ++token) {
+          const int64_t base = token * top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kRouteThreads)) {
+            float sum = 0.0f;
+            for (int64_t choice = 0; choice < top_k; ++choice) {
+              sum += static_cast<float>(
+                  values[positions[base + choice] * hidden + column]);
+            }
+            out[token * hidden + column] = bf16(sum);
+          }
+        }
+      });
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("route_gather_bf16", &aurora_moe::route_gather_bf16,
+             "Gather tokens into sorted route order (BF16/XPU)");
+  module.def("inverse_permutation_i64", &aurora_moe::inverse_permutation_i64,
+             "Invert a route permutation (int64/XPU)");
+  module.def("sorted_to_padded_bf16", &aurora_moe::sorted_to_padded_bf16,
+             "Exactly pack sorted BF16 routes into dynamic padded expert rows");
+  module.def("padded_to_sorted_bf16", &aurora_moe::padded_to_sorted_bf16,
+             "Exactly trim dynamic padded expert rows into sorted BF16 routes");
+  module.def("weighted_route_reduce_bf16",
+             &aurora_moe::weighted_route_reduce_bf16,
+             "Reduce routed values to tokens with BF16/FP32 gate weights (XPU)");
+  module.def("route_sum_bf16", &aurora_moe::route_sum_bf16,
+             "Reduce routed values to tokens without weights (BF16/XPU)");
+}

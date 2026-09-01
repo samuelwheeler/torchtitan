@@ -365,7 +365,8 @@ agpt_configs = {
         n_heads=16,
         n_kv_heads=None,
         rope_theta=500000,
-        vocab_size=32000,
+        # vocab_size=32000,
+        vocab_size = 256128,
         hidden_dim=compute_ffn_hidden_dim(256, multiple_of=256),
     ),
     "debugmodel_flex_attn": _build_agpt_config(
@@ -396,6 +397,15 @@ agpt_configs = {
         rope_theta=50000,
         vocab_size=256128,
         hidden_dim=11008,
+    ),
+    "2B_50K": _build_agpt_config(
+        dim=2048,
+        n_layers=24,
+        n_heads=16,
+        n_kv_heads=4,
+        rope_theta=50000,
+        vocab_size=50304,
+        hidden_dim=10496,
     ),
     "2B_qknorm": _build_agpt_config(
         dim=2048,
@@ -559,6 +569,7 @@ agpt_configs = {
 
 # Case-insensitive aliases
 agpt_configs["2b"] = agpt_configs["2B"]
+agpt_configs["2b_50k"] = agpt_configs["2B_50K"]
 agpt_configs["2b_flex_attn"] = agpt_configs["2B_flex_attn"]
 agpt_configs["7b"] = agpt_configs["7B"]
 agpt_configs["8b"] = agpt_configs["8B"]

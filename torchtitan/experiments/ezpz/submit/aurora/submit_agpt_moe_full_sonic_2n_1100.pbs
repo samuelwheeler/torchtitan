@@ -1,0 +1,280 @@
+#!/bin/bash --login
+#PBS -A AuroraGPT
+#PBS -N CODEX_AGPT_MOE
+#PBS -l select=2
+#PBS -l walltime=04:00:00
+#PBS -l filesystems=home:flare
+#PBS -l place=scatter
+# PBS's prod route has a 256-node minimum; two-node production runs use the
+# capacity execution queue.
+#PBS -q capacity
+#PBS -k doe
+#PBS -j oe
+
+set -eo pipefail
+module load oneapi/release/2025.3.1 hdf5 pti-gpu
+set -u
+
+ROOT=/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan
+INPUT_DIR=${TT_INPUT_DIR:?missing frozen input directory}
+ARCHIVE_SHA=${TT_SOURCE_ARCHIVE_SHA256:?missing source archive hash}
+SNAPSHOT_ID=${TT_SNAPSHOT_ID:?missing snapshot ID}
+CONFIG_REL=torchtitan/experiments/ezpz/moe_runs/agpt_2b_50k_moe_ep12_dp2_full_sonic_1100.json
+EXPECTED_STEPS=${TT_EXPECTED_STEPS:-1100}
+CASE_TIMEOUT=${TT_CASE_TIMEOUT:-13800}
+WARMUP_STEPS=${TT_MOE_WARMUP_STEPS:-0}
+WARMUP_TIMEOUT=${TT_MOE_WARMUP_TIMEOUT:-3000}
+ENABLE_WANDB=${TT_ENABLE_WANDB:-1}
+EXPERT_GEMM=${TT_MOE_EXPERT_GEMM:-onemkl}
+EXPERT_DW=${TT_MOE_EXPERT_DW:-onemkl}
+L0_MIN_CAPACITY_ELEMENTS=${TT_MOE_L0_MIN_CAPACITY_ELEMENTS:-0}
+EP_TRANSPORT=${TT_MOE_EP_TRANSPORT:-xccl}
+PHASE_SHARED=${TT_MOE_PHASE_SHARED:-0}
+case "${EXPECTED_STEPS}:${WARMUP_STEPS}:${WARMUP_TIMEOUT}:${ENABLE_WANDB}" in
+    *[!0-9:]*|:*|*::*|*:) echo "invalid numeric launch setting" >&2; exit 2 ;;
+esac
+test "${EXPECTED_STEPS}" -gt 0
+test "${WARMUP_TIMEOUT}" -gt 0
+test "${ENABLE_WANDB}" -eq 0 -o "${ENABLE_WANDB}" -eq 1
+case "${EP_TRANSPORT}:${PHASE_SHARED}" in
+    xccl:0|l0:0|l0:1) ;;
+    *) echo "unsupported MoE transport/phase setting ${EP_TRANSPORT}:${PHASE_SHARED}" >&2; exit 2 ;;
+esac
+case "${L0_MIN_CAPACITY_ELEMENTS}" in
+    ''|*[!0-9]*) echo "invalid L0 capacity ${L0_MIN_CAPACITY_ELEMENTS}" >&2; exit 2 ;;
+esac
+case "${EXPERT_GEMM}:${EXPERT_DW}" in
+    onemkl:onemkl|torch:torch) ;;
+    *) echo "unsupported expert backend pair ${EXPERT_GEMM}:${EXPERT_DW}" >&2; exit 2 ;;
+esac
+
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export ONEAPI_DEVICE_SELECTOR="opencl:gpu;level_zero:gpu"
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_OP_SYNC=1
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=100000
+export PYTHONUNBUFFERED=1
+export LOG_RANK=0
+
+JOB_KEY=${PBS_JOBID%%.*}
+OUT=${ROOT}/outputs/agpt_moe_full_sonic_2n_1100/${SNAPSHOT_ID}/${JOB_KEY}
+SOURCE=${OUT}/source
+ARCHIVE=${INPUT_DIR}/source.tar.gz
+DATA_CACHE=${TT_DATA_CACHE_PATH:?missing validated BlendCorpus cache path}
+test "${DATA_CACHE}" = "$(realpath "${DATA_CACHE}")"
+mkdir -p "${OUT}"
+test -d "${DATA_CACHE}"
+test ! -e "${SOURCE}"
+test "${INPUT_DIR}" = "$(realpath "${INPUT_DIR}")"
+test "$(sha256sum "${ARCHIVE}" | awk '{print $1}')" = "${ARCHIVE_SHA}"
+mkdir "${SOURCE}"
+tar -xzf "${ARCHIVE}" --no-same-owner -C "${SOURCE}"
+cp "${INPUT_DIR}/source.manifest.sha256" "${OUT}/source.manifest.sha256"
+
+NNODES=$(sort -u "${PBS_NODEFILE}" | wc -l)
+test "${NNODES}" -eq 2
+export NODE_VENV=/tmp/CODEX_AGPT_MOE_${JOB_KEY}_venv
+mpiexec --envall --np 2 --ppn 1 --hostfile "${PBS_NODEFILE}" \
+    --no-vni --cpu-bind "list:2-9" bash -c '
+        set -euo pipefail
+        partial=${NODE_VENV}.partial
+        test ! -e "${NODE_VENV}" && test ! -e "${partial}"
+        mkdir "${partial}"
+        tar -xzf /lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/.venv.tar.gz --strip-components=1 -C "${partial}"
+        mv "${partial}" "${NODE_VENV}"
+    '
+export VIRTUAL_ENV=${NODE_VENV}
+export PATH=${VIRTUAL_ENV}/bin:${PATH}
+export PYTHONPATH=${SOURCE}:${SOURCE}/vendor/aurora_moe_dropin/src${PYTHONPATH:+:${PYTHONPATH}}
+export TT_CONFIG_JSON=${SOURCE}/${CONFIG_REL}
+
+CACHE=${ROOT}/outputs/moe_full_runtime_tt_1layer/kernel_cache_py213
+export TORCH_EXTENSIONS_DIR=${CACHE}
+export AURORA_MOE_SYCL_BUILD_DIR=${CACHE}
+export AURORA_MOE_L0_IPC_BUILD_DIR=${CACHE}
+export AURORA_MOE_L0_IPC_PREBUILT=1
+export AURORA_MOE_ONE_MKL_EXACT_OPS_SO=${CACHE}/one_mkl_exact_expert/aurora_moe_one_mkl_exact_expert.so
+export AURORA_MOE_SWIGLU_OPS_SO=${CACHE}/swiglu_ops/aurora_moe_swiglu_ops.so
+export AURORA_MOE_EP_ROUTE_OPS_SO=${CACHE}/ep_route_ops/aurora_moe_ep_route_ops.so
+export AURORA_MOE_SEGMENT_EXPERT_REORDER_OPS_SO=${CACHE}/segment_expert_reorder/aurora_moe_segment_expert_reorder.so
+for so in "${AURORA_MOE_ONE_MKL_EXACT_OPS_SO}" "${AURORA_MOE_SWIGLU_OPS_SO}" \
+    "${AURORA_MOE_EP_ROUTE_OPS_SO}" "${AURORA_MOE_SEGMENT_EXPERT_REORDER_OPS_SO}" \
+    "${CACHE}"/level_zero_ipc*/aurora_moe_level_zero_ipc*.so; do test -s "${so}"; done
+
+export AURORA_MOE_ALLTOALLV=1
+export AURORA_MOE_SEGMENTED_SONIC=1
+export AURORA_MOE_SEGMENTED_EXPERT_MAJOR=1
+export AURORA_MOE_SEGMENTED_FUSED_SCORE_PAYLOAD=1
+export AURORA_MOE_EXPERT_MAJOR_GEMM=${EXPERT_GEMM}
+export AURORA_MOE_EXPERT_MAJOR_DW=${EXPERT_DW}
+export AURORA_MOE_EXPERT_MAJOR_REORDER=row_parallel
+export AURORA_MOE_EXPERT_MAJOR_DOWN_BACKWARD=reordered
+export AURORA_MOE_SEGMENTED_POINTWISE=sycl
+export AURORA_MOE_ONEMKL_FUSE_UP_GATE_DX=1
+export AURORA_MOE_EXPERT_MAJOR_PACKED_UP_GATE=0
+export AURORA_MOE_JOINT_ROUTED_SHARED_AUTOGRAD=1
+if test "${EP_TRANSPORT}" = l0; then
+    export AURORA_MOE_L0_IPC_ALLTOALLV=1
+    export AURORA_MOE_L0_IPC_ALLTOALLV_CCL_TYPED_STORE=1
+    export AURORA_MOE_L0_IPC_ALLTOALLV_MIN_CAPACITY_ELEMENTS=${L0_MIN_CAPACITY_ELEMENTS}
+else
+    unset AURORA_MOE_L0_IPC_ALLTOALLV
+    unset AURORA_MOE_L0_IPC_ALLTOALLV_CCL_TYPED_STORE
+    unset AURORA_MOE_L0_IPC_ALLTOALLV_MIN_CAPACITY_ELEMENTS
+fi
+if test "${PHASE_SHARED}" = 1; then
+    export AURORA_MOE_PHASE_SHARED_EXPERTS=1
+    export AURORA_MOE_PHASE_SHARED_FORWARD_REORDER=1
+    export AURORA_MOE_PHASE_SHARED_A4_SUBMIT_WAIT=1
+else
+    unset AURORA_MOE_PHASE_SHARED_EXPERTS
+    unset AURORA_MOE_PHASE_SHARED_FORWARD_REORDER
+    unset AURORA_MOE_PHASE_SHARED_A4_SUBMIT_WAIT
+fi
+
+DATA_LIST=/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/torchtitan/experiments/ezpz/data-lists/aurora/dolma_v1_7_llama2_live.txt
+TOKENIZER=/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/assets/hf/llama-2-32k-sp/tokenizer.model
+test "$(sha256sum "${DATA_LIST}" | awk '{print $1}')" = ded7678c8c94820d73ea654e98c47f4cc60d60d80bb3b70e1a5b1793c375be53
+test "$(sha256sum "${TOKENIZER}" | awk '{print $1}')" = 9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347
+
+export MASTER_ADDR=$(head -n 1 "${PBS_NODEFILE}")
+export WORLD_SIZE=24
+CPU_BIND="verbose,list:2-4:10-12:18-20:26-28:34-36:42-44:54-56:62-64:70-72:78-80:86-88:94-96"
+LOG=${OUT}/train.log
+TOTAL_TOKENS=$((EXPECTED_STEPS * 49152))
+printf 'AGPT_MOE_FULL_SONIC schema=2 nodes=2 tiles=24 ep=12 dp=2 seq=2048 local_batch=1 global_batch=24 tokens_per_step=49152 steps=%s total_tokens=%s dataset=dolma-v1.7-llama2 model_seed=20260722 data_seed=42 optimizer=AdamW_fused lr=2.2e-4 checkpoint=0 activation_checkpoint=selective_attention_only compile=0 CCL_OP_SYNC=%s snapshot=%s archive_sha256=%s output=%s\n' \
+    "${EXPECTED_STEPS}" "${TOTAL_TOKENS}" "${CCL_OP_SYNC}" "${SNAPSHOT_ID}" "${ARCHIVE_SHA}" "${OUT}" | tee "${LOG}"
+printf 'AGPT_MOE_FULL_SONIC_RUNTIME case_timeout_s=%s warmup_steps=%s warmup_timeout_s=%s expert_gemm=%s expert_dw=%s ep_transport=%s phase_shared=%s l0_min_capacity_elements=%s data_cache=%s\n' \
+    "${CASE_TIMEOUT}" "${WARMUP_STEPS}" "${WARMUP_TIMEOUT}" "${EXPERT_GEMM}" "${EXPERT_DW}" \
+    "${EP_TRANSPORT}" "${PHASE_SHARED}" "${L0_MIN_CAPACITY_ELEMENTS}" "${DATA_CACHE}" | tee -a "${LOG}"
+cd "${SOURCE}"
+python3 -c 'from torchtitan.experiments.ezpz.moe.config_registry import agpt_2b_50k_moe_sdpa_aurora_full_sonic_from_json'
+
+# Exercise the cold oneMKL/SYCL expert shapes on every allocated tile.  This is
+# deliberately a separate, unmeasured process: the production process below
+# reconstructs model, optimizer, and dataloader from the original seeds/step 0.
+if test "${WARMUP_STEPS}" -gt 0; then
+    WARMUP_LOG=${OUT}/warmup.log
+    export MASTER_PORT=29633
+    if test "${EP_TRANSPORT}" = l0; then
+        export AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET=/tmp/CODEX_AGPT_MOE_${JOB_KEY}_warmup
+    fi
+    export TORCHTITAN_REQUIRE_WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
+    unset WANDB_RUN_GROUP WANDB_RUN_NAME WANDB_RUN_ID WANDB_RUN_JOB_TYPE WANDB_RESUME
+    printf 'MOE_COLD_WARMUP_START steps=%s output=%s\n' "${WARMUP_STEPS}" "${OUT}/warmup" | tee "${WARMUP_LOG}"
+    set +e
+    timeout --foreground --kill-after=30s "${WARMUP_TIMEOUT}s" \
+        mpiexec --envall --np 24 --ppn 12 --hostfile "${PBS_NODEFILE}" \
+          --no-vni --cpu-bind "${CPU_BIND}" bash -c '
+            export RANK=${PALS_RANKID}
+            export LOCAL_RANK=${PALS_LOCAL_RANKID}
+            export LOCAL_WORLD_SIZE=${PALS_LOCAL_SIZE:-12}
+            python3 -u -m torchtitan.experiments.ezpz.train \
+              --module=ezpz.moe \
+              --config=agpt_2b_50k_moe_sdpa_aurora_full_sonic_from_json \
+              --dump-folder="$1" --dataloader.data-cache-path="$2" \
+              --training.steps="$3" --metrics.no-enable_wandb \
+              --metrics.log-freq=1 --metrics.disable-color-printing \
+              --checkpoint.no-enable
+          ' bash "${OUT}/warmup" "${DATA_CACHE}" "${WARMUP_STEPS}" 2>&1 | tee -a "${WARMUP_LOG}"
+    warmup_rc=${PIPESTATUS[0]}
+    set -e
+    test "${warmup_rc}" -eq 0
+    grep -q 'Training completed' "${WARMUP_LOG}"
+    ! grep -q 'Traceback (most recent call last)' "${WARMUP_LOG}"
+    python3 - "${WARMUP_LOG}" "${WARMUP_STEPS}" <<'PY'
+import re
+import sys
+
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", open(sys.argv[1], errors="replace").read())
+steps = [int(value) for value in re.findall(r"step:\s*(\d+)", text)]
+totals = [int(value) for value in re.findall(r"total steps\s+(\d+)", text)]
+expected = int(sys.argv[2])
+assert steps and max(steps) <= expected, (steps[-5:], expected)
+assert totals and totals[-1] == expected, (totals[-5:], expected)
+assert "Training completed" in text
+PY
+    printf 'MOE_COLD_WARMUP_STATUS rc=0 completed=1 steps=%s\n' "${WARMUP_STEPS}" | tee -a "${WARMUP_LOG}"
+fi
+
+export MASTER_PORT=29634
+if test "${EP_TRANSPORT}" = l0; then
+    export AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET=/tmp/CODEX_AGPT_MOE_${JOB_KEY}_train
+else
+    unset AURORA_MOE_L0_IPC_ALLTOALLV_SOCKET
+fi
+if test "${ENABLE_WANDB}" -eq 1; then
+    unset WANDB_MODE WANDB_DISABLED
+    export TORCHTITAN_REQUIRE_WANDB=1
+    export WANDB_PROJECT=${WANDB_PROJECT:-torchtitan.ezpz.train}
+    export WANDB_RUN_GROUP=CODEX_AGPT_MOE_2N_1100_${SNAPSHOT_ID}
+    export WANDB_RUN_NAME=${WANDB_RUN_GROUP}_${JOB_KEY}
+    export WANDB_RUN_ID=${WANDB_RUN_GROUP}-${JOB_KEY}
+    export WANDB_RUN_JOB_TYPE=agpt_moe_full_sonic_2n_1100
+    TRAIN_WANDB_ARG=--metrics.enable_wandb
+else
+    export TORCHTITAN_REQUIRE_WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
+    TRAIN_WANDB_ARG=--metrics.no-enable_wandb
+fi
+printf 'MOE_CLEAN_RESTART step=0 model_seed=20260722 data_seed=42 wandb=%s\n' "${ENABLE_WANDB}" | tee -a "${LOG}"
+set +e
+timeout --foreground --kill-after=30s "${CASE_TIMEOUT}s" \
+    mpiexec --envall --np 24 --ppn 12 --hostfile "${PBS_NODEFILE}" \
+      --no-vni --cpu-bind "${CPU_BIND}" bash -c '
+        export RANK=${PALS_RANKID}
+        export LOCAL_RANK=${PALS_LOCAL_RANKID}
+        export LOCAL_WORLD_SIZE=${PALS_LOCAL_SIZE:-12}
+        python3 -u -m torchtitan.experiments.ezpz.train \
+          --module=ezpz.moe \
+          --config=agpt_2b_50k_moe_sdpa_aurora_full_sonic_from_json \
+          --dump-folder="$1" --dataloader.data-cache-path="$2" \
+          --training.steps="$3" "$4" --metrics.disable-color-printing
+      ' bash "${OUT}/train" "${DATA_CACHE}" "${EXPECTED_STEPS}" "${TRAIN_WANDB_ARG}" 2>&1 | tee -a "${LOG}"
+rc=${PIPESTATUS[0]}
+set -e
+grep -q 'Training completed' "${LOG}"
+! grep -q 'Traceback (most recent call last)' "${LOG}"
+test "${rc}" -eq 0
+python3 - "${LOG}" "${EXPECTED_STEPS}" <<'PY'
+import re
+import sys
+
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", open(sys.argv[1], errors="replace").read())
+steps = [int(value) for value in re.findall(r"step:\s*(\d+)", text)]
+totals = [int(value) for value in re.findall(r"total steps\s+(\d+)", text)]
+expected = int(sys.argv[2])
+assert steps and max(steps) <= expected, (steps[-5:], expected)
+assert totals and totals[-1] == expected, (totals[-5:], expected)
+assert "Training completed" in text
+PY
+if test "${WARMUP_STEPS}" -gt 0; then
+    python3 - "${WARMUP_LOG}" "${LOG}" <<'PY'
+import re
+import sys
+
+ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+metric = re.compile(
+    r"step:\s*(\d+)\s+loss:\s*([0-9.eE+-]+)\s+grad_norm:\s*([0-9.eE+-]+)"
+)
+
+def read(path):
+    text = ansi.sub("", open(path, errors="replace").read())
+    return {int(step): (float(loss), float(grad)) for step, loss, grad in metric.findall(text)}
+
+warmup = read(sys.argv[1])
+training = read(sys.argv[2])
+common = sorted(set(warmup) & set(training))
+assert common and common[0] == 1, common
+max_loss = max(abs(warmup[step][0] - training[step][0]) for step in common)
+max_grad = max(abs(warmup[step][1] - training[step][1]) for step in common)
+assert max_loss <= 0.005, max_loss
+assert max_grad <= 0.05, max_grad
+print(
+    f"MOE_CLEAN_RESTART_CORRECTNESS common_steps={common} "
+    f"max_loss_delta={max_loss:.8g} max_grad_norm_delta={max_grad:.8g}",
+    flush=True,
+)
+PY
+fi
+printf 'CASE_STATUS rc=0 completed=1 expected_steps=%s output=%s\n' \
+    "${EXPECTED_STEPS}" "${OUT}" | tee -a "${LOG}"

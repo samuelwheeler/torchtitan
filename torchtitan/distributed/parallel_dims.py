@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
+import torch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from torchtitan.config.configs import ParallelismConfig
@@ -27,6 +29,7 @@ class ParallelDims:
     pp: int
     ep: int
     world_size: int
+    pipeline_parallel_mesh_order: Literal["pp_first", "dp_first"] = "pp_first"
 
     _meshes: dict[str, DeviceMesh] = field(default_factory=dict)
     _world_mesh: DeviceMesh | None = None
@@ -43,6 +46,9 @@ class ParallelDims:
             pp=parallelism_config.pipeline_parallel_degree,
             ep=parallelism_config.expert_parallel_degree,
             world_size=world_size,
+            pipeline_parallel_mesh_order=(
+                parallelism_config.pipeline_parallel_mesh_order
+            ),
         )
 
     def __post_init__(self):
@@ -69,6 +75,51 @@ class ParallelDims:
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
             f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
+        assert self.pipeline_parallel_mesh_order in {"pp_first", "dp_first"}, (
+            "pipeline_parallel_mesh_order must be 'pp_first' or 'dp_first', "
+            f"got {self.pipeline_parallel_mesh_order!r}"
+        )
+
+    def _build_global_mesh_rank_tensors(self) -> dict[str, torch.Tensor]:
+        """Return logical mesh tensors with the configured physical rank order."""
+        if self.pipeline_parallel_mesh_order == "pp_first":
+            logical_ranks = torch.arange(self.world_size).reshape(
+                self.pp,
+                self.dp_replicate,
+                self.dp_shard,
+                self.cp,
+                self.tp,
+            )
+        else:
+            # Physical ranks are contiguous by DP replica, then by PP stage and
+            # TP rank. With dp_shard=cp=1, TP2 x PP6 therefore maps one complete
+            # model replica to each contiguous block of 12 Aurora tiles.
+            logical_ranks = (
+                torch.arange(self.world_size)
+                .reshape(
+                    self.dp_replicate,
+                    self.dp_shard,
+                    self.pp,
+                    self.cp,
+                    self.tp,
+                )
+                .permute(2, 0, 1, 3, 4)
+            )
+
+        batch = self.dp_replicate * self.dp_shard
+        fsdp = self.dp_shard * self.cp
+        efsdp = fsdp * self.tp // self.ep
+        return {
+            "dataloading": logical_ranks.reshape(
+                self.pp, batch, self.cp, self.tp
+            ),
+            "dense": logical_ranks.reshape(
+                self.pp, self.dp_replicate, fsdp, self.tp
+            ),
+            "sparse": logical_ranks.reshape(
+                self.pp, self.dp_replicate, efsdp, self.ep
+            ),
+        }
 
     def _mesh_exist(self, name: str, degree: int) -> bool:
         if name == "fsdp":
@@ -124,6 +175,7 @@ class ParallelDims:
             world_mesh: DeviceMesh,
             dim_names: tuple[str, ...],
             dim_degrees: tuple[int, ...],
+            rank_tensor: torch.Tensor | None = None,
         ):
             """Unflatten the world mesh to create the required mesh dimensions.
 
@@ -135,6 +187,17 @@ class ParallelDims:
                 if not self._mesh_exist(name, degree):
                     backend_override[name] = "fake"
 
+            if rank_tensor is not None:
+                direct_backend_override = tuple(
+                    (backend_override.get(name), None) for name in dim_names
+                )
+                return DeviceMesh(
+                    device_type,
+                    rank_tensor,
+                    mesh_dim_names=dim_names,
+                    backend_override=direct_backend_override,
+                )
+
             return world_mesh._unflatten(
                 0,
                 dim_degrees,
@@ -145,7 +208,8 @@ class ParallelDims:
         logger.info(
             f"Building device mesh with parallelism: "
             f"pp={self.pp}, dp_replicate={self.dp_replicate}, dp_shard={self.dp_shard}, "
-            f"cp={self.cp}, tp={self.tp}, ep={self.ep}"
+            f"cp={self.cp}, tp={self.tp}, ep={self.ep}, "
+            f"pipeline_parallel_mesh_order={self.pipeline_parallel_mesh_order}"
         )
 
         batch = self.dp_replicate * self.dp_shard
@@ -155,21 +219,46 @@ class ParallelDims:
         self._world_mesh = init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=("world",)
         )
+        rank_tensors = (
+            self._build_global_mesh_rank_tensors()
+            if self.pipeline_parallel_mesh_order == "dp_first"
+            else {}
+        )
         dataloading_mesh = unflatten_mesh(
             self._world_mesh,
             ("pp", "batch", "cp", "tp"),
             (self.pp, batch, self.cp, self.tp),
+            rank_tensors.get("dataloading"),
         )
-        loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        # With CP disabled the loss-reduction group is exactly the batch group.
+        # Reuse it directly: flattening a size-one fake CP dimension from an
+        # explicitly rank-permuted mesh can lose the batch communicator.
+        loss_mesh = (
+            dataloading_mesh["batch"]
+            if self.cp == 1
+            else dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        )
         dense_mesh = unflatten_mesh(
             self._world_mesh,
             ("pp", "dp_replicate", "fsdp", "tp"),
             (self.pp, self.dp_replicate, fsdp, self.tp),
+            rank_tensors.get("dense"),
         )
         sparse_mesh = unflatten_mesh(
             self._world_mesh,
             ("pp", "dp_replicate", "efsdp", "ep"),
             (self.pp, self.dp_replicate, efsdp, self.ep),
+            rank_tensors.get("sparse"),
+        )
+        # DTensor gradient norms are Partial over both FSDP and TP. Registering
+        # their flattened submesh lets ``DTensor.full_tensor()`` reduce the norm
+        # with one collective instead of warning and issuing one scalar
+        # all-reduce per mesh dimension. Retain the mesh so its process group is
+        # included in timeout management.
+        fsdp_tp_mesh = (
+            dense_mesh["fsdp", "tp"]._flatten("fsdp_tp")
+            if fsdp > 1 and self.tp > 1
+            else None
         )
 
         self._global_meshes = {
@@ -190,9 +279,20 @@ class ParallelDims:
             "ep": sparse_mesh["ep"],
             "efsdp": sparse_mesh["efsdp"],
         }
+        if fsdp_tp_mesh is not None:
+            self._meshes["fsdp_tp"] = fsdp_tp_mesh
 
         # Validate mesh sizes
         self._validate_meshes()
+
+        if self.pipeline_parallel_mesh_order == "dp_first":
+            logger.info(
+                "DP-first local mesh ranks: pp=%s, tp=%s, dp_replicate=%s, loss=%s",
+                self._meshes["pp"].mesh.tolist(),
+                self._meshes["tp"].mesh.tolist(),
+                self._meshes["dp_replicate"].mesh.tolist(),
+                self._meshes["loss"].mesh.tolist(),
+            )
 
         logger.info(
             f"Successfully created meshes with active dimensions: "
@@ -324,6 +424,12 @@ class ParallelDims:
         if self._world_mesh is None:
             self._world_mesh = self.build_mesh()
         return self._world_mesh
+
+    @property
+    def pipeline_last_stage_first_rank(self) -> int:
+        """Global rank with loss on the first DP replica's last PP stage."""
+        ranks = self._build_global_mesh_rank_tensors()["dataloading"]
+        return int(ranks[-1, 0, 0, 0].item())
 
     @property
     def dp_enabled(self):

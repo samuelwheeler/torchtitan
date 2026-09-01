@@ -1,0 +1,400 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Experimental runtime-shape grouped BF16 GEMM and exact MoE row boundaries
+// using PVC XMX joint_matrix instructions.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+#ifndef AURORA_MOE_XMX_GROUPED_TILE_M
+#define AURORA_MOE_XMX_GROUPED_TILE_M 4
+#endif
+
+#ifndef AURORA_MOE_XMX_GROUPED_TILE_N
+#define AURORA_MOE_XMX_GROUPED_TILE_N 4
+#endif
+
+namespace aurora_moe {
+namespace {
+
+namespace matrix = sycl::ext::oneapi::experimental::matrix;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr int64_t kTileM = 8;
+constexpr int64_t kTileN = 16;
+constexpr int64_t kTileK = 16;
+constexpr size_t kSubgroupSize = 16;
+constexpr int64_t kBlockTilesM = AURORA_MOE_XMX_GROUPED_TILE_M;
+constexpr int64_t kBlockTilesN = AURORA_MOE_XMX_GROUPED_TILE_N;
+constexpr int64_t kBlockM = kTileM * kBlockTilesM;
+constexpr int64_t kBlockN = kTileN * kBlockTilesN;
+constexpr size_t kThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+static_assert(kBlockTilesM == 2 || kBlockTilesM == 4,
+              "supported grouped-XMX M macro-tiles are 2 or 4 DPAS tiles");
+static_assert(kBlockTilesN == 2 || kBlockTilesN == 4 || kBlockTilesN == 8,
+              "supported grouped-XMX N macro-tiles are 2, 4, or 8 DPAS tiles");
+
+using AtomicCounter = sycl::atomic_ref<
+    int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+    sycl::access::address_space::global_space>;
+
+class CountPaddedIdsKernel;
+class PackPaddedIdsKernel;
+class ScatterRowsKernel;
+class XmxGroupedGemmKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+void check_i32_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name,
+              " must have dtype torch.int32");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+bool is_valid_padded_row(int64_t row, const int64_t* counts, int64_t cap) {
+  return row % cap < counts[row / cap];
+}
+
+}  // namespace
+
+// Count valid source-padded routes by local expert.  Valid IDs must be in
+// [0, num_experts); padding IDs are never read.
+at::Tensor xmx_count_padded_expert_ids_i64(const at::Tensor& local_ids,
+                                           const at::Tensor& recv_counts,
+                                           int64_t cap,
+                                           int64_t num_experts) {
+  check_i64_vector(local_ids, "local_ids");
+  check_i64_vector(recv_counts, "recv_counts");
+  TORCH_CHECK(num_experts > 0, "num_experts must be positive");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  TORCH_CHECK(local_ids.device() == recv_counts.device(),
+              "local_ids and recv_counts must share an XPU device");
+  TORCH_CHECK(local_ids.numel() == recv_counts.numel() * cap,
+              "local_ids rows must equal recv_counts.numel() * cap");
+  auto output = at::zeros({num_experts}, local_ids.options().dtype(at::kInt));
+  if (local_ids.numel() == 0) {
+    return output;
+  }
+  const auto* ids = local_ids.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* output_ptr = output.data_ptr<int32_t>();
+  current_queue(local_ids).parallel_for<CountPaddedIdsKernel>(
+      sycl::range<1>(static_cast<size_t>(local_ids.numel())),
+      [=](sycl::id<1> index) {
+        const int64_t row = static_cast<int64_t>(index[0]);
+        if (!is_valid_padded_row(row, counts, cap)) {
+          return;
+        }
+        AtomicCounter(output_ptr[ids[row]]).fetch_add(1);
+      });
+  return output;
+}
+
+// Pack source-major [token..., score] payload rows into zero-padded XMX
+// group-major rows.  The caller obtains padded_rows from the exact count
+// tensor and must make it large enough for every expert.
+std::vector<at::Tensor> xmx_pack_padded_payload_ids_i64_bf16(
+    const at::Tensor& payload, const at::Tensor& local_ids,
+    const at::Tensor& recv_counts, int64_t cap, int64_t num_experts,
+    int64_t padded_rows, int64_t padded_model_dim) {
+  check_bf16(payload, "payload");
+  check_i64_vector(local_ids, "local_ids");
+  check_i64_vector(recv_counts, "recv_counts");
+  TORCH_CHECK(payload.dim() == 2 && payload.size(1) >= 2,
+              "payload must have shape [padded_rows, token..., score]");
+  TORCH_CHECK(payload.device() == local_ids.device() &&
+                  payload.device() == recv_counts.device(),
+              "payload, local_ids, and recv_counts must share an XPU device");
+  TORCH_CHECK(cap >= 0 && num_experts > 0 && padded_rows >= 0,
+              "cap and padded_rows must be nonnegative and num_experts positive");
+  TORCH_CHECK(padded_rows % kBlockM == 0 || padded_rows == 0,
+              "padded_rows must be a multiple of the XMX M macro-tile");
+  const int64_t model_dim = payload.size(1) - 1;
+  TORCH_CHECK(padded_model_dim >= model_dim && padded_model_dim % kTileK == 0,
+              "padded_model_dim must cover model_dim and be a multiple of 16");
+  TORCH_CHECK(payload.size(0) == recv_counts.numel() * cap &&
+                  local_ids.numel() == payload.size(0),
+              "payload/local_ids rows must equal recv_counts.numel() * cap");
+  auto tokens = at::zeros(
+      {num_experts, padded_rows, padded_model_dim}, payload.options());
+  auto scores = at::zeros({num_experts, padded_rows}, payload.options());
+  auto source_slots = at::empty_like(local_ids);
+  auto counters = at::zeros({num_experts}, local_ids.options().dtype(at::kInt));
+  const int64_t source_rows = payload.size(0);
+  if (source_rows == 0 || padded_rows == 0) {
+    return {tokens, scores, source_slots};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* ids = local_ids.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* token_ptr = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_ptr = reinterpret_cast<bf16*>(scores.data_ptr());
+  auto* slot_ptr = source_slots.data_ptr<int64_t>();
+  auto* counter_ptr = counters.data_ptr<int32_t>();
+  const int64_t payload_stride = payload.size(1);
+  const size_t groups = static_cast<size_t>(
+      (source_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  current_queue(payload).submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<int64_t, 1> expert_slots(
+        sycl::range<1>(kRowsPerWorkgroup), cgh);
+    cgh.parallel_for<PackPaddedIdsKernel>(
+        sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                          sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t base_row =
+              static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          if (lane < kRowsPerWorkgroup) {
+            const int64_t row = base_row + lane;
+            int64_t slot = -1;
+            if (row < source_rows && is_valid_padded_row(row, counts, cap)) {
+              const int64_t expert = ids[row];
+              const int32_t expert_row =
+                  AtomicCounter(counter_ptr[expert]).fetch_add(1);
+              slot = expert * padded_rows + static_cast<int64_t>(expert_row);
+              slot_ptr[row] = slot;
+              score_ptr[slot] = input[row * payload_stride + model_dim];
+            }
+            expert_slots[lane] = slot;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int64_t row = base_row;
+               row < base_row + kRowsPerWorkgroup && row < source_rows; ++row) {
+            const int64_t slot = expert_slots[row - base_row];
+            if (slot < 0) {
+              continue;
+            }
+            for (int64_t column = lane; column < model_dim;
+                 column += static_cast<int64_t>(kThreads)) {
+              token_ptr[slot * padded_model_dim + column] =
+                  input[row * payload_stride + column];
+            }
+          }
+        });
+  });
+  return {tokens, scores, source_slots};
+}
+
+// Run a row-major BF16 XMX GEMM for each expert.  Activations must be the
+// zero-padded result of the pack primitive; only the first group_rows[e] rows
+// of each output group are defined.
+at::Tensor xmx_grouped_gemm_bf16(const at::Tensor& activations,
+                                 const at::Tensor& weights,
+                                 const at::Tensor& group_rows) {
+  check_bf16(activations, "activations");
+  check_bf16(weights, "weights");
+  check_i32_vector(group_rows, "group_rows");
+  TORCH_CHECK(activations.dim() == 3,
+              "activations must have shape [experts, padded_rows, padded_k]");
+  TORCH_CHECK(weights.dim() == 3,
+              "weights must have shape [experts, padded_k, padded_n]");
+  TORCH_CHECK(activations.device() == weights.device() &&
+                  activations.device() == group_rows.device(),
+              "grouped GEMM tensors must share an XPU device");
+  const int64_t experts = activations.size(0);
+  const int64_t padded_rows = activations.size(1);
+  const int64_t padded_k = activations.size(2);
+  const int64_t padded_n = weights.size(2);
+  TORCH_CHECK(weights.size(0) == experts && weights.size(1) == padded_k &&
+                  group_rows.numel() == experts,
+              "expert, K, and group_rows dimensions must agree");
+  TORCH_CHECK(padded_rows % kBlockM == 0 && padded_k % kTileK == 0 &&
+                  padded_n % kBlockN == 0,
+              "XMX grouped GEMM dimensions must be macro-tile aligned");
+  auto output = at::empty({experts, padded_rows, padded_n}, activations.options());
+  if (experts == 0 || padded_rows == 0 || padded_n == 0) {
+    return output;
+  }
+  const auto* activation_ptr =
+      reinterpret_cast<const bf16*>(activations.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const bf16*>(weights.data_ptr());
+  const auto* row_ptr = group_rows.data_ptr<int32_t>();
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  const size_t m_blocks = static_cast<size_t>(padded_rows / kBlockM);
+  const size_t n_blocks = static_cast<size_t>(padded_n / kBlockN);
+  current_queue(activations).parallel_for<XmxGroupedGemmKernel>(
+      sycl::nd_range<3>(
+          sycl::range<3>(static_cast<size_t>(experts), m_blocks,
+                         n_blocks * kSubgroupSize),
+          sycl::range<3>(1, 1, kSubgroupSize)),
+      [=](sycl::nd_item<3> item) [[intel::reqd_sub_group_size(16)]] {
+        const int64_t expert = static_cast<int64_t>(item.get_global_id(0));
+        const int64_t m_block = static_cast<int64_t>(item.get_global_id(1));
+        const int64_t n_block = static_cast<int64_t>(item.get_group(2));
+        const int64_t row_base = m_block * kBlockM;
+        if (row_base >= static_cast<int64_t>(row_ptr[expert])) {
+          return;
+        }
+        const auto subgroup = item.get_sub_group();
+        const auto activation_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(activation_ptr);
+        const auto weight_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(weight_ptr);
+        const auto output_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(output_ptr);
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::a, kTileM,
+                             kTileK, matrix::layout::row_major>
+            a_fragment[kBlockTilesM];
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::b, kTileK,
+                             kTileN, matrix::layout::row_major>
+            b_fragment[kBlockTilesN];
+        matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator,
+                             kTileM, kTileN>
+            accumulator[kBlockTilesM][kBlockTilesN];
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::accumulator,
+                             kTileM, kTileN>
+            output_fragment;
+        for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            matrix::joint_matrix_fill(subgroup, accumulator[mi][ni], 0.0f);
+          }
+        }
+        for (int64_t k_offset = 0; k_offset < padded_k; k_offset += kTileK) {
+          for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+            matrix::joint_matrix_load(
+                subgroup, a_fragment[mi],
+                activation_global +
+                    ((expert * padded_rows + row_base + mi * kTileM) * padded_k +
+                     k_offset),
+                static_cast<size_t>(padded_k));
+          }
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            matrix::joint_matrix_load(
+                subgroup, b_fragment[ni],
+                weight_global + ((expert * padded_k + k_offset) * padded_n +
+                                 n_block * kBlockN + ni * kTileN),
+                static_cast<size_t>(padded_n));
+          }
+          for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+            for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+              matrix::joint_matrix_mad(subgroup, accumulator[mi][ni],
+                                       a_fragment[mi], b_fragment[ni],
+                                       accumulator[mi][ni]);
+            }
+          }
+        }
+        for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            matrix::joint_matrix_copy(subgroup, accumulator[mi][ni],
+                                      output_fragment);
+            matrix::joint_matrix_store(
+                subgroup, output_fragment,
+                output_global +
+                    ((expert * padded_rows + row_base + mi * kTileM) * padded_n +
+                     n_block * kBlockN + ni * kTileN),
+                static_cast<size_t>(padded_n), matrix::layout::row_major);
+          }
+        }
+      });
+  return output;
+}
+
+// Restore score-weighted valid expert rows to source-major padded order.
+at::Tensor xmx_scatter_rows_to_padded_bf16(
+    const at::Tensor& expert_values, const at::Tensor& expert_scores,
+    const at::Tensor& source_slots, const at::Tensor& recv_counts,
+    int64_t cap, int64_t output_columns) {
+  check_bf16(expert_values, "expert_values");
+  check_bf16(expert_scores, "expert_scores");
+  check_i64_vector(source_slots, "source_slots");
+  check_i64_vector(recv_counts, "recv_counts");
+  TORCH_CHECK(expert_values.dim() == 3 && expert_scores.dim() == 2,
+              "expert values/scores must have shapes [E, rows, columns]/[E, rows]");
+  TORCH_CHECK(expert_values.size(0) == expert_scores.size(0) &&
+                  expert_values.size(1) == expert_scores.size(1),
+              "expert values and scores must share expert-row dimensions");
+  TORCH_CHECK(expert_values.device() == expert_scores.device() &&
+                  expert_values.device() == source_slots.device() &&
+                  expert_values.device() == recv_counts.device(),
+              "scatter tensors must share an XPU device");
+  TORCH_CHECK(cap >= 0 && output_columns >= 0 &&
+                  output_columns <= expert_values.size(2),
+              "invalid cap or output_columns");
+  const int64_t source_rows = recv_counts.numel() * cap;
+  TORCH_CHECK(source_slots.numel() == source_rows,
+              "source_slots must have one entry per source-padded row");
+  auto output = at::zeros({source_rows, output_columns}, expert_values.options());
+  if (source_rows == 0 || output_columns == 0) {
+    return output;
+  }
+  const auto* values = reinterpret_cast<const bf16*>(expert_values.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(expert_scores.data_ptr());
+  const auto* slots = source_slots.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  const int64_t expert_columns = expert_values.size(2);
+  const size_t groups = static_cast<size_t>(
+      (source_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  current_queue(expert_values).parallel_for<ScatterRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < source_rows; ++row) {
+          if (!is_valid_padded_row(row, counts, cap)) {
+            continue;
+          }
+          const int64_t slot = slots[row];
+          const float score = static_cast<float>(scores[slot]);
+          for (int64_t column = lane; column < output_columns;
+               column += static_cast<int64_t>(kThreads)) {
+            output_ptr[row * output_columns + column] = bf16(
+                static_cast<float>(values[slot * expert_columns + column]) * score);
+          }
+        }
+      });
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("xmx_count_padded_expert_ids_i64",
+             &aurora_moe::xmx_count_padded_expert_ids_i64,
+             "Count valid source-padded rows by expert (XPU)");
+  module.def("xmx_pack_padded_payload_ids_i64_bf16",
+             &aurora_moe::xmx_pack_padded_payload_ids_i64_bf16,
+             "Pack source-padded MoE rows into aligned XMX expert rows (XPU)");
+  module.def("xmx_grouped_gemm_bf16", &aurora_moe::xmx_grouped_gemm_bf16,
+             "Aligned runtime-shape grouped BF16 XMX GEMM (XPU)");
+  module.def("xmx_scatter_rows_to_padded_bf16",
+             &aurora_moe::xmx_scatter_rows_to_padded_bf16,
+             "Scatter score-weighted XMX expert rows to padded source order (XPU)");
+}

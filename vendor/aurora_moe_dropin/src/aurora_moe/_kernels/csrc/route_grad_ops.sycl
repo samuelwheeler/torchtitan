@@ -1,0 +1,210 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact route-gradient preparation for the direct padded EP expert layout.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr size_t kThreads = 256;
+
+class RouteGradScaleScoreKernel;
+class RouteGradTailZeroKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_bf16_expert_values(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 3, name, " must have shape [experts, rows, columns]");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+void check_i32_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name,
+              " must have dtype torch.int32");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+inline bool is_valid_padded_row(int64_t row, const int64_t* counts,
+                                int64_t cap) {
+  return row % cap < counts[row / cap];
+}
+
+}  // namespace
+
+// Produce the two backward inputs consumed by the expert GEMMs without first
+// materializing an unscaled expert-major copy of grad_output.  Every valid
+// padded source row maps to one unique expert slot.  If zero_initialize is
+// false, max_tail must cover max_rows - group_rows[e] for every expert.
+std::vector<at::Tensor> route_grad_scale_score_bf16(
+    const at::Tensor& grad_output, const at::Tensor& expert_values,
+    const at::Tensor& expert_scores, const at::Tensor& source_slots,
+    const at::Tensor& recv_counts, const at::Tensor& group_rows,
+    int64_t cap, int64_t max_tail, bool zero_initialize) {
+  check_bf16_matrix(grad_output, "grad_output");
+  check_bf16_expert_values(expert_values, "expert_values");
+  check_bf16_matrix(expert_scores, "expert_scores");
+  check_i64_vector(source_slots, "source_slots");
+  check_i64_vector(recv_counts, "recv_counts");
+  check_i32_vector(group_rows, "group_rows");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+
+  const int64_t experts = expert_values.size(0);
+  const int64_t max_rows = expert_values.size(1);
+  const int64_t columns = expert_values.size(2);
+  TORCH_CHECK(experts > 0, "expert_values must have a positive expert dimension");
+  TORCH_CHECK(expert_scores.size(0) == experts &&
+                  expert_scores.size(1) == max_rows,
+              "expert_scores must have shape [experts, rows]");
+  TORCH_CHECK(group_rows.numel() == experts,
+              "group_rows must provide one count per expert");
+  TORCH_CHECK(grad_output.size(1) == columns,
+              "grad_output and expert_values column dimensions must match");
+  const int64_t padded_rows = grad_output.size(0);
+  TORCH_CHECK(recv_counts.numel() * cap == padded_rows,
+              "grad_output rows must equal recv_counts.numel() * cap");
+  TORCH_CHECK(source_slots.numel() == padded_rows,
+              "source_slots must provide one slot per padded row");
+  TORCH_CHECK(max_tail >= 0 && max_tail <= max_rows,
+              "max_tail must be in [0, max_rows]");
+  TORCH_CHECK(grad_output.device() == expert_values.device() &&
+                  grad_output.device() == expert_scores.device() &&
+                  grad_output.device() == source_slots.device() &&
+                  grad_output.device() == recv_counts.device() &&
+                  grad_output.device() == group_rows.device(),
+              "all route-gradient inputs must share an XPU device");
+
+  auto grad_values = zero_initialize
+      ? at::zeros(expert_values.sizes(), expert_values.options())
+      : at::empty(expert_values.sizes(), expert_values.options());
+  auto grad_scores = zero_initialize
+      ? at::zeros({experts, max_rows}, expert_values.options())
+      : at::empty({experts, max_rows}, expert_values.options());
+  if (max_rows == 0) {
+    return {grad_values, grad_scores};
+  }
+  if (columns == 0) {
+    return {grad_values, at::zeros({experts, max_rows}, expert_values.options())};
+  }
+
+  const auto* grad_output_ptr = reinterpret_cast<const bf16*>(grad_output.data_ptr());
+  const auto* expert_values_ptr = reinterpret_cast<const bf16*>(expert_values.data_ptr());
+  const auto* expert_scores_ptr = reinterpret_cast<const bf16*>(expert_scores.data_ptr());
+  const auto* source_slots_ptr = source_slots.data_ptr<int64_t>();
+  const auto* recv_counts_ptr = recv_counts.data_ptr<int64_t>();
+  const auto* group_rows_ptr = group_rows.data_ptr<int32_t>();
+  auto* grad_values_ptr = reinterpret_cast<bf16*>(grad_values.data_ptr());
+  auto* grad_scores_ptr = reinterpret_cast<bf16*>(grad_scores.data_ptr());
+  auto& queue = current_queue(grad_output);
+
+  if (padded_rows > 0) {
+    const size_t groups = static_cast<size_t>(padded_rows);
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> partial_sums(sycl::range<1>(kThreads), cgh);
+      cgh.parallel_for<RouteGradScaleScoreKernel>(
+          sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                            sycl::range<1>(kThreads)),
+          [=](sycl::nd_item<1> item) {
+            const int64_t row = static_cast<int64_t>(item.get_group(0));
+            const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+            const bool valid = is_valid_padded_row(row, recv_counts_ptr, cap);
+            const int64_t slot = valid ? source_slots_ptr[row] : 0;
+            const float score = valid
+                ? static_cast<float>(expert_scores_ptr[slot])
+                : 0.0f;
+            float partial = 0.0f;
+            if (valid) {
+              for (int64_t column = lane; column < columns;
+                   column += static_cast<int64_t>(kThreads)) {
+                const float grad = static_cast<float>(
+                    grad_output_ptr[row * columns + column]);
+                const float value = static_cast<float>(
+                    expert_values_ptr[slot * columns + column]);
+                grad_values_ptr[slot * columns + column] = bf16(grad * score);
+                partial += grad * value;
+              }
+            }
+            partial_sums[lane] = partial;
+            item.barrier(sycl::access::fence_space::local_space);
+            for (size_t width = kThreads / 2; width > 0; width /= 2) {
+              if (static_cast<size_t>(lane) < width) {
+                partial_sums[lane] += partial_sums[lane + static_cast<int64_t>(width)];
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+            }
+            if (valid && lane == 0) {
+              grad_scores_ptr[slot] = bf16(partial_sums[0]);
+            }
+          });
+    });
+  }
+
+  if (!zero_initialize && max_tail > 0) {
+    const size_t elements_per_expert =
+        static_cast<size_t>(max_tail) * static_cast<size_t>(columns);
+    const size_t rounded_elements =
+        ((elements_per_expert + kThreads - 1) / kThreads) * kThreads;
+    const size_t total_items = static_cast<size_t>(experts) * rounded_elements;
+    queue.parallel_for<RouteGradTailZeroKernel>(
+        sycl::range<1>(total_items), [=](sycl::id<1> index) {
+          const size_t linear = index[0];
+          const int64_t expert = static_cast<int64_t>(linear / rounded_elements);
+          const int64_t offset = static_cast<int64_t>(linear % rounded_elements);
+          const int64_t rows = static_cast<int64_t>(group_rows_ptr[expert]);
+          const int64_t tail_rows = max_rows - rows;
+          const int64_t tail_elements = tail_rows * columns;
+          if (offset >= tail_elements) {
+            return;
+          }
+          const int64_t row = rows + offset / columns;
+          grad_values_ptr[(expert * max_rows + row) * columns + offset % columns] =
+              bf16(0.0f);
+          if (offset % columns == 0) {
+            grad_scores_ptr[expert * max_rows + row] = bf16(0.0f);
+          }
+        });
+  }
+  return {grad_values, grad_scores};
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("route_grad_scale_score_bf16", &aurora_moe::route_grad_scale_score_bf16,
+             "Fuse padded route gradient mapping, score scaling, and score reduction (XPU)");
+}

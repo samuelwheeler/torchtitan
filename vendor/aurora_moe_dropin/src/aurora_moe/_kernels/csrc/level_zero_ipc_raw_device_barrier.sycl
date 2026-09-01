@@ -1,0 +1,386 @@
+// Raw-SYCL control allocation counterpart to oneCCL's IPC comm_barrier.
+//
+// This intentionally does not use a PyTorch allocator tensor for its control
+// words.  It keeps a persistent `sycl::malloc_device<uint64_t>(3, queue)`
+// allocation, exports its Level Zero IPC handle, and captures the peer pointer
+// list by value in the barrier kernel.  The allocation/layout therefore match
+// oneCCL's ptrs0 barrier controls closely enough for an isolated A/B test.
+
+#include <c10/xpu/XPUFunctions.h>
+#include <c10/xpu/XPUStream.h>
+#include <level_zero/ze_api.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <limits>
+#include <optional>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+namespace py = pybind11;
+
+namespace aurora_moe {
+namespace {
+
+constexpr int64_t kSlots = 3;
+constexpr int64_t kMaxNodeRanks = 12;
+constexpr int64_t kMaxWorkGroupSize = 32;
+
+class RawIpcDeviceBarrierKernel;
+
+void check_ze(ze_result_t status, const char* operation) {
+  TORCH_CHECK(status == ZE_RESULT_SUCCESS, operation,
+              " failed with Level Zero status ", static_cast<int64_t>(status));
+}
+
+ze_context_handle_t ze_context() {
+  auto& context = c10::xpu::get_device_context();
+  return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context);
+}
+
+ze_device_handle_t ze_device(int device_index) {
+  c10::xpu::check_device_index(device_index);
+  auto& device = c10::xpu::get_raw_device(device_index);
+  return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device);
+}
+
+sycl::queue& current_queue(int device_index) {
+  return c10::xpu::getCurrentXPUStream(device_index).queue();
+}
+
+int64_t checked_i64(size_t value, const char* name) {
+  TORCH_CHECK(value <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+              name, " exceeds int64 range");
+  return static_cast<int64_t>(value);
+}
+
+void close_fd_noexcept(int& fd) noexcept {
+  if (fd >= 0) {
+    static_cast<void>(::close(std::exchange(fd, -1)));
+  }
+}
+
+void check_barrier_args(const std::vector<int64_t>& remote_addresses,
+                        int64_t world_size,
+                        int64_t rank,
+                        int64_t ordinal,
+                        int device_index,
+                        uintptr_t local_address) {
+  c10::xpu::check_device_index(device_index);
+  TORCH_CHECK(world_size >= 2 && world_size <= kMaxNodeRanks,
+              "raw IPC barriers support world sizes in [2, ", kMaxNodeRanks, "]");
+  TORCH_CHECK(rank >= 0 && rank < world_size, "rank is outside world_size");
+  TORCH_CHECK(ordinal >= 0, "ordinal must be nonnegative");
+  TORCH_CHECK(remote_addresses.size() == static_cast<size_t>(world_size),
+              "remote address list must contain one control pointer per rank");
+  TORCH_CHECK(static_cast<uintptr_t>(remote_addresses[rank]) == local_address,
+              "raw IPC self pointer does not equal local control allocation");
+  for (int64_t index = 0; index < world_size; ++index) {
+    TORCH_CHECK(static_cast<uintptr_t>(remote_addresses[index]) % alignof(uint64_t) == 0,
+                "raw IPC control pointer is not uint64 aligned");
+  }
+}
+
+std::array<uintptr_t, kMaxNodeRanks> make_pointer_array(
+    const std::vector<int64_t>& remote_addresses) {
+  std::array<uintptr_t, kMaxNodeRanks> pointers{};
+  for (size_t index = 0; index < remote_addresses.size(); ++index) {
+    pointers[index] = static_cast<uintptr_t>(remote_addresses[index]);
+  }
+  return pointers;
+}
+
+}  // namespace
+
+class RawDeviceControl {
+ public:
+  explicit RawDeviceControl(int device_index) : device_index_(device_index) {
+    c10::xpu::check_device_index(device_index_);
+    context_ = ze_context();
+    auto& queue = current_queue(device_index_);
+    values_ = sycl::malloc_device<uint64_t>(kSlots, queue);
+    TORCH_CHECK(values_ != nullptr, "sycl::malloc_device failed for raw IPC controls");
+    queue.memset(values_, 0, static_cast<size_t>(kSlots) * sizeof(*values_)).wait();
+
+    void* base = nullptr;
+    size_t allocation_bytes = 0;
+    check_ze(zeMemGetAddressRange(context_, values_, &base, &allocation_bytes),
+             "zeMemGetAddressRange");
+    const auto base_address = reinterpret_cast<uintptr_t>(base);
+    const auto values_address = reinterpret_cast<uintptr_t>(values_);
+    TORCH_CHECK(values_address >= base_address,
+                "raw IPC control pointer is below its Level Zero allocation base");
+    offset_bytes_ = values_address - base_address;
+    TORCH_CHECK(offset_bytes_ <= allocation_bytes &&
+                    static_cast<size_t>(kSlots) * sizeof(*values_) <=
+                        allocation_bytes - offset_bytes_,
+                "raw IPC control extent is outside its Level Zero allocation");
+    allocation_base_ = base;
+    check_ze(zeMemGetIpcHandle(context_, allocation_base_, &handle_),
+             "zeMemGetIpcHandle");
+    handle_live_ = true;
+    uint64_t raw_fd = 0;
+    check_ze(zeMemGetFileDescriptorFromIpcHandleExp(context_, handle_, &raw_fd),
+             "zeMemGetFileDescriptorFromIpcHandleExp");
+    TORCH_CHECK(raw_fd <= static_cast<uint64_t>(std::numeric_limits<int>::max()),
+                "Level Zero IPC file descriptor exceeds int range");
+    fd_ = static_cast<int>(raw_fd);
+  }
+
+  RawDeviceControl(const RawDeviceControl&) = delete;
+  RawDeviceControl& operator=(const RawDeviceControl&) = delete;
+
+  ~RawDeviceControl() { close_noexcept(); }
+
+  int fd() const {
+    TORCH_CHECK(handle_live_, "raw IPC control export is closed");
+    return fd_;
+  }
+
+  int64_t control_offset_bytes() const {
+    TORCH_CHECK(handle_live_, "raw IPC control export is closed");
+    return checked_i64(offset_bytes_, "raw control offset");
+  }
+
+  uint64_t control_address() const {
+    TORCH_CHECK(values_ != nullptr, "raw IPC control is closed");
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(values_));
+  }
+
+  py::bytes handle_bytes() const {
+    TORCH_CHECK(handle_live_, "raw IPC control export is closed");
+    return py::bytes(handle_.data, ZE_MAX_IPC_HANDLE_SIZE);
+  }
+
+  void zero() {
+    TORCH_CHECK(values_ != nullptr, "raw IPC control is closed");
+    current_queue(device_index_).memset(
+        values_, 0, static_cast<size_t>(kSlots) * sizeof(*values_));
+  }
+
+  std::vector<int64_t> counters() {
+    TORCH_CHECK(values_ != nullptr, "raw IPC control is closed");
+    std::array<uint64_t, kSlots> host{};
+    current_queue(device_index_)
+        .memcpy(host.data(), values_, static_cast<size_t>(kSlots) * sizeof(*values_))
+        .wait();
+    std::vector<int64_t> result;
+    result.reserve(kSlots);
+    for (const auto value : host) {
+      TORCH_CHECK(value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                  "raw IPC counter exceeds int64 range");
+      result.push_back(static_cast<int64_t>(value));
+    }
+    return result;
+  }
+
+  void close() {
+    TORCH_CHECK(values_ != nullptr || handle_live_, "raw IPC control is already closed");
+    auto& queue = current_queue(device_index_);
+    queue.wait_and_throw();
+    if (handle_live_) {
+      check_ze(zeMemPutIpcHandle(context_, handle_), "zeMemPutIpcHandle");
+      handle_live_ = false;
+    }
+    if (values_ != nullptr) {
+      sycl::free(values_, queue);
+      values_ = nullptr;
+      allocation_base_ = nullptr;
+    }
+    fd_ = -1;
+  }
+
+ private:
+  void close_noexcept() noexcept {
+    try {
+      if (values_ != nullptr) {
+        auto& queue = current_queue(device_index_);
+        queue.wait_and_throw();
+        if (handle_live_) {
+          static_cast<void>(zeMemPutIpcHandle(context_, handle_));
+          handle_live_ = false;
+        }
+        sycl::free(values_, queue);
+        values_ = nullptr;
+        allocation_base_ = nullptr;
+      }
+    }
+    catch (...) {
+    }
+    fd_ = -1;
+  }
+
+  ze_context_handle_t context_{nullptr};
+  ze_ipc_mem_handle_t handle_{};
+  void* allocation_base_{nullptr};
+  uint64_t* values_{nullptr};
+  size_t offset_bytes_{0};
+  int device_index_{-1};
+  int fd_{-1};
+  bool handle_live_{false};
+};
+
+class RawIpcImport {
+ public:
+  RawIpcImport(const py::bytes& handle_bytes,
+               int received_fd,
+               int device_index,
+               int ipc_bias_flags = 0)
+      : device_index_(device_index), received_fd_(received_fd) {
+    c10::xpu::check_device_index(device_index_);
+    const std::string bytes = handle_bytes;
+    TORCH_CHECK(bytes.size() == ZE_MAX_IPC_HANDLE_SIZE,
+                "IPC handle has an unexpected byte count");
+    std::memcpy(handle_.data, bytes.data(), ZE_MAX_IPC_HANDLE_SIZE);
+    TORCH_CHECK(received_fd_ >= 0 && ::fcntl(received_fd_, F_GETFD) >= 0,
+                "raw IPC import requires a valid receiver-local file descriptor");
+    std::memcpy(handle_.data, &received_fd_, sizeof(received_fd_));
+    context_ = ze_context();
+    const auto flags = static_cast<ze_ipc_memory_flags_t>(ipc_bias_flags);
+    TORCH_CHECK(flags == 0 || flags == ZE_IPC_MEMORY_FLAG_BIAS_CACHED ||
+                    flags == ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED,
+                "IPC bias flags must be 0, cached (1), or uncached (2)");
+    const ze_result_t status = zeMemOpenIpcHandle(
+        context_, ze_device(device_index_), handle_, flags, &mapping_);
+    if (status != ZE_RESULT_SUCCESS) {
+      close_fd_noexcept(received_fd_);
+      check_ze(status, "zeMemOpenIpcHandle");
+    }
+    mapping_live_ = true;
+  }
+
+  RawIpcImport(const RawIpcImport&) = delete;
+  RawIpcImport& operator=(const RawIpcImport&) = delete;
+
+  ~RawIpcImport() { close_noexcept(); }
+
+  uint64_t mapping_address() const {
+    TORCH_CHECK(mapping_live_, "raw IPC import is closed");
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapping_));
+  }
+
+  void close() {
+    TORCH_CHECK(mapping_live_, "raw IPC import is already closed");
+    current_queue(device_index_).wait_and_throw();
+    check_ze(zeMemCloseIpcHandle(context_, mapping_), "zeMemCloseIpcHandle");
+    mapping_live_ = false;
+    close_fd();
+  }
+
+ private:
+  void close_fd() {
+    const int fd = std::exchange(received_fd_, -1);
+    TORCH_CHECK(fd >= 0, "raw IPC import file descriptor is already closed");
+    TORCH_CHECK(::close(fd) == 0, "close failed for raw IPC import file descriptor");
+  }
+
+  void close_noexcept() noexcept {
+    if (mapping_live_) {
+      try {
+        current_queue(device_index_).wait_and_throw();
+      }
+      catch (...) {
+      }
+      static_cast<void>(zeMemCloseIpcHandle(context_, mapping_));
+      mapping_live_ = false;
+    }
+    close_fd_noexcept(received_fd_);
+  }
+
+  ze_context_handle_t context_{nullptr};
+  ze_ipc_mem_handle_t handle_{};
+  void* mapping_{nullptr};
+  int device_index_{-1};
+  int received_fd_{-1};
+  bool mapping_live_{false};
+};
+
+void enqueue_raw_ipc_device_barrier(const std::vector<int64_t>& remote_addresses,
+                                    int64_t world_size,
+                                    int64_t rank,
+                                    int64_t ordinal,
+                                    int device_index,
+                                    int64_t local_address) {
+  const auto local = static_cast<uintptr_t>(local_address);
+  check_barrier_args(remote_addresses, world_size, rank, ordinal, device_index, local);
+  const auto remote_bases = make_pointer_array(remote_addresses);
+  const uint64_t round = static_cast<uint64_t>(ordinal / kSlots) + 1;
+  TORCH_CHECK(round <= std::numeric_limits<uint64_t>::max() /
+                         static_cast<uint64_t>(world_size),
+              "ordinal would overflow the raw IPC barrier counter");
+  const uint64_t expected = round * static_cast<uint64_t>(world_size);
+  const int64_t slot = ordinal % kSlots;
+  auto& queue = current_queue(device_index);
+  const auto predecessor = queue.ext_oneapi_submit_barrier();
+
+  queue.submit([=](sycl::handler& handler) {
+    handler.depends_on(predecessor);
+    handler.parallel_for<RawIpcDeviceBarrierKernel>(
+        sycl::nd_range<1>(sycl::range<1>(kMaxWorkGroupSize),
+                           sycl::range<1>(kMaxWorkGroupSize)),
+        [=](sycl::nd_item<1> item) {
+          const size_t lane = item.get_local_linear_id();
+          if (lane < static_cast<size_t>(world_size)) {
+            auto* remote = reinterpret_cast<uint64_t*>(remote_bases[lane]);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>
+                counter(remote[slot]);
+            counter.fetch_add(1);
+          }
+          sycl::atomic_fence(sycl::memory_order::acq_rel,
+                             sycl::memory_scope::device);
+          item.barrier(sycl::access::fence_space::global_and_local);
+
+          if (lane == 0) {
+            auto* self = reinterpret_cast<uint64_t*>(remote_bases[rank]);
+            sycl::atomic_ref<uint64_t,
+                             sycl::memory_order::relaxed,
+                             sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>
+                local_counter(self[slot]);
+            uint64_t observed = local_counter.load();
+            while (observed < expected) {
+              observed = local_counter.load();
+            }
+            sycl::atomic_fence(sycl::memory_order::acq_rel,
+                               sycl::memory_scope::device);
+          }
+          item.barrier(sycl::access::fence_space::global_and_local);
+        });
+  });
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  using aurora_moe::RawDeviceControl;
+  using aurora_moe::RawIpcImport;
+  module.attr("slots") = aurora_moe::kSlots;
+  module.def("enqueue_raw_ipc_device_barrier",
+             &aurora_moe::enqueue_raw_ipc_device_barrier,
+             "Enqueue one raw-SYCL IPC device barrier on the current XPU stream");
+  py::class_<RawDeviceControl>(module, "RawDeviceControl")
+      .def(py::init<int>(), py::arg("device_index"))
+      .def("fd", &RawDeviceControl::fd)
+      .def("control_offset_bytes", &RawDeviceControl::control_offset_bytes)
+      .def("control_address", &RawDeviceControl::control_address)
+      .def("handle_bytes", &RawDeviceControl::handle_bytes)
+      .def("zero", &RawDeviceControl::zero)
+      .def("counters", &RawDeviceControl::counters)
+      .def("close", &RawDeviceControl::close);
+  py::class_<RawIpcImport>(module, "RawIpcImport")
+      .def(py::init<const py::bytes&, int, int, int>(),
+           py::arg("handle_bytes"), py::arg("received_fd"),
+           py::arg("device_index"), py::arg("ipc_bias_flags") = 0)
+      .def("mapping_address", &RawIpcImport::mapping_address)
+      .def("close", &RawIpcImport::close);
+}

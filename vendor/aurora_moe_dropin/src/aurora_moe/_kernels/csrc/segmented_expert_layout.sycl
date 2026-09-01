@@ -1,0 +1,193 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact source-block expert segmentation primitives for Aurora MoE probes.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+using AtomicCounter = sycl::atomic_ref<
+    int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+    sycl::access::address_space::global_space>;
+
+class BuildSegmentOffsetsKernel;
+class PackSourceExpertSegmentsKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_i32_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name,
+              " must have dtype torch.int32");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+void check_i64_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+bool is_valid_padded_row(int64_t row, const int64_t* recv_counts,
+                         int64_t cap) {
+  return cap > 0 && row % cap < recv_counts[row / cap];
+}
+
+}  // namespace
+
+// ``source_expert_counts[s, e]`` is the exact number of rows source ``s``
+// sends to local expert ``e``.  The returned offsets partition each fixed
+// source block, while expert_rows gives the logical total M per expert.
+std::vector<at::Tensor> build_source_expert_offsets_i32(
+    const at::Tensor& source_expert_counts, int64_t cap) {
+  check_i32_matrix(source_expert_counts, "source_expert_counts");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  const int64_t sources = source_expert_counts.size(0);
+  const int64_t experts = source_expert_counts.size(1);
+  TORCH_CHECK(experts > 0, "source_expert_counts must have at least one expert");
+  auto offsets = at::empty(
+      {sources, experts + 1}, source_expert_counts.options().dtype(at::kLong));
+  auto source_rows = at::empty({sources}, source_expert_counts.options());
+  auto expert_rows = at::zeros({experts}, source_expert_counts.options());
+  if (sources == 0) {
+    return {offsets, source_rows, expert_rows};
+  }
+
+  const auto* counts = source_expert_counts.data_ptr<int32_t>();
+  auto* offset_ptr = offsets.data_ptr<int64_t>();
+  auto* source_row_ptr = source_rows.data_ptr<int32_t>();
+  auto* expert_row_ptr = expert_rows.data_ptr<int32_t>();
+  current_queue(source_expert_counts)
+      .parallel_for<BuildSegmentOffsetsKernel>(
+          sycl::range<1>(static_cast<size_t>(sources)),
+          [=](sycl::id<1> index) {
+            const int64_t source = static_cast<int64_t>(index[0]);
+            int64_t prefix = 0;
+            offset_ptr[source * (experts + 1)] = 0;
+            for (int64_t expert = 0; expert < experts; ++expert) {
+              const int32_t rows = counts[source * experts + expert];
+              prefix += static_cast<int64_t>(rows);
+              offset_ptr[source * (experts + 1) + expert + 1] = prefix;
+              AtomicCounter(expert_row_ptr[expert]).fetch_add(rows);
+            }
+            source_row_ptr[source] = static_cast<int32_t>(prefix);
+          });
+  return {offsets, source_rows, expert_rows};
+}
+
+// Reference-only bridge from an arbitrary source-major padded payload to the
+// source-block expert segmentation.  The production route pack will write
+// directly to these slots, so it will not pay this reorder.  Row order within
+// a (source, expert) segment is intentionally unspecified.
+std::vector<at::Tensor> pack_padded_payload_to_source_expert_segments_bf16(
+    const at::Tensor& payload, const at::Tensor& local_ids,
+    const at::Tensor& recv_counts, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, int64_t cap) {
+  check_bf16_matrix(payload, "payload");
+  check_i64_vector(local_ids, "local_ids");
+  check_i64_vector(recv_counts, "recv_counts");
+  check_i32_matrix(source_expert_counts, "source_expert_counts");
+  check_i64_matrix(source_expert_offsets, "source_expert_offsets");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  const int64_t sources = recv_counts.numel();
+  const int64_t experts = source_expert_counts.size(1);
+  const int64_t padded_rows = sources * cap;
+  TORCH_CHECK(experts > 0, "source_expert_counts must have at least one expert");
+  TORCH_CHECK(payload.size(0) == padded_rows && local_ids.numel() == padded_rows,
+              "payload and local_ids must have one row per source padded slot");
+  TORCH_CHECK(source_expert_counts.size(0) == sources,
+              "source_expert_counts source dimension must match recv_counts");
+  TORCH_CHECK(source_expert_offsets.size(0) == sources &&
+                  source_expert_offsets.size(1) == experts + 1,
+              "source_expert_offsets must have shape [sources, experts + 1]");
+  TORCH_CHECK(payload.device() == local_ids.device() &&
+                  payload.device() == recv_counts.device() &&
+                  payload.device() == source_expert_counts.device() &&
+                  payload.device() == source_expert_offsets.device(),
+              "segment-layout tensors must share an XPU device");
+
+  auto segmented = at::zeros_like(payload);
+  auto source_to_segment = at::full(
+      {padded_rows}, -1, payload.options().dtype(at::kLong));
+  auto segment_to_source = at::full(
+      {padded_rows}, -1, payload.options().dtype(at::kLong));
+  if (padded_rows == 0) {
+    return {segmented, source_to_segment, segment_to_source};
+  }
+  auto counters = at::zeros_like(source_expert_counts);
+  const int64_t columns = payload.size(1);
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* ids = local_ids.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  const auto* offsets = source_expert_offsets.data_ptr<int64_t>();
+  auto* counter_ptr = counters.data_ptr<int32_t>();
+  auto* output = reinterpret_cast<bf16*>(segmented.data_ptr());
+  auto* source_to_segment_ptr = source_to_segment.data_ptr<int64_t>();
+  auto* segment_to_source_ptr = segment_to_source.data_ptr<int64_t>();
+  current_queue(payload)
+      .parallel_for<PackSourceExpertSegmentsKernel>(
+          sycl::range<1>(static_cast<size_t>(padded_rows)),
+          [=](sycl::id<1> index) {
+            const int64_t source_row = static_cast<int64_t>(index[0]);
+            if (!is_valid_padded_row(source_row, counts, cap)) {
+              return;
+            }
+            const int64_t source = source_row / cap;
+            const int64_t expert = ids[source_row];
+            const int32_t ordinal = AtomicCounter(
+                counter_ptr[source * experts + expert]).fetch_add(1);
+            const int64_t segment_row = source * cap +
+                offsets[source * (experts + 1) + expert] + ordinal;
+            for (int64_t column = 0; column < columns; ++column) {
+              output[segment_row * columns + column] =
+                  input[source_row * columns + column];
+            }
+            source_to_segment_ptr[source_row] = segment_row;
+            segment_to_source_ptr[segment_row] = source_row;
+          });
+  return {segmented, source_to_segment, segment_to_source};
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("build_source_expert_offsets_i32",
+             &aurora_moe::build_source_expert_offsets_i32,
+             "Build exact source-block expert offsets on XPU");
+  module.def("pack_padded_payload_to_source_expert_segments_bf16",
+             &aurora_moe::pack_padded_payload_to_source_expert_segments_bf16,
+             "Reference source-major to source-block expert segmentation");
+}

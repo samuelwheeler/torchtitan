@@ -53,7 +53,16 @@ def init_logger() -> None:
     reset_logger(logger)
 
     rank = _detect_rank()
-    level = logging.INFO if rank == 0 else logging.CRITICAL
+    configured_ranks = os.environ.get("LOG_RANK", "").split(",")
+    logged_ranks = {
+        int(configured_rank)
+        for configured_rank in configured_ranks
+        if configured_rank.strip().lstrip("-").isdigit()
+    }
+    if not logged_ranks:
+        logged_ranks = {0}
+    should_log = rank in logged_ranks
+    level = logging.INFO if should_log else logging.CRITICAL
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
@@ -64,7 +73,7 @@ def init_logger() -> None:
     logger.addHandler(ch)
     logger.setLevel(level)
 
-    if rank == 0:
+    if should_log:
         logging.disable(logging.NOTSET)
     else:
         # Keep CRITICAL logs from non-zero ranks and suppress everything else.

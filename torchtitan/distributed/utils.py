@@ -21,28 +21,22 @@ from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from torchtitan.config import CommConfig, DebugConfig
+from torchtitan.config import CommConfig, DebugConfig, ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
 
 
-def _dist_reduce(
+def _dist_reduce_tensor(
     x: torch.Tensor,
     reduceOp: str,
     mesh: DeviceMesh | None,
     extra_pg: dist.ProcessGroup | None,
-) -> float:
-    """Perform distributed reduction on a tensor.
+) -> torch.Tensor:
+    """Perform a reduction without materializing a host scalar.
 
-    Args:
-        x (torch.Tensor): Input tensor.
-        reduceOp (str): Reduce operation to perform.
-        mesh (DeviceMesh | None): Device mesh to use for reduction.
-            If None, no reduction is performed but simply convert the tensor to a float.
-        extra_pg (dist.ProcessGroup, optional): Extra process group to use for reduction.
-            Defaults to None. If provided, this all_reduce will be called for the extra
-            process group, and then the result will be all_reduced for the mesh.
+    Functional collectives return an async tensor whose device dependency can be
+    consumed later without blocking the host at collective submission time.
     """
     if isinstance(x, DTensor):
         # DTensor path: ``full_tensor()`` already performs the mesh reduction
@@ -61,15 +55,26 @@ def _dist_reduce(
                 "mesh, and extra_pg (e.g. the FT replica group) is orthogonal "
                 "to that mesh. Pass a plain tensor when using extra_pg."
             )
-        return float(x.full_tensor().item())
+        return x.full_tensor()
 
     # Plain tensor path.
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
     if mesh is None:
-        return float(x.item())
-    assert x.numel() == 1  # required by `.item()`
-    return float(funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item())
+        return x
+    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
+
+
+def _dist_reduce(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> float:
+    """Perform a reduction and materialize its scalar result on the host."""
+    reduced = _dist_reduce_tensor(x, reduceOp, mesh, extra_pg)
+    assert reduced.numel() == 1  # required by `.item()`
+    return float(reduced.item())
 
 
 # TODO: rename this to maybe_dist_max
@@ -90,6 +95,28 @@ def dist_sum(
 ) -> float:
     return _dist_reduce(
         x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_sum_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Sum a tensor while preserving asynchronous device-side completion."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_max_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Max-reduce a tensor while preserving asynchronous completion."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg
     )
 
 
@@ -310,12 +337,37 @@ class TrainContext(Protocol):
         pass
 
 
-def get_train_context(enable_loss_parallel: bool) -> TrainContext:
+def should_enable_bf16_autocast(parallelism: ParallelismConfig) -> bool:
+    """Return whether the trainer must provide BF16 autocast compute."""
+    return parallelism.disable_degree_one_fsdp or (
+        parallelism.enable_data_parallel_native_ddp
+        and parallelism.native_ddp_compute_policy == "autocast"
+    )
+
+
+def validate_pure_model_parallel_model(
+    model_name: str, parallelism: ParallelismConfig
+) -> None:
+    """Reject the AGPT-only wrapper-free control for every other model."""
+    if parallelism.disable_degree_one_fsdp and model_name != "ezpz.agpt":
+        raise ValueError(
+            "disable_degree_one_fsdp is an AGPT-only experimental control; "
+            f"model_spec.name must be 'ezpz.agpt', got {model_name!r}"
+        )
+
+
+def get_train_context(
+    enable_loss_parallel: bool, *, enable_bf16_autocast: bool = False
+) -> TrainContext:
     @contextlib.contextmanager
     def context():
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+            if enable_bf16_autocast:
+                stack.enter_context(
+                    torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+                )
 
             yield
 

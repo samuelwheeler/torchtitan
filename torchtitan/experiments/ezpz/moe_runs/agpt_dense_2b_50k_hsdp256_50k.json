@@ -1,0 +1,64 @@
+{
+  "hf_assets_path": "/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/assets/hf/llama-2-32k-sp",
+  "tokenizer": {"backend": "sptoken"},
+  "training": {
+    "local_batch_size": 1,
+    "global_batch_size": 3072,
+    "seq_len": 2048,
+    "steps": 50000,
+    "gc_freq": 200,
+    "dtype": "float32",
+    "mixed_precision_param": "bfloat16",
+    "mixed_precision_reduce": "float32"
+  },
+  "parallelism": {
+    "data_parallel_replicate_degree": 256,
+    "data_parallel_shard_degree": 12,
+    "tensor_parallel_degree": 1,
+    "pipeline_parallel_degree": 1,
+    "context_parallel_degree": 1,
+    "expert_parallel_degree": 1
+  },
+  "activation_checkpoint": {"mode": "selective"},
+  "compile": {"enable": false},
+  "optimizer": {
+    "name": "AdamW",
+    "implementation": "fused",
+    "lr": 0.00022,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-8,
+    "weight_decay": 0.1
+  },
+  "lr_scheduler": {
+    "warmup_steps": 1000,
+    "total_steps": 50000,
+    "decay_ratio": 0.8,
+    "decay_type": "cosine",
+    "min_lr_factor": 0.1
+  },
+  "dataloader": {
+    "dataset": "blendcorpus",
+    "dataset_path": "/lus/flare/projects/AuroraGPT/sww/new_tt_aurora/torchtitan/outputs/agpt_2b_50k_native_ddp_compile_wandb_ab/8703043/source/torchtitan/experiments/ezpz/data-lists/aurora/dolma_v1_7_llama2_live.txt",
+    "seed": 42,
+    "train_iters": 50000,
+    "num_workers": 2,
+    "persistent_workers": true,
+    "prefetch_factor": 8,
+    "pin_memory": false,
+    "infinite": true,
+    "shuffle": true,
+    "shuffle_sample_in_corpus": true,
+    "append_eod": true
+  },
+  "checkpoint": {
+    "enable": true,
+    "folder": "checkpoint",
+    "interval": 500,
+    "last_save_model_only": false,
+    "keep_latest_k": 2
+  },
+  "metrics": {"enable_wandb": true, "log_freq": 10},
+  "comm": {"init_timeout_seconds": 1800, "train_timeout_seconds": 1800},
+  "debug": {"seed": 20260722, "print_config": true}
+}

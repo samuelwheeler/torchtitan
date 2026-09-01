@@ -44,6 +44,11 @@ def _get_save_ops() -> set:
         # FlexAttention (torch.ops.higher_order.flex_attention is the same object)
         torch._higher_order_ops.flex_attention,
         torch.ops.aten.linear.default,
+        # MoE routing changes downstream ragged tensor shapes. XPU GEMM
+        # recomputation can move a near-boundary token to another expert, so
+        # selective AC must replay the original top-k result rather than route
+        # the token a second time during backward.
+        torch.ops.aten.topk.default,
         # Inductor compiled code (available when torch.compile is used)
         (torch._higher_order_ops, "inductor_compiled_code"),
         # torch_attn custom backend
@@ -207,6 +212,7 @@ def apply_ac(
     *,
     model_compile_enabled: bool = False,
     base_folder: str = "",
+    checkpoint_submodule: str | None = None,
 ) -> None:
     """Apply activation checkpointing to the model.
 
@@ -214,6 +220,9 @@ def apply_ac(
         model (nn.Module): The model to apply activation checkpointing to.
         ac_config (ACConfig): The activation checkpointing config.
         model_compile_enabled (bool): Whether torch.compile is enabled for the model.
+        checkpoint_submodule (str | None): If set, checkpoint only this
+            submodule within each transformer block instead of wrapping the
+            complete block.
 
     Returns:
         None
@@ -245,11 +254,33 @@ def apply_ac(
     else:
         layers = model.get_submodule("layers")
         for layer_id, transformer_block in layers.named_children():
-            transformer_block = _apply_ac_to_transformer_block(
-                transformer_block,
-                ac_config,
-                base_fqn=f"layers.{layer_id}",
+            checkpoint_target = (
+                transformer_block
+                if checkpoint_submodule is None
+                else transformer_block.get_submodule(checkpoint_submodule)
             )
-            layers.register_module(layer_id, transformer_block)
+            checkpoint_target = _apply_ac_to_transformer_block(
+                checkpoint_target,
+                ac_config,
+                base_fqn=".".join(
+                    filter(
+                        None,
+                        (f"layers.{layer_id}", checkpoint_submodule),
+                    )
+                ),
+            )
+            if checkpoint_submodule is None:
+                layers.register_module(layer_id, checkpoint_target)
+            else:
+                transformer_block.set_submodule(
+                    checkpoint_submodule, checkpoint_target
+                )
 
-    logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
+    scope = (
+        "transformer blocks" if checkpoint_submodule is None else checkpoint_submodule
+    )
+    logger.info(
+        "Applied %s activation checkpointing to model %s",
+        ac_config.mode,
+        scope,
+    )

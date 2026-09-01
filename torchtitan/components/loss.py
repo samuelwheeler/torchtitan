@@ -264,6 +264,7 @@ class ChunkedCELoss(BaseLoss):
         through the decoder via a custom autograd Function.
         """
         from torch.distributed._composable.fsdp import FSDPModule
+        from torch.distributed._composable.replicate_with_fsdp import ReplicateModule
         from torch.distributed.tensor import DTensor, Replicate
 
         hidden_states = pred
@@ -271,6 +272,7 @@ class ChunkedCELoss(BaseLoss):
         lm_head = self.lm_head
         assert lm_head is not None, "Set lm_head before calling ChunkedCELoss"
         fsdp_enabled = isinstance(lm_head, FSDPModule)
+        replicate_enabled = isinstance(lm_head, ReplicateModule)
 
         # If SP is enabled, hidden states are Shard(1) on the TP mesh dim.
         # Redistribute only the TP dim to Replicate before chunking so that
@@ -310,8 +312,9 @@ class ChunkedCELoss(BaseLoss):
         # all chunks, avoiding repeated all-gathers. Coalesce per-chunk
         # grad sync into a single reduce-scatter at the last chunk by
         # disabling gradient sync for chunks 0..N-2.
-        if fsdp_enabled:
+        if fsdp_enabled and not replicate_enabled:
             lm_head.set_reshard_after_forward(False)
+        if fsdp_enabled:
             lm_head.set_reshard_after_backward(False)
             lm_head.set_requires_gradient_sync(False, recurse=False)
 
@@ -336,7 +339,8 @@ class ChunkedCELoss(BaseLoss):
                 h_chunk.grad = None
 
         if fsdp_enabled:
-            lm_head.set_reshard_after_forward(True)
+            if not replicate_enabled:
+                lm_head.set_reshard_after_forward(True)
             lm_head.set_reshard_after_backward(True)
             lm_head.set_requires_gradient_sync(True, recurse=False)
             lm_head.reshard()

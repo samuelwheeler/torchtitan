@@ -1,0 +1,179 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Runtime-shape BF16 GEMM using PVC XMX through SYCL joint_matrix.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+namespace aurora_moe {
+namespace {
+
+namespace matrix = sycl::ext::oneapi::experimental::matrix;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr int64_t kTileM = 8;
+constexpr int64_t kTileN = 16;
+constexpr int64_t kTileK = 16;
+constexpr size_t kSubgroupSize = 16;
+// Compute a small output macro-tile per subgroup.  Reusing each loaded A
+// fragment across four N tiles and each B fragment across two M tiles raises
+// arithmetic intensity substantially versus one 8x16 DPAS tile/subgroup.
+constexpr int64_t kBlockTilesM = 4;
+constexpr int64_t kBlockTilesN = 4;
+constexpr int64_t kBlockM = kTileM * kBlockTilesM;
+constexpr int64_t kBlockN = kTileN * kBlockTilesN;
+
+class XmxBf16GemmKernel;
+
+void check_input(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must have shape [rows, cols]");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+int64_t round_up(int64_t value, int64_t tile) {
+  return ((value + tile - 1) / tile) * tile;
+}
+
+at::Tensor pad_right_and_bottom(const at::Tensor& input, int64_t rows,
+                                int64_t cols) {
+  if (input.size(0) == rows && input.size(1) == cols) {
+    return input;
+  }
+  auto padded = at::zeros({rows, cols}, input.options());
+  padded.narrow(0, 0, input.size(0)).narrow(1, 0, input.size(1)).copy_(input);
+  return padded;
+}
+
+at::Tensor xmx_gemm_bf16_aligned(const at::Tensor& a, const at::Tensor& b) {
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(1);
+  TORCH_CHECK(m % kBlockM == 0 && k % kTileK == 0 && n % kBlockN == 0,
+              "internal XMX GEMM dimensions must be tile aligned");
+
+  auto output = at::empty({m, n}, a.options());
+  auto* a_ptr = reinterpret_cast<const bf16*>(a.data_ptr());
+  auto* b_ptr = reinterpret_cast<const bf16*>(b.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = c10::xpu::getCurrentXPUStream(a.get_device()).queue();
+
+  const size_t m_blocks = static_cast<size_t>(m / kBlockM);
+  const size_t n_blocks = static_cast<size_t>(n / kBlockN);
+  queue.parallel_for<XmxBf16GemmKernel>(
+      sycl::nd_range<2>(sycl::range<2>(m_blocks, n_blocks * kSubgroupSize),
+                        sycl::range<2>(1, kSubgroupSize)),
+      [=](sycl::nd_item<2> item) [[intel::reqd_sub_group_size(16)]] {
+        const size_t m_block = item.get_global_id(0);
+        const size_t n_block = item.get_group(1);
+        const auto subgroup = item.get_sub_group();
+        const auto a_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(a_ptr);
+        const auto b_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(b_ptr);
+        const auto output_global = sycl::address_space_cast<
+            sycl::access::address_space::global_space,
+            sycl::access::decorated::no>(output_ptr);
+
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::a, kTileM,
+                             kTileK, matrix::layout::row_major>
+            a_fragment[kBlockTilesM];
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::b, kTileK,
+                             kTileN, matrix::layout::row_major>
+            b_fragment[kBlockTilesN];
+        matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator,
+                             kTileM, kTileN>
+            accumulator[kBlockTilesM][kBlockTilesN];
+        matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::accumulator,
+                             kTileM, kTileN>
+            output_fragment;
+        for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            matrix::joint_matrix_fill(subgroup, accumulator[mi][ni], 0.0f);
+          }
+        }
+        for (int64_t k_offset = 0; k_offset < k; k_offset += kTileK) {
+          for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+            matrix::joint_matrix_load(
+                subgroup, a_fragment[mi],
+                a_global + (m_block * kBlockM + mi * kTileM) * k + k_offset,
+                static_cast<size_t>(k));
+          }
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            matrix::joint_matrix_load(
+                subgroup, b_fragment[ni],
+                b_global + k_offset * n + n_block * kBlockN + ni * kTileN,
+                static_cast<size_t>(n));
+          }
+          for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+            for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+              matrix::joint_matrix_mad(subgroup, accumulator[mi][ni],
+                                       a_fragment[mi], b_fragment[ni],
+                                       accumulator[mi][ni]);
+            }
+          }
+        }
+        for (int64_t mi = 0; mi < kBlockTilesM; ++mi) {
+          for (int64_t ni = 0; ni < kBlockTilesN; ++ni) {
+            // The BF16 accumulator fragment avoids an intermediate FP32
+            // tensor. DPAS itself still accumulates BF16 products in FP32.
+            matrix::joint_matrix_copy(subgroup, accumulator[mi][ni],
+                                      output_fragment);
+            matrix::joint_matrix_store(
+                subgroup, output_fragment,
+                output_global + (m_block * kBlockM + mi * kTileM) * n +
+                    n_block * kBlockN + ni * kTileN,
+                static_cast<size_t>(n), matrix::layout::row_major);
+          }
+        }
+      });
+  return output;
+}
+
+}  // namespace
+
+at::Tensor xmx_gemm_bf16(const at::Tensor& a, const at::Tensor& b) {
+  check_input(a, "a");
+  check_input(b, "b");
+  TORCH_CHECK(a.device() == b.device(), "a and b must share an XPU device");
+  TORCH_CHECK(a.size(1) == b.size(0), "a and b inner dimensions must match");
+
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(1);
+  if (m == 0 || n == 0) {
+    return at::empty({m, n}, a.options());
+  }
+  if (k == 0) {
+    return at::zeros({m, n}, a.options());
+  }
+
+  const int64_t padded_m = round_up(m, kBlockM);
+  const int64_t padded_k = round_up(k, kTileK);
+  const int64_t padded_n = round_up(n, kBlockN);
+  auto padded_a = pad_right_and_bottom(a, padded_m, padded_k);
+  auto padded_b = pad_right_and_bottom(b, padded_k, padded_n);
+  auto padded_output = xmx_gemm_bf16_aligned(padded_a, padded_b);
+  if (padded_m == m && padded_n == n) {
+    return padded_output;
+  }
+  return padded_output.narrow(0, 0, m).narrow(1, 0, n).clone();
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("xmx_gemm_bf16", &aurora_moe::xmx_gemm_bf16,
+             "PVC XMX BF16 GEMM using SYCL joint_matrix");
+}

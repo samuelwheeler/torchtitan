@@ -1,0 +1,194 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Transport-agnostic direct-peer reverse-A4 remap candidate.  The peer address
+// table is an XPU int64 tensor, so EP is runtime data rather than a host-side
+// template specialization.  The caller owns descriptor exchange and the
+// collective readiness protocol.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+class FusedA4RemapPeerPushKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16(const at::Tensor& tensor, const char* name, int64_t dim) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == dim, name, " has an unexpected rank");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+void check_inputs(const at::Tensor& expert_tokens,
+                  const at::Tensor& expert_scores,
+                  const at::Tensor& source_slots,
+                  const at::Tensor& recv_counts,
+                  const at::Tensor& receive_staging,
+                  const at::Tensor& remote_receive_addresses,
+                  int64_t rank, int64_t cap) {
+  check_bf16(expert_tokens, "expert_tokens", 3);
+  check_bf16(expert_scores, "expert_scores", 2);
+  check_i64_vector(source_slots, "source_slots");
+  check_i64_vector(recv_counts, "recv_counts");
+  check_bf16(receive_staging, "receive_staging", 2);
+  check_i64_vector(remote_receive_addresses, "remote_receive_addresses");
+  TORCH_CHECK(expert_scores.size(0) == expert_tokens.size(0) &&
+                  expert_scores.size(1) == expert_tokens.size(1),
+              "expert_scores must match expert_tokens expert-row dimensions");
+  TORCH_CHECK(expert_scores.device() == expert_tokens.device() &&
+                  source_slots.device() == expert_tokens.device() &&
+                  recv_counts.device() == expert_tokens.device() &&
+                  receive_staging.device() == expert_tokens.device() &&
+                  remote_receive_addresses.device() == expert_tokens.device(),
+              "all fused A4 remap tensors must share an XPU device");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  const int64_t peers = recv_counts.numel();
+  TORCH_CHECK(peers > 0, "fused A4 remap requires at least one peer");
+  TORCH_CHECK(remote_receive_addresses.numel() == peers,
+              "remote_receive_addresses must contain one address per peer");
+  TORCH_CHECK(receive_staging.size(0) == peers,
+              "receive_staging must have one row per peer");
+  TORCH_CHECK(source_slots.numel() == peers * cap,
+              "source_slots must contain peers * cap entries");
+  TORCH_CHECK(rank >= 0 && rank < peers, "rank is outside the peer group");
+  const int64_t payload_columns = expert_tokens.size(2) + 1;
+  TORCH_CHECK(payload_columns > 0 && cap <= INT64_MAX / payload_columns,
+              "reverse-A4 payload size overflows int64");
+  TORCH_CHECK(receive_staging.size(1) >= cap * payload_columns,
+              "receive_staging capacity is smaller than the reverse-A4 payload");
+}
+
+sycl::event submit_fused_a4_remap(
+    const at::Tensor& expert_tokens, const at::Tensor& expert_scores,
+    const at::Tensor& source_slots, const at::Tensor& recv_counts,
+    const at::Tensor& remote_receive_addresses, int64_t rank_value,
+    int64_t cap_value, int64_t receive_stride_value, sycl::queue& current,
+    const sycl::event& producer) {
+  const size_t peers = static_cast<size_t>(recv_counts.numel());
+  const size_t cap = static_cast<size_t>(cap_value);
+  const size_t model_dim = static_cast<size_t>(expert_tokens.size(2));
+  const size_t payload_columns = model_dim + 1;
+  const size_t elements_per_peer = cap * payload_columns;
+  const size_t total_elements = peers * elements_per_peer;
+  const size_t rank = static_cast<size_t>(rank_value);
+  const size_t receive_stride = static_cast<size_t>(receive_stride_value);
+  const auto* tokens = reinterpret_cast<const bf16*>(expert_tokens.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(expert_scores.data_ptr());
+  const auto* slots = source_slots.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  const auto* addresses = remote_receive_addresses.data_ptr<int64_t>();
+
+  // The OOO queue is intentionally local to this standalone candidate.  A
+  // production integration can substitute a transport-owned queue while
+  // retaining this fully dynamic device address-table ABI.
+  sycl::queue out_of_order(current.get_context(), current.get_device());
+  return out_of_order.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(producer);
+    cgh.parallel_for<FusedA4RemapPeerPushKernel>(
+        sycl::range<1>(total_elements), [=](sycl::id<1> item) {
+          const size_t linear = static_cast<size_t>(item[0]);
+          const size_t peer = linear / elements_per_peer;
+          const size_t payload_index = linear - peer * elements_per_peer;
+          const size_t row = payload_index / payload_columns;
+          const size_t column = payload_index - row * payload_columns;
+          const int64_t received = counts[peer];
+          bf16 value(0.0f);
+          if (received > 0 && row < static_cast<size_t>(received)) {
+            const int64_t slot = slots[peer * cap + row];
+            value = column < model_dim
+                ? tokens[slot * static_cast<int64_t>(model_dim) +
+                         static_cast<int64_t>(column)]
+                : scores[slot];
+          }
+          const auto address = static_cast<uintptr_t>(addresses[peer]);
+          auto* output = reinterpret_cast<bf16*>(address);
+          output[rank * receive_stride + payload_index] = value;
+        });
+  });
+}
+
+}  // namespace
+
+void push_fused_a4_remap_bf16(const at::Tensor& expert_tokens,
+                               const at::Tensor& expert_scores,
+                               const at::Tensor& source_slots,
+                               const at::Tensor& recv_counts,
+                               const at::Tensor& receive_staging,
+                               const at::Tensor& remote_receive_addresses,
+                               int64_t rank, int64_t cap) {
+  check_inputs(expert_tokens, expert_scores, source_slots, recv_counts,
+               receive_staging, remote_receive_addresses, rank, cap);
+  if (cap == 0) {
+    return;
+  }
+  auto& current = current_queue(expert_tokens);
+  const auto producer = current.ext_oneapi_submit_barrier();
+  auto event = submit_fused_a4_remap(
+      expert_tokens, expert_scores, source_slots, recv_counts,
+      remote_receive_addresses, rank, cap, receive_staging.size(1), current,
+      producer);
+  event.wait_and_throw();
+}
+
+void push_fused_a4_remap_bf16_async(
+    const at::Tensor& expert_tokens, const at::Tensor& expert_scores,
+    const at::Tensor& source_slots, const at::Tensor& recv_counts,
+    const at::Tensor& receive_staging,
+    const at::Tensor& remote_receive_addresses, int64_t rank, int64_t cap) {
+  check_inputs(expert_tokens, expert_scores, source_slots, recv_counts,
+               receive_staging, remote_receive_addresses, rank, cap);
+  if (cap == 0) {
+    return;
+  }
+  auto stream = c10::xpu::getCurrentXPUStream(expert_tokens.get_device());
+  auto& current = stream.queue();
+  const auto producer = current.ext_oneapi_submit_barrier();
+  const auto event = submit_fused_a4_remap(
+      expert_tokens, expert_scores, source_slots, recv_counts,
+      remote_receive_addresses, rank, cap, receive_staging.size(1), current,
+      producer);
+  static_cast<void>(current.ext_oneapi_submit_barrier({event}));
+  expert_tokens.record_stream(stream);
+  expert_scores.record_stream(stream);
+  source_slots.record_stream(stream);
+  recv_counts.record_stream(stream);
+  receive_staging.record_stream(stream);
+  remote_receive_addresses.record_stream(stream);
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("push_fused_a4_remap_bf16", &aurora_moe::push_fused_a4_remap_bf16,
+             "Synchronously remap expert gradients into dynamic peer A4 buffers");
+  module.def("push_fused_a4_remap_bf16_async",
+             &aurora_moe::push_fused_a4_remap_bf16_async,
+             "Asynchronously remap expert gradients into dynamic peer A4 buffers");
+}

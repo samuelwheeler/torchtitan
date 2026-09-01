@@ -74,6 +74,7 @@ def parallelize_llama(
             # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
+            parallelism.context_parallel_rotate_method,
         )
 
     tp_mesh = None

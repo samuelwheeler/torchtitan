@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Iterable
+
 import torch.nn as nn
 from torch.distributed._composable.fsdp import FSDPModule
 
@@ -23,6 +25,21 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+
+
+def set_fsdp_gradient_sync(
+    model_parts: Iterable[nn.Module], is_last_microbatch: bool
+) -> None:
+    """Configure FSDP2 gradient synchronization for one accumulation microbatch."""
+    for model_part in model_parts:
+        if not isinstance(model_part, FSDPModule):
+            raise TypeError(
+                "gradient accumulation with data parallelism requires each "
+                "non-pipeline model part to be an FSDPModule or ReplicateModule, "
+                f"but got {type(model_part).__name__}"
+            )
+        model_part.set_is_last_backward(is_last_microbatch)
+        model_part.set_requires_gradient_sync(is_last_microbatch)
 
 
 def get_fsdp_reshard_after_forward_policy(

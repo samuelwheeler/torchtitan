@@ -106,6 +106,13 @@ class Profiler(Configurable):
         save_traces_folder: str = "profile_traces"
         """Trace files location."""
 
+        profile_ranks: str = ""
+        """
+        Optional comma-separated global ranks to profile. An empty string
+        profiles every rank. This keeps distributed XPU traces small enough
+        for targeted communication/computation-overlap analysis.
+        """
+
         profile_freq: int = 10
         """How often to collect profile traces, in iterations."""
 
@@ -263,6 +270,22 @@ class Profiler(Configurable):
         if not cfg.enable_profiling:
             return None
 
+        rank = torch.distributed.get_rank()
+        if cfg.profile_ranks:
+            try:
+                profile_ranks = {
+                    int(item.strip())
+                    for item in cfg.profile_ranks.split(",")
+                    if item.strip()
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    "profiler.profile_ranks must be a comma-separated list of "
+                    f"integer global ranks, got {cfg.profile_ranks!r}"
+                ) from exc
+            if rank not in profile_ranks:
+                return None
+
         trace_dir = os.path.join(base_folder, cfg.save_traces_folder)
         profile_freq, warmup, active = (
             cfg.profile_freq,
@@ -280,7 +303,6 @@ class Profiler(Configurable):
             if val is not None
         }
 
-        rank = torch.distributed.get_rank()
         post_processor = (
             cfg.trace_post_processor.build() if cfg.trace_post_processor else None
         )

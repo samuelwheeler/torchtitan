@@ -1,0 +1,454 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// FP32-output diagnostic companion to xetla_grouped_gemm.sycl.  It deliberately
+// keeps the BF16 A/B mainloop, compact expert metadata, C/D aliasing, and
+// device-resident grouped scheduler unchanged.  Only the generic TLA epilogue
+// C/D element type and output store type differ from the BF16 prototype.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <cute/tensor.hpp>
+#include <cute/util/compat.hpp>
+#include <cutlass/epilogue/collective/default_epilogue.hpp>
+#include <cutlass/epilogue/collective/xe_array_epilogue.hpp>
+#include <cutlass/epilogue/fusion/xe_callbacks.hpp>
+#include <cutlass/gemm/collective/collective_mma.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/group_array_problem_shape.hpp>
+#include <cutlass/gemm/kernel/xe_gemm_array_cooperative.hpp>
+#include <cutlass/kernel_hardware_info.h>
+#include <cutlass/util/packed_stride.hpp>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+#pragma clang diagnostic ignored "-Wpass-failed"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+namespace aurora_moe {
+namespace {
+
+using namespace cute;
+
+using Element = cutlass::bfloat16_t;
+using ElementOutput = float;
+using ElementAccumulator = float;
+using ElementComputeEpilogue = float;
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::RowMajor;
+using LayoutC = cutlass::layout::RowMajor;
+using LayoutD = cutlass::layout::RowMajor;
+using TileShape = Shape<_256, _256, _32>;
+using TiledMma = typename TiledMMAHelper<
+    MMA_Atom<XE_DPAS_TT<8, ElementAccumulator, Element>>,
+    Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+using MainloopPolicy = cutlass::gemm::MainloopXeL1StagedGroup<2>;
+using EpiloguePolicy = cutlass::epilogue::IntelXeGenericGroup;
+using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
+    ElementOutput, ElementComputeEpilogue, ElementAccumulator, ElementAccumulator,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using FusionCallbacks = cutlass::epilogue::fusion::FusionCallbacks<
+    EpiloguePolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
+using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
+    EpiloguePolicy, TileShape, void, ElementOutput,
+    cutlass::gemm::TagToStrideC_t<LayoutC*>, ElementOutput,
+    cutlass::gemm::TagToStrideC_t<LayoutD*>, FusionCallbacks, void, void>;
+using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    MainloopPolicy, TileShape, Element, cutlass::gemm::TagToStrideA_t<LayoutA*>,
+    Element, cutlass::gemm::TagToStrideB_t<LayoutB*>, TiledMma, void, void,
+    void, cute::identity, void, void, void, cute::identity>;
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+    cutlass::gemm::GroupScheduler>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
+using StrideA = GemmKernel::InternalStrideA;
+using StrideB = GemmKernel::InternalStrideB;
+using StrideC = GemmKernel::InternalStrideC;
+using StrideD = GemmKernel::InternalStrideD;
+using TileScheduler = cutlass::gemm::kernel::detail::PersistentTileSchedulerXeGroup<
+    ProblemShape>;
+using RasterOrderOptions = TileScheduler::RasterOrderOptions;
+
+class BuildGroupedMetadataF32Kernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name, int64_t dim) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == dim, name, " has an invalid rank");
+}
+
+void check_cpu_i32_vector(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name,
+              " must have dtype torch.int32");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank one");
+}
+
+at::Tensor metadata_storage(const at::Tensor& reference, size_t bytes) {
+  return at::empty({static_cast<int64_t>(bytes)},
+                   reference.options().dtype(at::kByte).requires_grad(false));
+}
+
+template <class T>
+T* metadata_ptr(at::Tensor& storage) {
+  return reinterpret_cast<T*>(storage.data_ptr<uint8_t>());
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+void record_current_stream(const at::Tensor& tensor) {
+  const auto stream = c10::xpu::getCurrentXPUStream(tensor.get_device());
+  tensor.record_stream(stream.unwrap());
+}
+
+int stream_slice_count(sycl::queue& queue) {
+  const auto device = queue.get_device();
+  const auto slices = device.get_info<sycl::ext::intel::info::device::gpu_slices>();
+  const auto subslices =
+      device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+  return static_cast<int>(slices * subslices);
+}
+
+}  // namespace
+
+at::Tensor grouped_gemm_bf16_to_f32(const at::Tensor& activations,
+                                     const at::Tensor& weights,
+                                     const at::Tensor& group_offsets) {
+  check_bf16_matrix(activations, "activations", 2);
+  check_bf16_matrix(weights, "weights", 3);
+  check_xpu_contiguous(group_offsets, "group_offsets");
+  TORCH_CHECK(group_offsets.scalar_type() == at::kInt,
+              "group_offsets must have dtype torch.int32");
+  TORCH_CHECK(group_offsets.dim() == 1,
+              "group_offsets must have shape [groups + 1]");
+  TORCH_CHECK(activations.device() == weights.device() &&
+                  activations.device() == group_offsets.device(),
+              "all grouped GEMM inputs must share an XPU device");
+
+  const int64_t groups = weights.size(0);
+  const int64_t total_rows = activations.size(0);
+  const int64_t k = activations.size(1);
+  const int64_t n = weights.size(2);
+  TORCH_CHECK(groups > 0, "at least one expert group is required");
+  TORCH_CHECK(group_offsets.numel() == groups + 1,
+              "group_offsets must have one more element than weights groups");
+  TORCH_CHECK(weights.size(1) == k, "activation and weight K dimensions differ");
+  TORCH_CHECK(k > 0 && n > 0, "K and N must be positive");
+  TORCH_CHECK(n % 4 == 0,
+              "the SYCL*TLA FP32 epilogue requires N divisible by 4");
+  TORCH_CHECK(groups <= std::numeric_limits<int32_t>::max() &&
+                  total_rows <= std::numeric_limits<int32_t>::max() &&
+                  k <= std::numeric_limits<int32_t>::max() &&
+                  n <= std::numeric_limits<int32_t>::max(),
+              "grouped GEMM extents exceed SYCL*TLA int32 limits");
+
+  auto output = at::empty(
+      {total_rows, n}, activations.options().dtype(at::kFloat).requires_grad(false));
+  if (total_rows == 0) {
+    return output;
+  }
+
+  auto problem_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(UnderlyingProblemShape));
+  auto a_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const Element*));
+  auto b_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const Element*));
+  auto c_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const ElementOutput*));
+  auto d_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(ElementOutput*));
+  auto a_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideA));
+  auto b_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideB));
+  auto c_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideC));
+  auto d_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideD));
+
+  auto* shapes = metadata_ptr<UnderlyingProblemShape>(problem_storage);
+  auto* a_ptrs = metadata_ptr<const Element*>(a_pointer_storage);
+  auto* b_ptrs = metadata_ptr<const Element*>(b_pointer_storage);
+  auto* c_ptrs = metadata_ptr<const ElementOutput*>(c_pointer_storage);
+  auto* d_ptrs = metadata_ptr<ElementOutput*>(d_pointer_storage);
+  auto* a_strides = metadata_ptr<StrideA>(a_stride_storage);
+  auto* b_strides = metadata_ptr<StrideB>(b_stride_storage);
+  auto* c_strides = metadata_ptr<StrideC>(c_stride_storage);
+  auto* d_strides = metadata_ptr<StrideD>(d_stride_storage);
+
+  const auto* offsets = group_offsets.data_ptr<int32_t>();
+  const auto* a = reinterpret_cast<const Element*>(activations.data_ptr());
+  const auto* b = reinterpret_cast<const Element*>(weights.data_ptr());
+  auto* d = output.data_ptr<float>();
+  auto& queue = current_queue(activations);
+  const int32_t groups_i32 = static_cast<int32_t>(groups);
+  const int32_t k_i32 = static_cast<int32_t>(k);
+  const int32_t n_i32 = static_cast<int32_t>(n);
+  const auto metadata_ready = queue.parallel_for<BuildGroupedMetadataF32Kernel>(
+      sycl::range<1>(static_cast<size_t>(groups)), [=](sycl::id<1> index) {
+        const int32_t group = static_cast<int32_t>(index[0]);
+        const int32_t begin = offsets[group];
+        const int32_t rows = offsets[group + 1] - begin;
+        shapes[group] = UnderlyingProblemShape{rows, n_i32, k_i32};
+        a_ptrs[group] = a + static_cast<int64_t>(begin) * k_i32;
+        b_ptrs[group] = b + static_cast<int64_t>(group) * k_i32 * n_i32;
+        c_ptrs[group] = d + static_cast<int64_t>(begin) * n_i32;
+        d_ptrs[group] = d + static_cast<int64_t>(begin) * n_i32;
+        a_strides[group] = cutlass::make_cute_packed_stride(
+            StrideA{}, cute::make_shape(rows, k_i32, 1));
+        b_strides[group] = cutlass::make_cute_packed_stride(
+            StrideB{}, cute::make_shape(n_i32, k_i32, 1));
+        c_strides[group] = cutlass::make_cute_packed_stride(
+            StrideC{}, cute::make_shape(rows, n_i32, 1));
+        d_strides[group] = cutlass::make_cute_packed_stride(
+            StrideD{}, cute::make_shape(rows, n_i32, 1));
+      });
+  queue.ext_oneapi_submit_barrier({metadata_ready});
+
+  auto fusion_args = decltype(Gemm::Arguments{}.epilogue.thread){};
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+  const int slices = stream_slice_count(queue);
+  TORCH_CHECK(slices > 0, "the current XPU stream reports no GPU slices");
+  cutlass::KernelHardwareInfo hardware{activations.get_device(), slices};
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {groups_i32, shapes, nullptr},
+      {a_ptrs, a_strides, b_ptrs, b_strides},
+      {fusion_args, c_ptrs, c_strides, d_ptrs, d_strides},
+      hardware,
+      {1, RasterOrderOptions::AlongN}};
+
+  Gemm gemm;
+  const auto initialize_status = gemm.initialize(args, nullptr, &queue);
+  TORCH_CHECK(initialize_status == cutlass::Status::kSuccess,
+              "SYCL*TLA FP32-output grouped GEMM initialization failed with status ",
+              static_cast<int>(initialize_status));
+  const auto run_status = gemm.run(&queue);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "SYCL*TLA FP32-output grouped GEMM launch failed with status ",
+              static_cast<int>(run_status));
+  record_current_stream(activations);
+  record_current_stream(weights);
+  record_current_stream(group_offsets);
+  record_current_stream(output);
+  record_current_stream(problem_storage);
+  record_current_stream(a_pointer_storage);
+  record_current_stream(b_pointer_storage);
+  record_current_stream(c_pointer_storage);
+  record_current_stream(d_pointer_storage);
+  record_current_stream(a_stride_storage);
+  record_current_stream(b_stride_storage);
+  record_current_stream(c_stride_storage);
+  record_current_stream(d_stride_storage);
+  return output;
+}
+
+// This deliberately synchronous control follows the only metadata flow used
+// by SYCL*TLA's shipped grouped-GEMM examples: host-build descriptor arrays,
+// upload them, and provide both device and host problem-shape arrays.  It is
+// not a production MoE path; it distinguishes that descriptor/scheduler
+// contract from the preceding device-only metadata path.
+at::Tensor grouped_gemm_bf16_to_f32_host_metadata(
+    const at::Tensor& activations, const at::Tensor& weights,
+    const at::Tensor& host_group_offsets) {
+  check_bf16_matrix(activations, "activations", 2);
+  check_bf16_matrix(weights, "weights", 3);
+  check_cpu_i32_vector(host_group_offsets, "host_group_offsets");
+  TORCH_CHECK(activations.device() == weights.device(),
+              "activation and weight tensors must share an XPU device");
+
+  const int64_t groups = weights.size(0);
+  const int64_t total_rows = activations.size(0);
+  const int64_t k = activations.size(1);
+  const int64_t n = weights.size(2);
+  TORCH_CHECK(groups > 0, "at least one expert group is required");
+  TORCH_CHECK(host_group_offsets.numel() == groups + 1,
+              "host_group_offsets must have one more element than weight groups");
+  TORCH_CHECK(weights.size(1) == k, "activation and weight K dimensions differ");
+  TORCH_CHECK(k > 0 && n > 0, "K and N must be positive");
+  TORCH_CHECK(n % 4 == 0,
+              "the SYCL*TLA FP32 epilogue requires N divisible by 4");
+  TORCH_CHECK(groups <= std::numeric_limits<int32_t>::max() &&
+                  total_rows <= std::numeric_limits<int32_t>::max() &&
+                  k <= std::numeric_limits<int32_t>::max() &&
+                  n <= std::numeric_limits<int32_t>::max(),
+              "grouped GEMM extents exceed SYCL*TLA int32 limits");
+
+  const auto* host_offsets = host_group_offsets.data_ptr<int32_t>();
+  TORCH_CHECK(host_offsets[0] == 0,
+              "host_group_offsets must start at zero");
+  TORCH_CHECK(host_offsets[groups] == total_rows,
+              "host_group_offsets must end at the activation row count");
+
+  auto output = at::empty(
+      {total_rows, n}, activations.options().dtype(at::kFloat).requires_grad(false));
+  if (total_rows == 0) {
+    return output;
+  }
+
+  auto problem_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(UnderlyingProblemShape));
+  auto a_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const Element*));
+  auto b_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const Element*));
+  auto c_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(const ElementOutput*));
+  auto d_pointer_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(ElementOutput*));
+  auto a_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideA));
+  auto b_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideB));
+  auto c_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideC));
+  auto d_stride_storage = metadata_storage(
+      activations, static_cast<size_t>(groups) * sizeof(StrideD));
+
+  auto* shapes = metadata_ptr<UnderlyingProblemShape>(problem_storage);
+  auto* a_ptrs = metadata_ptr<const Element*>(a_pointer_storage);
+  auto* b_ptrs = metadata_ptr<const Element*>(b_pointer_storage);
+  auto* c_ptrs = metadata_ptr<const ElementOutput*>(c_pointer_storage);
+  auto* d_ptrs = metadata_ptr<ElementOutput*>(d_pointer_storage);
+  auto* a_strides = metadata_ptr<StrideA>(a_stride_storage);
+  auto* b_strides = metadata_ptr<StrideB>(b_stride_storage);
+  auto* c_strides = metadata_ptr<StrideC>(c_stride_storage);
+  auto* d_strides = metadata_ptr<StrideD>(d_stride_storage);
+
+  const auto* a = reinterpret_cast<const Element*>(activations.data_ptr());
+  const auto* b = reinterpret_cast<const Element*>(weights.data_ptr());
+  auto* d = output.data_ptr<float>();
+  const int32_t groups_i32 = static_cast<int32_t>(groups);
+  const int32_t k_i32 = static_cast<int32_t>(k);
+  const int32_t n_i32 = static_cast<int32_t>(n);
+
+  std::vector<UnderlyingProblemShape> host_shapes(static_cast<size_t>(groups));
+  std::vector<const Element*> host_a_ptrs(static_cast<size_t>(groups));
+  std::vector<const Element*> host_b_ptrs(static_cast<size_t>(groups));
+  std::vector<const ElementOutput*> host_c_ptrs(static_cast<size_t>(groups));
+  std::vector<ElementOutput*> host_d_ptrs(static_cast<size_t>(groups));
+  std::vector<StrideA> host_a_strides(static_cast<size_t>(groups));
+  std::vector<StrideB> host_b_strides(static_cast<size_t>(groups));
+  std::vector<StrideC> host_c_strides(static_cast<size_t>(groups));
+  std::vector<StrideD> host_d_strides(static_cast<size_t>(groups));
+  for (int32_t group = 0; group < groups_i32; ++group) {
+    const int32_t begin = host_offsets[group];
+    const int32_t end = host_offsets[group + 1];
+    TORCH_CHECK(begin >= 0 && end >= begin && end <= total_rows,
+                "host_group_offsets must be monotonic and in bounds");
+    const int32_t rows = end - begin;
+    host_shapes[group] = UnderlyingProblemShape{rows, n_i32, k_i32};
+    host_a_ptrs[group] = a + static_cast<int64_t>(begin) * k_i32;
+    host_b_ptrs[group] = b + static_cast<int64_t>(group) * k_i32 * n_i32;
+    host_c_ptrs[group] = d + static_cast<int64_t>(begin) * n_i32;
+    host_d_ptrs[group] = d + static_cast<int64_t>(begin) * n_i32;
+    host_a_strides[group] = cutlass::make_cute_packed_stride(
+        StrideA{}, cute::make_shape(rows, k_i32, 1));
+    host_b_strides[group] = cutlass::make_cute_packed_stride(
+        StrideB{}, cute::make_shape(n_i32, k_i32, 1));
+    host_c_strides[group] = cutlass::make_cute_packed_stride(
+        StrideC{}, cute::make_shape(rows, n_i32, 1));
+    host_d_strides[group] = cutlass::make_cute_packed_stride(
+        StrideD{}, cute::make_shape(rows, n_i32, 1));
+  }
+
+  auto& queue = current_queue(activations);
+  std::vector<sycl::event> uploads;
+  uploads.reserve(9);
+  uploads.push_back(queue.memcpy(shapes, host_shapes.data(),
+                                 static_cast<size_t>(groups) * sizeof(UnderlyingProblemShape)));
+  uploads.push_back(queue.memcpy(a_ptrs, host_a_ptrs.data(),
+                                 static_cast<size_t>(groups) * sizeof(const Element*)));
+  uploads.push_back(queue.memcpy(b_ptrs, host_b_ptrs.data(),
+                                 static_cast<size_t>(groups) * sizeof(const Element*)));
+  uploads.push_back(queue.memcpy(c_ptrs, host_c_ptrs.data(),
+                                 static_cast<size_t>(groups) * sizeof(const ElementOutput*)));
+  uploads.push_back(queue.memcpy(d_ptrs, host_d_ptrs.data(),
+                                 static_cast<size_t>(groups) * sizeof(ElementOutput*)));
+  uploads.push_back(queue.memcpy(a_strides, host_a_strides.data(),
+                                 static_cast<size_t>(groups) * sizeof(StrideA)));
+  uploads.push_back(queue.memcpy(b_strides, host_b_strides.data(),
+                                 static_cast<size_t>(groups) * sizeof(StrideB)));
+  uploads.push_back(queue.memcpy(c_strides, host_c_strides.data(),
+                                 static_cast<size_t>(groups) * sizeof(StrideC)));
+  uploads.push_back(queue.memcpy(d_strides, host_d_strides.data(),
+                                 static_cast<size_t>(groups) * sizeof(StrideD)));
+  for (auto& upload : uploads) {
+    upload.wait_and_throw();
+  }
+
+  auto fusion_args = decltype(Gemm::Arguments{}.epilogue.thread){};
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+  const int slices = stream_slice_count(queue);
+  TORCH_CHECK(slices > 0, "the current XPU stream reports no GPU slices");
+  cutlass::KernelHardwareInfo hardware{activations.get_device(), slices};
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {groups_i32, shapes, host_shapes.data()},
+      {a_ptrs, a_strides, b_ptrs, b_strides},
+      {fusion_args, c_ptrs, c_strides, d_ptrs, d_strides},
+      hardware,
+      {1, RasterOrderOptions::AlongN}};
+
+  Gemm gemm;
+  const auto can_implement_status = gemm.can_implement(args);
+  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess,
+              "SYCL*TLA host-metadata grouped GEMM cannot implement this shape, status ",
+              static_cast<int>(can_implement_status));
+  const auto initialize_status = gemm.initialize(args, nullptr, &queue);
+  TORCH_CHECK(initialize_status == cutlass::Status::kSuccess,
+              "SYCL*TLA host-metadata grouped GEMM initialization failed with status ",
+              static_cast<int>(initialize_status));
+  const auto run_status = gemm.run(&queue);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "SYCL*TLA host-metadata grouped GEMM launch failed with status ",
+              static_cast<int>(run_status));
+  // Keep the stack-backed host table alive through the launch.  This is an
+  // intentionally synchronous correctness control, never a timed path.
+  queue.wait_and_throw();
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("grouped_gemm_bf16_to_f32", &aurora_moe::grouped_gemm_bf16_to_f32,
+             "Generic SYCL*TLA BF16 grouped GEMM with FP32 output on XPU");
+  module.def("grouped_gemm_bf16_to_f32_host_metadata",
+             &aurora_moe::grouped_gemm_bf16_to_f32_host_metadata,
+             "Synchronous host-metadata control for generic SYCL*TLA grouped GEMM");
+}

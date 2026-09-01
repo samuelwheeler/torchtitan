@@ -1,0 +1,98 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Device-side exact expert row metadata.  The first kernel counts arbitrary
+// local expert IDs; after the observed maximum is known, the second assigns a
+// unique padded BMM row to every route.  No route is clipped or discarded.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+namespace aurora_moe {
+
+namespace {
+
+class ExpertCountsKernel;
+class ExpertSlotsKernel;
+
+void check_ids(const at::Tensor& expert_ids) {
+  TORCH_CHECK(expert_ids.device().type() == c10::DeviceType::XPU,
+              "expert_ids must be an XPU tensor");
+  TORCH_CHECK(expert_ids.scalar_type() == at::kLong,
+              "expert_ids must have dtype torch.int64");
+  TORCH_CHECK(expert_ids.dim() == 1, "expert_ids must be rank 1");
+  TORCH_CHECK(expert_ids.is_contiguous(), "expert_ids must be contiguous");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+using AtomicCounter = sycl::atomic_ref<
+    int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+    sycl::access::address_space::global_space>;
+
+}  // namespace
+
+at::Tensor expert_counts_i32(const at::Tensor& expert_ids, int64_t num_experts) {
+  check_ids(expert_ids);
+  TORCH_CHECK(num_experts > 0, "num_experts must be positive");
+  auto counts = at::zeros({num_experts}, expert_ids.options().dtype(at::kInt));
+  const int64_t routes = expert_ids.numel();
+  if (routes == 0) {
+    return counts;
+  }
+  const auto* ids = expert_ids.data_ptr<int64_t>();
+  auto* output = counts.data_ptr<int32_t>();
+  auto& queue = current_queue(expert_ids);
+  queue.parallel_for<ExpertCountsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        const int64_t expert = ids[route];
+        AtomicCounter counter(output[expert]);
+        counter.fetch_add(1);
+      });
+  return counts;
+}
+
+at::Tensor expert_route_slots_i64(const at::Tensor& expert_ids,
+                                  int64_t num_experts,
+                                  int64_t max_rows) {
+  check_ids(expert_ids);
+  TORCH_CHECK(num_experts > 0, "num_experts must be positive");
+  TORCH_CHECK(max_rows >= 0, "max_rows must be nonnegative");
+  const int64_t routes = expert_ids.numel();
+  TORCH_CHECK(routes == 0 || max_rows > 0,
+              "nonempty routes require positive observed max_rows");
+  auto slots = at::empty_like(expert_ids);
+  if (routes == 0) {
+    return slots;
+  }
+  auto counters = at::zeros({num_experts}, expert_ids.options().dtype(at::kInt));
+  const auto* ids = expert_ids.data_ptr<int64_t>();
+  auto* counter_data = counters.data_ptr<int32_t>();
+  auto* output = slots.data_ptr<int64_t>();
+  auto& queue = current_queue(expert_ids);
+  queue.parallel_for<ExpertSlotsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        const int64_t expert = ids[route];
+        AtomicCounter counter(counter_data[expert]);
+        const int32_t row = counter.fetch_add(1);
+        output[route] = expert * max_rows + static_cast<int64_t>(row);
+      });
+  return slots;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("expert_counts_i32", &aurora_moe::expert_counts_i32,
+             "Count exact local expert routes on XPU");
+  module.def("expert_route_slots_i64", &aurora_moe::expert_route_slots_i64,
+             "Assign exact padded local-expert rows on XPU");
+}

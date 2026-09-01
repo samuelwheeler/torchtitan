@@ -33,6 +33,27 @@ def agpt_2b() -> FaultTolerantTrainer.Config:
     return ezpz_agpt_2b()
 
 
+def agpt_2b_50k() -> FaultTolerantTrainer.Config:
+    return ezpz_agpt_2b_50k()
+
+
+def agpt_2b_50k_tp2_pp6() -> FaultTolerantTrainer.Config:
+    """2B/50K with one Aurora node's TP2 x PP6 model-parallel layout.
+
+    DP-major mesh ordering keeps both TP and PP within each 12-tile node when
+    data-parallel replicas are added. Data-parallel degrees and batch sizes are
+    intentionally left to the launch configuration because they depend on node
+    count. Automatic pipeline partitioning was slightly faster than the tested
+    hand-balanced partition for this model.
+    """
+    cfg = ezpz_agpt_2b_50k()
+    cfg.parallelism.tensor_parallel_degree = 2
+    cfg.parallelism.pipeline_parallel_degree = 6
+    cfg.parallelism.pipeline_parallel_mesh_order = "dp_first"
+    cfg.parallelism.pipeline_parallel_schedule = "1F1B"
+    return cfg
+
+
 def agpt_2b_hf() -> FaultTolerantTrainer.Config:
     cfg = ezpz_agpt_2b()
     cfg.dataloader.dataset_path = None
@@ -144,6 +165,14 @@ def ezpz_agpt_2b() -> FaultTolerantTrainer.Config:
     return agpt("2b", activation_checkpoint_mode="none")
 
 
+def ezpz_agpt_2b_50k() -> FaultTolerantTrainer.Config:
+    return agpt(
+        "2b_50k",
+        activation_checkpoint_mode="none",
+        hf_assets_path="./assets/hf/olmo-7b-0724-hf",
+    )
+
+
 def agpt_2b_chunkedce() -> FaultTolerantTrainer.Config:
     """agpt_2b with ChunkedCELoss to keep peak memory low.
 
@@ -227,6 +256,10 @@ def ezpz_agpt_debugmodel_from_json() -> FaultTolerantTrainer.Config:
 
 def ezpz_agpt_2b_from_json() -> FaultTolerantTrainer.Config:
     return _config_from_json("2b")
+
+
+def agpt_2b_50k_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json("2b_50k")
 
 
 def ezpz_agpt_7b_from_json() -> FaultTolerantTrainer.Config:

@@ -1,0 +1,450 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Direct oneCCL collective prototype.  This is intentionally separate from
+// ProcessGroupXCCL: that backend does not expose its oneCCL communicator.  A
+// Python wrapper bootstraps this communicator with a one-time KVS-address
+// broadcast, then this source submits all collectives to PyTorch's current
+// SYCL queue by default and retains the returned ccl::event.  An opt-in,
+// same-context private queue records explicit producer dependencies instead.
+
+// Torch's extension JIT can invoke a separate SYCL host compiler phase that
+// does not expose SYCL_LANGUAGE_VERSION to the oneCCL headers.  Without this
+// explicit adapter selection, oneCCL falls back to its empty native-device
+// API: create_device(sycl::device), create_stream(sycl::queue), and the
+// native SYCL event bridge are then unavailable.  Aurora's installed oneCCL
+// library is the DPC++/Level Zero build, so selecting its SYCL adapter is the
+// intended ABI in both direct and JIT builds.
+#ifndef CCL_ENABLE_SYCL
+#define CCL_ENABLE_SYCL 1
+#endif
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <oneapi/ccl.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <pybind11/gil.h>
+#include <pybind11/stl.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace py = pybind11;
+
+namespace aurora_moe {
+namespace {
+
+sycl::queue& current_queue(int device_index) {
+  return c10::xpu::getCurrentXPUStream(device_index).queue();
+}
+
+bool private_stream_requested() {
+  const char* value = std::getenv("AURORA_MOE_NATIVE_CCL_PRIVATE_STREAM");
+  return value != nullptr && std::string(value) == "1";
+}
+
+enum class PrivateQueuePriority { Normal, Low, High };
+
+PrivateQueuePriority private_queue_priority() {
+  const char* value =
+      std::getenv("AURORA_MOE_NATIVE_CCL_PRIVATE_STREAM_PRIORITY");
+  if (value == nullptr || std::string(value) == "normal") {
+    return PrivateQueuePriority::Normal;
+  }
+  if (std::string(value) == "low") {
+    return PrivateQueuePriority::Low;
+  }
+  if (std::string(value) == "high") {
+    return PrivateQueuePriority::High;
+  }
+  TORCH_CHECK(false,
+              "AURORA_MOE_NATIVE_CCL_PRIVATE_STREAM_PRIORITY must be one of "
+              "normal, low, or high");
+  return PrivateQueuePriority::Normal;
+}
+
+bool explicit_async_attr_requested() {
+  const char* value = std::getenv("AURORA_MOE_NATIVE_CCL_EXPLICIT_ASYNC_ATTR");
+  return value != nullptr && std::string(value) == "1";
+}
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_contiguous(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+}
+
+ccl::datatype equal_alltoall_datatype(const at::Tensor& tensor) {
+  switch (tensor.scalar_type()) {
+    case at::kBFloat16:
+      return ccl::datatype::bfloat16;
+    case at::kLong:
+      return ccl::datatype::int64;
+    default:
+      TORCH_CHECK(false, "equal all-to-all supports only torch.bfloat16 and torch.int64");
+      return ccl::datatype::bfloat16;
+  }
+}
+
+size_t checked_count(int64_t count, const char* name) {
+  TORCH_CHECK(count >= 0, name, " must be nonnegative");
+  TORCH_CHECK(static_cast<uint64_t>(count) <=
+                  static_cast<uint64_t>(std::numeric_limits<size_t>::max()),
+              name, " exceeds oneCCL size_t range");
+  return static_cast<size_t>(count);
+}
+
+void check_counts(const std::vector<int64_t>& counts, int world_size,
+                  int64_t expected, const char* name) {
+  TORCH_CHECK(static_cast<int>(counts.size()) == world_size, name,
+              " must have one value per communicator rank");
+  int64_t total = 0;
+  for (const int64_t count : counts) {
+    TORCH_CHECK(count >= 0, name, " cannot contain negative values");
+    TORCH_CHECK(total <= INT64_MAX - count, name, " total overflows int64");
+    total += count;
+  }
+  TORCH_CHECK(total == expected, name,
+              " must sum to the corresponding BF16 tensor element count");
+}
+
+class NativeCclWork {
+ public:
+  NativeCclWork(ccl::event event, ccl::stream stream, at::Tensor input,
+                at::Tensor output, int device_index,
+                std::optional<sycl::event> producer_fence = std::nullopt,
+                std::optional<sycl::queue> launch_queue = std::nullopt)
+      : event_(std::move(event)),
+        stream_(std::move(stream)),
+        input_(std::move(input)),
+        output_(std::move(output)),
+        device_index_(device_index),
+        producer_fence_(std::move(producer_fence)),
+        launch_queue_(std::move(launch_queue)) {
+    // Python establishes the mandatory current-stream completion bridge
+    // immediately after this constructor returns.  Keeping it outside the
+    // native collective call makes the two host costs independently visible
+    // in a PyTorch profiler trace; it does not alter ordering or lifetime.
+  }
+
+  void wait() {
+    if (event_.has_value()) {
+      event_->wait();
+    }
+  }
+
+  void wait_stream() {
+    if (!event_.has_value()) {
+      return;
+    }
+    auto native_event = event_->get_native();
+    auto& queue = current_queue(device_index_);
+    stream_fences_.emplace_back(queue.submit([native_event](sycl::handler& handler) {
+      handler.depends_on(native_event);
+    }));
+  }
+
+  bool is_completed() {
+    return !event_.has_value() || event_->test();
+  }
+
+  bool is_stream_fence_completed() const {
+    TORCH_CHECK(!stream_fences_.empty(),
+                "NativeCclWork is missing its stream completion fence");
+    return std::all_of(
+        stream_fences_.cbegin(), stream_fences_.cend(),
+        [](const sycl::event& fence) {
+          return fence.get_info<sycl::info::event::command_execution_status>() ==
+                 sycl::info::event_command_status::complete;
+        });
+  }
+
+ private:
+  std::optional<ccl::event> event_;
+  // Retain the oneCCL stream while the event is in flight.
+  std::optional<ccl::stream> stream_;
+  // Retain tensor storage so the PyTorch caching allocator cannot reuse it
+  // before this direct-oneCCL operation has completed.
+  at::Tensor input_;
+  at::Tensor output_;
+  int device_index_;
+  // In private-stream mode this records all producer-queue work preceding
+  // the collective and is passed to oneCCL as a device-side dependency.
+  // Retain it even after oneCCL wraps it so no native event handle expires
+  // while the collective still references it.
+  std::optional<sycl::event> producer_fence_;
+  // The communicator retains the persistent private queue; an in-flight work
+  // holds another queue reference in case its Python communicator is dropped
+  // before the current-stream consumer fence completes.
+  std::optional<sycl::queue> launch_queue_;
+  // Retain every PyTorch consumer fence.  A later bridge onto a final
+  // producer stream must not discard an earlier launch-stream fence before
+  // consumer-fence reaping has observed both streams complete.
+  std::vector<sycl::event> stream_fences_;
+};
+
+class NativeCclCommunicator {
+ private:
+  struct LaunchState {
+    ccl::stream stream;
+    ccl::vector_class<ccl::event> dependencies;
+    std::optional<sycl::event> producer_fence;
+    std::optional<sycl::queue> private_queue;
+  };
+
+  LaunchState prepare_launch() {
+    auto& producer_queue = current_queue(device_index_);
+    if (!private_stream_enabled_) {
+      return LaunchState{
+          ccl::create_stream(producer_queue), {}, std::nullopt, std::nullopt};
+    }
+    TORCH_CHECK(private_queue_.has_value() && private_stream_.has_value(),
+                "native oneCCL private stream was not initialized");
+    // This nonblocking barrier records every operation already enqueued on
+    // PyTorch's current producer stream.  Pass it through oneCCL's documented
+    // deps vector so the separate communication queue cannot read the input
+    // early, while the host remains free to submit independent work.
+    std::optional<sycl::event> producer_fence(
+        producer_queue.ext_oneapi_submit_barrier());
+    ccl::vector_class<ccl::event> dependencies;
+    dependencies.emplace_back(ccl::create_event(*producer_fence));
+    return LaunchState{*private_stream_, std::move(dependencies),
+                       std::move(producer_fence), *private_queue_};
+  }
+
+  template <class Attribute>
+  Attribute collective_attr(Attribute default_attr) const {
+    // CCL_OP_SYNC=0 is the documented process-wide control, but expose an
+    // opt-in per-operation setting for diagnosis: some oneCCL paths inherit a
+    // synchronous default attribute despite the environment being async.
+    if (explicit_async_attr_requested()) {
+      default_attr.template set<ccl::operation_attr_id::synchronous>(false);
+    }
+    return default_attr;
+  }
+
+ public:
+  py::bytes create_root_kvs_address() {
+    TORCH_CHECK(!initialized_, "cannot create a KVS address after initialization");
+    ccl::init();
+    main_kvs_ = ccl::create_main_kvs();
+    kvs_ = main_kvs_;
+    const auto address = main_kvs_->get_address();
+    return py::bytes(address.data(), address.size());
+  }
+
+  void initialize(const py::bytes& address_bytes, int world_size, int rank,
+                  int device_index) {
+    TORCH_CHECK(!initialized_, "NativeCclCommunicator is already initialized");
+    TORCH_CHECK(world_size > 0 && rank >= 0 && rank < world_size,
+                "invalid oneCCL communicator size or rank");
+    std::string raw_address = address_bytes;
+    TORCH_CHECK(raw_address.size() == ccl::kvs::address_max_size,
+                "unexpected oneCCL KVS address length");
+    ccl::init();
+    if (!kvs_) {
+      ccl::kvs::address_type address{};
+      std::memcpy(address.data(), raw_address.data(), address.size());
+      kvs_ = ccl::create_kvs(address);
+    }
+
+    auto& queue = current_queue(device_index);
+    auto device = ccl::create_device(queue.get_device());
+    auto context = ccl::create_context(queue.get_context());
+    comm_ = std::make_unique<ccl::communicator>(ccl::create_communicator(
+        world_size, rank, device, context, kvs_));
+    world_size_ = world_size;
+    rank_ = rank;
+    device_index_ = device_index;
+    private_stream_enabled_ = private_stream_requested();
+    if (private_stream_enabled_) {
+      // Keep this same-context, same-device queue for the communicator's
+      // lifetime.  In-order submission preserves collective ordering on this
+      // queue; the explicit producer dependency above preserves data ordering.
+      const auto priority = private_queue_priority();
+      if (priority == PrivateQueuePriority::High) {
+        private_queue_.emplace(
+            queue.get_context(), queue.get_device(),
+            sycl::property_list{
+                sycl::property::queue::in_order{},
+                sycl::ext::oneapi::property::queue::priority_high{}});
+      } else if (priority == PrivateQueuePriority::Low) {
+        private_queue_.emplace(
+            queue.get_context(), queue.get_device(),
+            sycl::property_list{
+                sycl::property::queue::in_order{},
+                sycl::ext::oneapi::property::queue::priority_low{}});
+      } else {
+        private_queue_.emplace(
+            queue.get_context(), queue.get_device(),
+            sycl::property_list{sycl::property::queue::in_order{}});
+      }
+      private_stream_.emplace(ccl::create_stream(*private_queue_));
+    }
+    initialized_ = true;
+  }
+
+  std::shared_ptr<NativeCclWork> alltoall_equal(
+      const at::Tensor& input, const at::Tensor& output) {
+    check_equal_alltoall_tensors(input, output);
+    TORCH_CHECK(input.numel() == output.numel(),
+                "equal all-to-all input/output element counts must match");
+    TORCH_CHECK(input.numel() % world_size_ == 0,
+                "equal all-to-all element count must divide communicator size");
+    auto launch = prepare_launch();
+    const size_t count = checked_count(input.numel() / world_size_, "all-to-all count");
+    auto attr = collective_attr(ccl::default_alltoall_attr);
+    auto event = ccl::alltoall(input.data_ptr(), output.data_ptr(), count,
+                               equal_alltoall_datatype(input), *comm_, launch.stream,
+                               attr, launch.dependencies);
+    return std::make_shared<NativeCclWork>(
+        std::move(event), std::move(launch.stream), input, output, device_index_,
+        std::move(launch.producer_fence), std::move(launch.private_queue));
+  }
+
+  std::shared_ptr<NativeCclWork> alltoall_equal_bf16(
+      const at::Tensor& input, const at::Tensor& output) {
+    check_bf16_contiguous(input, "input");
+    check_bf16_contiguous(output, "output");
+    return alltoall_equal(input, output);
+  }
+
+  std::shared_ptr<NativeCclWork> alltoall_equal_int64(
+      const at::Tensor& input, const at::Tensor& output) {
+    check_xpu_contiguous(input, "input");
+    check_xpu_contiguous(output, "output");
+    TORCH_CHECK(input.scalar_type() == at::kLong && output.scalar_type() == at::kLong,
+                "int64 all-to-all requires torch.int64 input/output");
+    return alltoall_equal(input, output);
+  }
+
+  std::shared_ptr<NativeCclWork> alltoallv_bf16(
+      const at::Tensor& input, const at::Tensor& output,
+      const std::vector<int64_t>& send_counts,
+      const std::vector<int64_t>& recv_counts) {
+    check_bf16_tensors(input, output);
+    check_counts(send_counts, world_size_, input.numel(), "send_counts");
+    check_counts(recv_counts, world_size_, output.numel(), "recv_counts");
+    ccl::vector_class<size_t> sends;
+    ccl::vector_class<size_t> recvs;
+    sends.reserve(send_counts.size());
+    recvs.reserve(recv_counts.size());
+    for (const int64_t count : send_counts) {
+      sends.push_back(static_cast<size_t>(count));
+    }
+    for (const int64_t count : recv_counts) {
+      recvs.push_back(static_cast<size_t>(count));
+    }
+    auto launch = prepare_launch();
+    auto attr = collective_attr(ccl::default_alltoallv_attr);
+    auto event = ccl::alltoallv(input.data_ptr(), sends, output.data_ptr(), recvs,
+                                ccl::datatype::bfloat16, *comm_, launch.stream,
+                                attr, launch.dependencies);
+    return std::make_shared<NativeCclWork>(
+        std::move(event), std::move(launch.stream), input, output, device_index_,
+        std::move(launch.producer_fence), std::move(launch.private_queue));
+  }
+
+  std::shared_ptr<NativeCclWork> allreduce_sum_bf16(
+      const at::Tensor& input, const at::Tensor& output) {
+    check_bf16_tensors(input, output);
+    TORCH_CHECK(input.numel() == output.numel(),
+                "all-reduce input/output element counts must match");
+    auto launch = prepare_launch();
+    auto attr = collective_attr(ccl::default_allreduce_attr);
+    auto event = ccl::allreduce(
+        input.data_ptr(), output.data_ptr(), checked_count(input.numel(), "all-reduce count"),
+        ccl::datatype::bfloat16, ccl::reduction::sum, *comm_, launch.stream,
+        attr, launch.dependencies);
+    return std::make_shared<NativeCclWork>(
+        std::move(event), std::move(launch.stream), input, output, device_index_,
+        std::move(launch.producer_fence), std::move(launch.private_queue));
+  }
+
+ private:
+  void check_common_tensors(const at::Tensor& input, const at::Tensor& output) const {
+    TORCH_CHECK(initialized_ && comm_, "initialize NativeCclCommunicator first");
+    check_xpu_contiguous(input, "input");
+    check_xpu_contiguous(output, "output");
+    TORCH_CHECK(input.device() == output.device(),
+                "input and output must share an XPU device");
+    TORCH_CHECK(input.get_device() == device_index_,
+                "input device does not match this communicator");
+  }
+
+  void check_equal_alltoall_tensors(const at::Tensor& input,
+                                    const at::Tensor& output) const {
+    check_common_tensors(input, output);
+    TORCH_CHECK(input.scalar_type() == output.scalar_type(),
+                "equal all-to-all input/output dtypes must match");
+    static_cast<void>(equal_alltoall_datatype(input));
+  }
+
+  void check_bf16_tensors(const at::Tensor& input, const at::Tensor& output) const {
+    check_common_tensors(input, output);
+    check_bf16_contiguous(input, "input");
+    check_bf16_contiguous(output, "output");
+  }
+
+  bool initialized_{false};
+  int world_size_{0};
+  int rank_{-1};
+  int device_index_{-1};
+  ccl::shared_ptr_class<ccl::kvs> main_kvs_;
+  ccl::shared_ptr_class<ccl::kvs_interface> kvs_;
+  std::unique_ptr<ccl::communicator> comm_;
+  bool private_stream_enabled_{false};
+  std::optional<sycl::queue> private_queue_;
+  std::optional<ccl::stream> private_stream_;
+};
+
+}  // namespace
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  using aurora_moe::NativeCclCommunicator;
+  using aurora_moe::NativeCclWork;
+  py::class_<NativeCclWork, std::shared_ptr<NativeCclWork>>(module,
+                                                              "NativeCclWork")
+      .def("wait", &NativeCclWork::wait,
+           py::call_guard<py::gil_scoped_release>(),
+           "Host-blocking oneCCL event wait")
+      .def("wait_stream", &NativeCclWork::wait_stream,
+           "Insert a oneCCL event dependency on the current XPU stream")
+      .def("is_completed", &NativeCclWork::is_completed,
+           "oneCCL event completion query")
+      .def("is_stream_fence_completed", &NativeCclWork::is_stream_fence_completed,
+           "Non-blocking completion query for the dependent SYCL stream fence");
+  py::class_<NativeCclCommunicator>(module, "NativeCclCommunicator")
+      .def(py::init<>())
+      .def("create_root_kvs_address", &NativeCclCommunicator::create_root_kvs_address)
+      .def("initialize", &NativeCclCommunicator::initialize)
+      // oneCCL submission may block in host progress.  Releasing the GIL here
+      // lets a Python host thread submit it while another queues XPU work.
+      .def("alltoall_equal", &NativeCclCommunicator::alltoall_equal,
+           py::call_guard<py::gil_scoped_release>())
+      .def("alltoall_equal_bf16", &NativeCclCommunicator::alltoall_equal_bf16,
+           py::call_guard<py::gil_scoped_release>())
+      .def("alltoall_equal_int64", &NativeCclCommunicator::alltoall_equal_int64,
+           py::call_guard<py::gil_scoped_release>())
+      .def("alltoallv_bf16", &NativeCclCommunicator::alltoallv_bf16,
+           py::call_guard<py::gil_scoped_release>())
+      .def("allreduce_sum_bf16", &NativeCclCommunicator::allreduce_sum_bf16,
+           py::call_guard<py::gil_scoped_release>());
+}

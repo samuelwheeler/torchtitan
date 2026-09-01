@@ -39,15 +39,16 @@
     "last_save_model_only": false,
     "load_step": -1
   },
-  "dataloader": {
+    "dataloader": {
     "dataset": "blendcorpus",
-    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/books.txt",
-    "train_iters": 1000
+    "dataset_path": "torchtitan/experiments/ezpz/data-lists/aurora/olmo-mix-1124.txt",
+    "data_cache_path": "checkpoints/moe-debug-olmo/.cache/olmo-mix-1124/index-cache"
   },
   "compile": {
     "enable": false
   },
   "debug": {
     "print_config": true
-  }
+  },
+  "hf_assets_path": "./assets/hf/gemma-7b"
 }

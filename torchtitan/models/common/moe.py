@@ -19,6 +19,22 @@ from torchtitan.protocols.module import Module
 
 from .token_dispatcher import LocalTokenDispatcher
 
+try:
+    from scattermoe.parallel_experts import flatten_sort_count, parallel_linear
+except ImportError:
+    flatten_sort_count = None
+    parallel_linear = None
+
+ExpertComputeBackend = Literal[
+    "for_loop",
+    "grouped_mm",
+    "batched_mm_padded",
+    "scattermoe",
+    "aurora_sycl",
+    "aurora_full_loop",
+    "aurora_full_sonic",
+]
+
 
 # NOTE: keeping this for-loop implementation for comparison
 #       and readability, may remove later
@@ -53,6 +69,44 @@ def _run_experts_for_loop(
     return out
 
 
+def _run_experts_batched_mm_padded(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    counts = num_tokens_per_expert.to(device=x.device, dtype=torch.int64)
+    if counts.numel() == 0:
+        return x.new_empty((0, w2.shape[1]))
+
+    max_tokens = int(counts.max().item())
+    if max_tokens == 0:
+        return x.new_empty((0, w2.shape[1]))
+
+    num_experts = counts.numel()
+    total_tokens = x.shape[0]
+    device = x.device
+
+    offsets = counts.cumsum(0) - counts
+    expert_indices = torch.repeat_interleave(
+        torch.arange(num_experts, device=device, dtype=torch.int64),
+        counts,
+    )
+    token_indices_within_expert = torch.arange(
+        total_tokens, device=device, dtype=torch.int64
+    ) - torch.repeat_interleave(offsets, counts)
+
+    padded_x = x.new_zeros((num_experts, max_tokens, x.shape[-1]))
+    padded_x[expert_indices, token_indices_within_expert] = x
+
+    h = F.silu(torch.bmm(padded_x, w1.transpose(-2, -1)))
+    h = h * torch.bmm(padded_x, w3.transpose(-2, -1))
+    out_padded = torch.bmm(h, w2.transpose(-2, -1))
+
+    return out_padded[expert_indices, token_indices_within_expert]
+
+
 def _run_experts_grouped_mm(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -73,6 +127,68 @@ def _run_experts_grouped_mm(
     return out
 
 
+def _run_experts_aurora_sycl(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Run exact compact expert GEMMs through the optional Aurora package.
+
+    Routing and score application remain in TorchTitan's token dispatcher.
+    Import lazily so every other backend remains usable without aurora-moe.
+    """
+
+    try:
+        from aurora_moe.torchtitan_experts import torchtitan_exact_experts
+    except ImportError as error:
+        raise ImportError(
+            "aurora_sycl expert backend requires aurora_moe_dropin on PYTHONPATH"
+        ) from error
+    return torchtitan_exact_experts(w1, w2, w3, x, num_tokens_per_expert)
+
+
+def _run_experts_scattermoe(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    x: torch.Tensor,
+    top_scores: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+) -> torch.Tensor:
+    if flatten_sort_count is None or parallel_linear is None:
+        raise ImportError(
+            "scattermoe backend requested, but the scattermoe package is not installed."
+        )
+
+    sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = flatten_sort_count(
+        selected_experts_indices, num_experts=w13.shape[0]
+    )
+
+    h_and_gates = parallel_linear(
+        x,
+        w13,
+        top_scores.shape[1],
+        sorted_expert_idxs,
+        sorted_scattered_idxs,
+        expert_offsets,
+        grouped_out=True,
+    )
+    h, gates = h_and_gates.chunk(2, dim=-1)
+    h = F.silu(gates) * h
+
+    return parallel_linear(
+        h,
+        w2,
+        1,
+        sorted_expert_idxs,
+        sorted_scattered_idxs,
+        expert_offsets,
+        gates=top_scores,
+        grouped_in=True,
+    )
+
+
 class GroupedExperts(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -80,22 +196,135 @@ class GroupedExperts(Module):
         hidden_dim: int
         num_experts: int
         use_grouped_mm: bool = True
+        compute_backend: ExpertComputeBackend | None = None
         token_dispatcher: LocalTokenDispatcher.Config
 
     def __init__(self, config: Config):
         super().__init__()
         self.num_experts = config.num_experts
-        self.w1 = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
+        self.dim = config.dim
+        self.hidden_dim = config.hidden_dim
+        self.compute_backend: ExpertComputeBackend = (
+            config.compute_backend
+            if config.compute_backend is not None
+            else ("grouped_mm" if config.use_grouped_mm else "for_loop")
         )
-        self.w2 = nn.Parameter(
-            torch.empty(config.num_experts, config.dim, config.hidden_dim)
-        )
-        self.w3 = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
-        self.use_grouped_mm = config.use_grouped_mm
+        if self.compute_backend == "scattermoe":
+            # Store weights directly in scattermoe's kernel layout:
+            #   w13: [num_experts, dim, 2 * hidden_dim]
+            #       first half = logical w3^T, second half = logical w1^T
+            #   w2:  [num_experts, hidden_dim, dim]
+            #       equals logical w2^T
+            self.scattermoe_w13 = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, 2 * config.hidden_dim)
+            )
+            self.scattermoe_w2 = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+        elif self.compute_backend in {"aurora_full_loop", "aurora_full_sonic"}:
+            # Aurora's routed runtime consumes GEMM-ready [expert, in, out]
+            # matrices, avoiding per-step transposes or parameter copies.
+            self.aurora_up = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, config.hidden_dim)
+            )
+            self.aurora_gate = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, config.hidden_dim)
+            )
+            self.aurora_down = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+        else:
+            self.w1 = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+            self.w2 = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, config.hidden_dim)
+            )
+            self.w3 = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+        self.use_grouped_mm = self.compute_backend == "grouped_mm"
         self.token_dispatcher = config.token_dispatcher.build()
+
+    def _init_self_parameters(self) -> None:
+        if self.compute_backend not in {
+            "scattermoe",
+            "aurora_full_loop",
+            "aurora_full_sonic",
+        }:
+            super()._init_self_parameters()
+            return
+
+        if self._param_init is None:
+            raise ValueError(
+                f"No param_init found for {self.compute_backend} GroupedExperts. "
+                "Set param_init on this module's Config or use skip_param_init."
+            )
+        missing = [name for name in ("w1", "w2", "w3") if name not in self._param_init]
+        if missing:
+            raise ValueError(
+                f"Missing {self.compute_backend} initializers for {missing} "
+                f"in {type(self).__name__}. "
+                f"Available: {list(self._param_init.keys())}"
+            )
+
+        # Initialize in the logical TorchTitan layout via transposed views so
+        # we preserve the existing w1/w2/w3 initialization rules without
+        # repacking at every forward.
+        if self.compute_backend == "scattermoe":
+            self._param_init["w3"](
+                self.scattermoe_w13[:, :, : self.hidden_dim].transpose(-2, -1)
+            )
+            self._param_init["w1"](
+                self.scattermoe_w13[:, :, self.hidden_dim :].transpose(-2, -1)
+            )
+            self._param_init["w2"](self.scattermoe_w2.transpose(-2, -1))
+            return
+
+        self._param_init["w3"](self.aurora_up.transpose(-2, -1))
+        self._param_init["w1"](self.aurora_gate.transpose(-2, -1))
+        self._param_init["w2"](self.aurora_down.transpose(-2, -1))
+
+    def _scattermoe_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        w13_param = self.scattermoe_w13
+        w2_param = self.scattermoe_w2
+        if isinstance(w13_param, DTensor):
+            w13 = w13_param.to_local()
+            # pyrefly: ignore [missing-attribute]
+            w2 = w2_param.to_local()
+        else:
+            w13 = w13_param
+            w2 = w2_param
+        return w13, w2
+
+    def _aurora_weights(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(self.aurora_up, DTensor):
+            return (
+                self.aurora_up.to_local(),
+                self.aurora_gate.to_local(),
+                self.aurora_down.to_local(),
+            )
+        return self.aurora_up, self.aurora_gate, self.aurora_down
+
+    def _aurora_shared_weights(
+        self, shared: FeedForward
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        weights = (shared.w3.weight, shared.w1.weight, shared.w2.weight)
+        if isinstance(weights[0], DTensor):
+            weights = tuple(weight.to_local() for weight in weights)
+        up_weight, gate_weight, down_weight = weights
+        shared_hidden = up_weight.shape[0]
+        if shared_hidden % self.hidden_dim:
+            raise ValueError(
+                "Aurora shared hidden dimension must be divisible by expert hidden dimension"
+            )
+        count = shared_hidden // self.hidden_dim
+        up = up_weight.view(count, self.hidden_dim, self.dim).transpose(-2, -1)
+        gate = gate_weight.view(count, self.hidden_dim, self.dim).transpose(-2, -1)
+        down = down_weight.view(self.dim, count, self.hidden_dim).permute(1, 2, 0)
+        return up, gate, down
 
     def _experts_forward(
         self,
@@ -116,10 +345,19 @@ class GroupedExperts(Module):
             w2 = self.w2
             w3 = self.w3
 
-        if self.use_grouped_mm:
+        if self.compute_backend == "grouped_mm":
             return _run_experts_grouped_mm(w1, w2, w3, x, num_tokens_per_expert)
-        else:
+        if self.compute_backend == "batched_mm_padded":
+            return _run_experts_batched_mm_padded(
+                w1, w2, w3, x, num_tokens_per_expert
+            )
+        if self.compute_backend == "aurora_sycl":
+            return _run_experts_aurora_sycl(
+                w1, w2, w3, x, num_tokens_per_expert
+            )
+        if self.compute_backend == "for_loop":
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+        raise ValueError(f"Unknown expert compute backend: {self.compute_backend}")
 
     def forward(
         self,
@@ -133,11 +371,61 @@ class GroupedExperts(Module):
         shared_experts is passed to combine() where it overlaps with the async
         combine all-to-all (NCCL stream) or async DeepEP combine.
         """
+        if self.compute_backend == "scattermoe":
+            if not isinstance(self.token_dispatcher, LocalTokenDispatcher):
+                raise NotImplementedError(
+                    "scattermoe backend is currently only supported for EP=1 local dispatch."
+                )
+            if self.token_dispatcher.score_before_experts:
+                raise NotImplementedError(
+                    "scattermoe backend requires score_before_experts=False."
+                )
+
+            w13, w2 = self._scattermoe_weights()
+
+            out = _run_experts_scattermoe(w13, w2, x, top_scores, selected_experts_indices)
+            if shared_experts is not None:
+                out = out + shared_experts(x)
+            return out
+        if self.compute_backend in {"aurora_full_loop", "aurora_full_sonic"}:
+            if self.token_dispatcher.score_before_experts:
+                raise ValueError("Aurora full runtime requires score_after_experts")
+            ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
+            if ep_mesh is None:
+                raise ValueError("Aurora full runtime requires expert parallelism")
+            from aurora_moe.torchtitan_full import torchtitan_full_moe
+
+            up, gate, down = self._aurora_weights()
+            backend = (
+                "loop"
+                if self.compute_backend == "aurora_full_loop"
+                else "sycl_sonic"
+            )
+            if not isinstance(shared_experts, FeedForward):
+                raise ValueError("Aurora full runtime requires TorchTitan shared experts")
+            shared_up, shared_gate, shared_down = self._aurora_shared_weights(
+                shared_experts
+            )
+            return torchtitan_full_moe(
+                x,
+                top_scores,
+                selected_experts_indices,
+                up,
+                gate,
+                down,
+                shared_up,
+                shared_gate,
+                shared_down,
+                ep_mesh,
+                backend=backend,
+            )
         routed_input, num_tokens_local, metadata = self.token_dispatcher.dispatch(
             x, top_scores, selected_experts_indices
         )
         routed_output = self._experts_forward(routed_input, num_tokens_local)
-        return self.token_dispatcher.combine(routed_output, metadata, x, shared_experts)
+        return self.token_dispatcher.combine(
+            routed_output, metadata, x, shared_experts
+        )
 
 
 class TokenChoiceTopKRouter(Module):
@@ -268,8 +556,18 @@ class TokenChoiceTopKRouter(Module):
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
+        # XPU topk does not promise stable indices for equal values. Router
+        # scores are BF16 on Aurora, so ties are common enough for activation
+        # checkpoint recomputation to change one route and therefore a ragged
+        # saved-tensor shape. Promote only the choice keys and add a sub-BF16-
+        # ULP expert-id tiebreak; gathered scores and their gradients remain
+        # unchanged.
+        expert_ids = torch.arange(
+            self.num_experts, device=scores_for_choice.device, dtype=torch.float32
+        )
+        choice_keys = scores_for_choice.float() - expert_ids * 1.0e-7
         _, selected_experts_indices = torch.topk(
-            scores_for_choice, k=self.top_k, dim=-1, sorted=False
+            choice_keys, k=self.top_k, dim=-1, sorted=False
         )
 
         # top scores shape (bs*slen, top_k)
@@ -290,11 +588,12 @@ class TokenChoiceTopKRouter(Module):
         top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
+        # Expert assignments are integer indices, so retain integer counts.
+        # This also avoids the non-deterministic/stale XPU histc path used by
+        # older TorchTitan revisions.
+        num_tokens_per_expert = torch.bincount(
             selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+            minlength=self.num_experts,
         )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert

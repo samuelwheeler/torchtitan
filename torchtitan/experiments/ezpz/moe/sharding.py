@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from torch.distributed.tensor import Placement, Replicate, Shard
 
 from torchtitan.experiments.ezpz.moe.model import Attention
+from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.decoder_sharding import (
     colwise_config,
     dense_activation_placement,
@@ -29,6 +30,7 @@ from torchtitan.models.common.decoder_sharding import (
     rowwise_config,
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
+    set_gqa_attention_sharding,
     set_gqa_inner_attention_local_map,
 )
 from torchtitan.protocols.sharding import ShardingConfig
@@ -70,13 +72,27 @@ def _set_moe_layer_sharding(
     sets dense FFN sharding. MoE-layer feed_forward sub-module is None;
     its `moe` block is left for ``apply_moe_ep_tp``.
     """
-    attention = layer_cfg.attention
-    assert isinstance(attention, Attention.Config)
-
     norm = norm_config(enable_sp=enable_sp)
     layer_cfg.attention_norm.sharding_config = norm
     layer_cfg.ffn_norm.sharding_config = norm
     attn_x_placement: Placement = Shard(1) if enable_sp else Replicate()
+
+    attention = layer_cfg.attention
+    if isinstance(attention, GQAttention.Config):
+        set_gqa_attention_sharding(attention, enable_sp=enable_sp)
+        set_gqa_inner_attention_local_map(attention.inner_attention)
+        if layer_cfg.feed_forward is not None:
+            set_dense_ffn_sharding(
+                layer_cfg.feed_forward,
+                attn_x_placement=attn_x_placement,
+                enable_sp=enable_sp,
+            )
+        return
+    if not isinstance(attention, Attention.Config):
+        raise TypeError(
+            "MoE sharding supports MLA or GQA attention, got "
+            f"{type(attention).__name__}."
+        )
 
     # MLA attention input: x is gathered to Replicate; freqs_cis always Replicate.
     attention.sharding_config = ShardingConfig(

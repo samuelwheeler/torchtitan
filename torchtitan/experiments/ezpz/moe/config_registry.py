@@ -296,6 +296,101 @@ def moe_10b_2b_sdpa() -> FaultTolerantTrainer.Config:
     return cfg
 
 
+def _moe_10b_2b_50k(flavor: str) -> FaultTolerantTrainer.Config:
+    cfg = moe(
+        flavor,
+        local_batch_size=1,
+        activation_checkpoint_mode="none",
+        seq_len=2048,
+        compile=False,
+        checkpoint_interval=100,
+        hf_assets_path="./assets/hf/llama-2-32k-sp",
+    )
+    cfg.tokenizer.backend = "sptoken"
+    cfg.optimizer.lr = 2.2e-4
+    cfg.lr_scheduler.decay_type = "cosine"
+    cfg.lr_scheduler.min_lr_factor = 0.1
+    cfg.training.steps = 1100
+    return cfg
+
+
+def moe_10b_2b_50k_sdpa_for_loop() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_for_loop")
+
+
+def moe_10b_2b_50k_sdpa_aurora_sycl() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_aurora_sycl")
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_loop() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_aurora_full_loop")
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_sonic() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_aurora_full_sonic")
+
+
+def _agpt_2b_50k_moe(flavor: str) -> FaultTolerantTrainer.Config:
+    cfg = _moe_10b_2b_50k(flavor)
+    cfg.hf_assets_path = "./assets/hf/olmo-7b-0724-hf"
+    cfg.tokenizer.backend = "hf"
+    cfg.activation_checkpoint.mode = "selective"
+    return cfg
+
+
+def agpt_2b_50k_moe_sdpa() -> FaultTolerantTrainer.Config:
+    return _agpt_2b_50k_moe("AGPT_2B_50K_MOE_sdpa")
+
+
+def agpt_2b_50k_moe_sdpa_aurora_full_loop() -> FaultTolerantTrainer.Config:
+    return _agpt_2b_50k_moe("AGPT_2B_50K_MOE_sdpa_aurora_full_loop")
+
+
+def agpt_2b_50k_moe_sdpa_aurora_full_sonic() -> FaultTolerantTrainer.Config:
+    return _agpt_2b_50k_moe("AGPT_2B_50K_MOE_sdpa_aurora_full_sonic")
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_loop_1layer() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_aurora_full_loop_1layer")
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_sonic_1layer() -> FaultTolerantTrainer.Config:
+    return _moe_10b_2b_50k("10B_2B_50K_sdpa_aurora_full_sonic_1layer")
+
+
+def moe_10b_2b_sdpa_1layer() -> FaultTolerantTrainer.Config:
+    cfg = moe("10B_2B_sdpa_1layer", local_batch_size=2,
+              activation_checkpoint_mode="none")
+    cfg.optimizer.lr = 2.2e-4
+    cfg.lr_scheduler.decay_type = "cosine"
+    cfg.lr_scheduler.min_lr_factor = 0.1
+    cfg.training.steps = 1000
+    cfg.checkpoint.interval = 100
+    return cfg
+
+
+def moe_10b_2b_sdpa_batched_mm_padded() -> FaultTolerantTrainer.Config:
+    cfg = moe("10B_2B_sdpa_batched_mm_padded", local_batch_size=2,
+              activation_checkpoint_mode="none")
+    cfg.optimizer.lr = 2.2e-4
+    cfg.lr_scheduler.decay_type = "cosine"
+    cfg.lr_scheduler.min_lr_factor = 0.1
+    cfg.training.steps = 1000
+    cfg.checkpoint.interval = 100
+    return cfg
+
+
+def moe_10b_2b_sdpa_scattermoe() -> FaultTolerantTrainer.Config:
+    cfg = moe("10B_2B_sdpa_scattermoe", local_batch_size=2,
+              activation_checkpoint_mode="none")
+    cfg.optimizer.lr = 2.2e-4
+    cfg.lr_scheduler.decay_type = "cosine"
+    cfg.lr_scheduler.min_lr_factor = 0.1
+    cfg.training.steps = 1000
+    cfg.checkpoint.interval = 100
+    return cfg
+
+
 def smoke_moe_500m_50steps() -> FaultTolerantTrainer.Config:
     """50-step moe smoke test for the post-#2963/#2937 replay.
 
@@ -338,6 +433,58 @@ def moe_16b_from_json() -> FaultTolerantTrainer.Config:
 
 def moe_10b_2b_from_json() -> FaultTolerantTrainer.Config:
     return _config_from_json(moe_10b_2b)
+
+
+def moe_10b_2b_sdpa_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_sdpa)
+
+
+def moe_10b_2b_50k_sdpa_for_loop_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_for_loop)
+
+
+def moe_10b_2b_50k_sdpa_aurora_sycl_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_aurora_sycl)
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_loop_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_aurora_full_loop)
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_sonic_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_aurora_full_sonic)
+
+
+def agpt_2b_50k_moe_sdpa_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(agpt_2b_50k_moe_sdpa)
+
+
+def agpt_2b_50k_moe_sdpa_aurora_full_loop_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(agpt_2b_50k_moe_sdpa_aurora_full_loop)
+
+
+def agpt_2b_50k_moe_sdpa_aurora_full_sonic_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(agpt_2b_50k_moe_sdpa_aurora_full_sonic)
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_loop_1layer_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_aurora_full_loop_1layer)
+
+
+def moe_10b_2b_50k_sdpa_aurora_full_sonic_1layer_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_50k_sdpa_aurora_full_sonic_1layer)
+
+
+def moe_10b_2b_sdpa_1layer_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_sdpa_1layer)
+
+
+def moe_10b_2b_sdpa_batched_mm_padded_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_sdpa_batched_mm_padded)
+
+
+def moe_10b_2b_sdpa_scattermoe_from_json() -> FaultTolerantTrainer.Config:
+    return _config_from_json(moe_10b_2b_sdpa_scattermoe)
 
 
 def moe_671b_from_json() -> FaultTolerantTrainer.Config:

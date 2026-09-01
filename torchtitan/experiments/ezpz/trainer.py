@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import os
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -15,12 +15,25 @@ import ezpz
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import ChunkedCELoss, IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed.fsdp import set_fsdp_gradient_sync
 from torchtitan.experiments.ezpz.lr_finder import LRFinderConfig
+from torchtitan.experiments.ezpz.native_ddp import (
+    get_agpt_dtype_probe_data,
+    get_native_ddp_logging_data,
+    install_agpt_dtype_probe,
+    maybe_rebuild_native_ddp_pipeline_buckets,
+    record_native_ddp_grad_streams,
+    validate_native_ddp,
+    validate_native_ddp_pipeline_checkpoint_state,
+    wrap_native_ddp,
+    wrap_native_ddp_pipeline_stage,
+)
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
 from torchtitan.experiments.ft.manager import FTManager, maybe_semi_sync_training
 from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
@@ -28,6 +41,11 @@ from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 from torchtitan.tools.profiler import Profiler
+from torchtitan.tools.xpu_phase_timer import (
+    install_fsdp_phase_timer_hooks,
+    validate_phase_timer_training_mode,
+    XPUPhaseTimer,
+)
 from torchtitan.trainer import Trainer
 
 
@@ -36,6 +54,7 @@ class FaultTolerantTrainer(Trainer):
     class Config(Trainer.Config):
         fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
         lr_finder: LRFinderConfig = field(default_factory=LRFinderConfig)
+        phase_timer: XPUPhaseTimer.Config = field(default_factory=XPUPhaseTimer.Config)
 
     ft_manager: FTManager
 
@@ -48,6 +67,15 @@ class FaultTolerantTrainer(Trainer):
             "model_spec must be set before creating Trainer"
         )
         model_spec = config.model_spec
+        dist_utils.validate_pure_model_parallel_model(
+            model_spec.name, config.parallelism
+        )
+        validate_phase_timer_training_mode(
+            enabled=config.phase_timer.enable,
+            native_ddp=config.parallelism.enable_data_parallel_native_ddp,
+            lr_finder=config.lr_finder.enable,
+            seed_checkpoint=config.checkpoint.create_seed_checkpoint,
+        )
 
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
@@ -120,13 +148,6 @@ class FaultTolerantTrainer(Trainer):
             utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]),
         ):
             model = model_config.build()
-
-        # if ezpz.dist
-        # if ezpz.distributed.asni
-        if ezpz.distributed.verify_wandb():
-            import wandb
-            if wandb.run is not None:
-                wandb.run.watch(model, log="all")
 
         # Quantization is now applied to the config at model_registry time
         # (#3127). The runtime model_converters layer is gone.
@@ -212,6 +233,32 @@ class FaultTolerantTrainer(Trainer):
             config.training.local_batch_size * batch_degree
         )
         assert self.gradient_accumulation_steps > 0
+        validate_native_ddp(
+            model_name=model_spec.name,
+            parallel_dims=parallel_dims,
+            training=config.training,
+            parallelism=config.parallelism,
+            loss_fn=self.loss_fn,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            fault_tolerance_enabled=self.ft_manager.enabled,
+            create_seed_checkpoint=config.checkpoint.create_seed_checkpoint,
+            optimizer_has_param_groups=bool(
+                getattr(config.optimizer, "param_groups", [])
+            ),
+        )
+        if (
+            (
+                config.parallelism.pipeline_parallel_fsdp_overlap
+                or config.parallelism.pipeline_parallel_fsdp_overlap_policy
+                != "bulk"
+            )
+            and self.gradient_accumulation_steps != 1
+        ):
+            raise ValueError(
+                "pipeline FSDP overlap currently requires exactly one "
+                "pipeline schedule invocation per optimizer step; gradient "
+                f"accumulation steps is {self.gradient_accumulation_steps}"
+            )
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
@@ -252,6 +299,23 @@ class FaultTolerantTrainer(Trainer):
                     cast(BaseModel, m).init_states(buffer_device=buffer_device)
                 m.train()
 
+            if config.parallelism.enable_data_parallel_native_ddp:
+                wrap_native_ddp_pipeline_stage(
+                    self.model_parts,
+                    self.pp_schedule,
+                    self.loss_fn,
+                    parallel_dims.get_mesh("dp_replicate"),
+                    config.parallelism.native_ddp_bucket_cap_mb,
+                    parallel_dims.dp_replicate,
+                    config.parallelism.native_ddp_compute_policy,
+                )
+                logger.info(
+                    "Applied native DDP to the sole local 1F1B stage with %.1f "
+                    "MiB gradient buckets and %s compute",
+                    config.parallelism.native_ddp_bucket_cap_mb,
+                    config.parallelism.native_ddp_compute_policy,
+                )
+
             # confirm that user will be able to view loss metrics on the console
             ensure_pp_loss_visible(
                 parallel_dims=parallel_dims,
@@ -275,7 +339,31 @@ class FaultTolerantTrainer(Trainer):
                 cast(BaseModel, model).init_states(buffer_device=buffer_device)
             model.train()
 
+            if config.parallelism.enable_data_parallel_native_ddp:
+                model = wrap_native_ddp(
+                    model,
+                    parallel_dims.get_mesh("dp_replicate"),
+                    config.parallelism.native_ddp_bucket_cap_mb,
+                    config.parallelism.native_ddp_compute_policy,
+                    config.parallelism.native_ddp_bucketize_first_iteration,
+                )
+                logger.info(
+                    "Applied native DDP with %.1f MiB gradient buckets, %s "
+                    "compute, and first-iteration bucketization=%s",
+                    config.parallelism.native_ddp_bucket_cap_mb,
+                    config.parallelism.native_ddp_compute_policy,
+                    config.parallelism.native_ddp_bucketize_first_iteration,
+                )
+
             self.model_parts = [model]
+
+        self.phase_timer = config.phase_timer.build(device=self.device)
+        install_fsdp_phase_timer_hooks(self.model_parts, self.phase_timer)
+
+        if os.getenv("TORCHTITAN_AGPT_DTYPE_PROBE") == "1":
+            if parallel_dims.pp_enabled or len(self.model_parts) != 1:
+                raise ValueError("AGPT dtype probe requires a non-pipeline model")
+            install_agpt_dtype_probe(self.model_parts[0])
 
         # Set lm_head reference for ChunkedCELoss after model construction.
         # Replayed from upstream torchtitan/trainer.py (lines 391-411). Required
@@ -368,7 +456,12 @@ class FaultTolerantTrainer(Trainer):
         loss_parallel_enabled = (
             parallel_dims.tp_enabled and not config.parallelism.disable_loss_parallel
         )
-        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
+        self.train_context = dist_utils.get_train_context(
+            loss_parallel_enabled,
+            enable_bf16_autocast=dist_utils.should_enable_bf16_autocast(
+                config.parallelism
+            ),
+        )
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -438,9 +531,20 @@ class FaultTolerantTrainer(Trainer):
         return ParallelDims.from_config(config.parallelism, world_size)
 
     def train_step(
-        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
+        self,
+        data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]],
+        *,
+        return_global_loss: bool = False,
     ):
+        self.phase_timer.begin_step(self.step)
+        self._debug_step_phase("step_start")
         self.optimizers.zero_grad()
+        self._debug_step_phase("zero_grad_returned")
+        if (
+            self.config.parallelism.enable_data_parallel_native_ddp
+            and self.parallel_dims.pp_enabled
+        ):
+            maybe_rebuild_native_ddp_pipeline_buckets(self.model_parts[0])
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
@@ -455,33 +559,54 @@ class FaultTolerantTrainer(Trainer):
             input_dict, labels = next(data_iterator)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
+        self._debug_step_phase("data_ready")
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                local_valid_tokens, batch_mesh
+            )
         else:
             global_valid_tokens = local_valid_tokens.float()
+        self._debug_step_phase("token_count_returned")
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for microbatch_idx, (input_dict, labels) in enumerate(microbatches):
+            if (
+                self.gradient_accumulation_steps > 1
+                and parallel_dims.dp_cp_enabled
+                and not parallel_dims.pp_enabled
+            ):
+                set_fsdp_gradient_sync(
+                    self.model_parts,
+                    microbatch_idx == self.gradient_accumulation_steps - 1,
+                )
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
 
+            self._debug_step_phase("forward_backward_start")
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
+            self._debug_step_phase("forward_backward_returned")
             accumulated_losses.append(loss.detach())
 
+        self.phase_timer.mark_grad_ready()
+        if self.config.parallelism.enable_data_parallel_native_ddp:
+            # Experimental mixed-precision DDP restores FP32 gradients on an
+            # upcast stream; ordinary DDP/autocast makes this helper a no-op.
+            record_native_ddp_grad_streams(self.model_parts[0])
+        self._debug_step_phase("grad_norm_start")
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.config.training.max_norm,
@@ -489,19 +614,65 @@ class FaultTolerantTrainer(Trainer):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
+        self._debug_step_phase("grad_norm_returned")
+        self.phase_timer.mark_norm_done()
+        should_log = self.metrics_processor.should_log(self.step)
+        logged_grad_norm = grad_norm
+        if self.config.parallelism.enable_data_parallel_native_ddp:
+            if should_log:
+                logged_grad_norm = grad_norm.detach().clone()
+            if (
+                should_log
+                and os.getenv("TORCHTITAN_NATIVE_DDP_PRE_OPT_NORM") == "1"
+            ):
+                print(
+                    "NATIVE_DDP_PRE_OPT_NORM "
+                    f"rank={torch.distributed.get_rank()} step={self.step} "
+                    f"value={float(logged_grad_norm.item()):.9g}",
+                    flush=True,
+                )
         self.checkpointer.maybe_wait_for_staging()
+        self.phase_timer.mark_optimizer_start()
+        self._debug_step_phase("optimizer_start")
         self.optimizers.step()
+        self._debug_step_phase("optimizer_returned")
+        self.phase_timer.mark_optimizer_done()
         self.lr_schedulers.step()
+        self.phase_timer.end_step()
+        self._debug_step_phase("step_core_returned")
+        if (
+            self.config.parallelism.enable_data_parallel_native_ddp
+            and should_log
+            and os.getenv("TORCHTITAN_NATIVE_DDP_PRE_OPT_NORM") == "1"
+        ):
+            print(
+                "NATIVE_DDP_POST_OPT_NORM "
+                f"rank={torch.distributed.get_rank()} step={self.step} "
+                f"original={float(grad_norm.item()):.9g} "
+                f"snapshot={float(logged_grad_norm.item()):.9g}",
+                flush=True,
+            )
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return float(loss.detach().item())
+        # Normal training does not consume a returned loss. Avoid materializing
+        # an XPU scalar on non-logging steps unless the LR finder requests it.
+        if not should_log and not return_global_loss:
+            self._debug_step_phase("step_returned")
+            return None
 
+        self._debug_step_phase("metrics_start")
         if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
+            metrics_loss = loss.detach()
+            # The loss can remain a DTensor after TP loss-parallel reduction.
+            # Materialize model-parallel placements before reducing the plain
+            # scalar over the independent DP/CP loss mesh.  Passing the
+            # DTensor directly to dist_sum() intentionally skips its mesh
+            # argument to avoid double-reducing Partial placements, which
+            # would omit this orthogonal DP reduction.
+            if isinstance(metrics_loss, DTensor):
+                metrics_loss = metrics_loss.full_tensor()
             # FT addition: use ft_manager.loss_sync_pg for extra process group
             ft_pg = self.ft_manager.loss_sync_pg
             loss_mesh = parallel_dims.get_optional_mesh("loss")
@@ -515,36 +686,59 @@ class FaultTolerantTrainer(Trainer):
             # local_avg_loss = local_loss_sum / local_valid_tokens
             #                = (loss * global_valid_tokens) / local_valid_tokens
             # global_max_loss = max(local_avg_loss)
-            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh, ft_pg),
-                dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
-                dist_utils.dist_sum(
+            global_avg_loss_tensor = dist_utils.dist_sum_tensor(
+                metrics_loss, loss_mesh, ft_pg
+            )
+            if should_log:
+                local_avg_loss = (
+                    metrics_loss * global_valid_tokens / local_valid_tokens
+                )
+                global_max_loss_tensor = dist_utils.dist_max_tensor(
+                    local_avg_loss, loss_mesh, ft_pg
+                )
+                global_ntokens_seen_tensor = dist_utils.dist_sum_tensor(
                     torch.tensor(
                         self.ntokens_seen, dtype=torch.int64, device=self.device
                     ),
                     loss_mesh,
                     ft_pg,
-                ),
-            )
+                )
+                # Enqueue all independent metric collectives before the first
+                # host scalar read. This avoids serial launch/wait/launch
+                # behavior on every logging step.
+                global_avg_loss = float(global_avg_loss_tensor.item())
+                global_max_loss = float(global_max_loss_tensor.item())
+                global_ntokens_seen = int(global_ntokens_seen_tensor.item())
+            else:
+                # Only the LR finder reaches this branch. It explicitly needs a
+                # globally reduced Python loss on every step.
+                global_avg_loss = float(global_avg_loss_tensor.item())
         else:
-            global_avg_loss = global_max_loss = float(loss.detach().item())
-            global_ntokens_seen = self.ntokens_seen
+            global_avg_loss = float(loss.detach().item())
+            if should_log:
+                global_max_loss = global_avg_loss
+                global_ntokens_seen = self.ntokens_seen
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            float(grad_norm.item()),
-            extra_metrics=extra_metrics,
-        )
+        if should_log:
+            extra_metrics = {
+                "n_tokens_seen": global_ntokens_seen,
+                "lr": lr,
+            }
+            extra_metrics.update(self.phase_timer.collect_ready_metrics())
+            self.metrics_processor.log(
+                self.step,
+                global_avg_loss,
+                global_max_loss,
+                float(logged_grad_norm.item()),
+                extra_metrics=extra_metrics,
+            )
+        self._debug_step_phase("metrics_returned")
 
-        if isinstance(global_avg_loss, torch.Tensor):
-            return float(global_avg_loss.item())
+        if not return_global_loss:
+            self._debug_step_phase("step_returned")
+            return None
+        if parallel_dims.pp_enabled and not self.pp_has_last_stage:
+            return None
         return float(global_avg_loss)
 
     @record
@@ -552,6 +746,11 @@ class FaultTolerantTrainer(Trainer):
         config = self.config
 
         self.checkpointer.load(step=config.checkpoint.load_step)
+        if (
+            config.parallelism.enable_data_parallel_native_ddp
+            and self.parallel_dims.pp_enabled
+        ):
+            validate_native_ddp_pipeline_checkpoint_state(self.model_parts[0])
         logger.info(f"Training starts at step {self.step + 1}")
 
         # FT addition: per-replica profiling leaf folder
@@ -591,6 +790,7 @@ class FaultTolerantTrainer(Trainer):
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:
+                    self.phase_timer.cancel_step()
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
@@ -615,8 +815,40 @@ class FaultTolerantTrainer(Trainer):
                         parallel_dims=self.parallel_dims,
                     )
 
-        if torch.distributed.get_rank() == 0:
-            logger.info("Sleeping 2 seconds for other ranks to complete")
-            time.sleep(2)
+        rank = torch.distributed.get_rank()
+        phase_artifact = self.phase_timer.finalize_to_artifact(
+            config.dump_folder, rank
+        )
+        if phase_artifact is not None and rank == 0:
+            logger.info(
+                "XPU phase timing wrote bounded rank-local artifacts under %s",
+                phase_artifact.parent,
+            )
+
+        if os.getenv("TORCHTITAN_AGPT_DTYPE_PROBE") == "1":
+            dtype_data = get_agpt_dtype_probe_data(
+                self.model_parts[0],
+                expected_policy=(
+                    "autocast"
+                    if dist_utils.should_enable_bf16_autocast(config.parallelism)
+                    else "uniform_bfloat16"
+                ),
+            )
+            if torch.distributed.get_rank() == 0:
+                logger.info(
+                    "DP_DTYPE_PROBE %s", json.dumps(dtype_data, sort_keys=True)
+                )
+
+        if config.parallelism.enable_data_parallel_native_ddp:
+            print(
+                "NATIVE_DDP_STATS "
+                + json.dumps(
+                    get_native_ddp_logging_data(self.model_parts[0]), sort_keys=True
+                ),
+                flush=True,
+            )
+
+        logger.info("Synchronizing ranks before training shutdown")
+        torch.distributed.barrier(device_ids=[self.device.index])
 
         logger.info("Training completed")

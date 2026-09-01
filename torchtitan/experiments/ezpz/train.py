@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
-import datetime
+import gc
 import json
 import os
 import sys
@@ -16,7 +16,6 @@ from typing import Any
 
 import ezpz
 import ezpz.distributed
-import ezpz.utils
 import torch
 import torch.distributed
 from torch.distributed import get_rank, get_world_size, is_initialized
@@ -99,39 +98,6 @@ _OPTIMIZER_CONFIGS: dict[str, type[OptimizersContainer.Config]] = {
     "spam": SPAMOptimizersContainer.Config,
     "torchmuon": TorchMuonOptimizersContainer.Config,
 }
-
-
-def _update_env() -> dict:
-    now = datetime.datetime.now()
-    dstr = now.strftime("%Y-%m-%d-%H%M%S")
-    env_dict: dict[str, Any] = {
-        f"env.{k}": v
-        for k, v in dict(os.environ).items()
-        if not k.startswith("_") and "API" not in k and "LS_" not in k
-    }
-    env_dict |= {
-        "created_at": dstr,
-        "day": ezpz.utils.get_timestamp("%d"),
-        "DIST_INFO": ezpz.distributed.get_dist_info(),
-        "ezpz_file": ezpz.__file__,
-        "ezpz_version": getattr(ezpz, "__version__", "0.0"),
-        "hostname": ezpz.distributed.get_hostname(),
-        "month": ezpz.utils.get_timestamp("%m"),
-        "machine": ezpz.distributed.get_machine(),
-        "pytorch_backend": str(ezpz.distributed.get_torch_backend()).lower(),
-        "project": WBPROJ_NAME,
-        "torch_version": torch.__version__,
-        "torch_file": torch.__file__,
-        "world_size": str(ezpz.distributed.get_world_size()),
-        "year": ezpz.utils.get_timestamp("%Y"),
-        "working_directory": os.getcwd(),
-    }
-    _ = env_dict.pop("LS_COLORS", None)
-    _ = env_dict.pop("PS1", None)
-    logger.info(f"Running on {ezpz.distributed.get_machine()=}")
-    # logger.info(f"environment={json.dumps(env_dict, indent=4, sort_keys=True)}")
-
-    return env_dict
 
 
 def _has_flag(args: list[str], name: str) -> bool:
@@ -365,7 +331,7 @@ def _translate_legacy_args(args: list[str]) -> list[str]:
 
     if legacy_tokenizer_backend is not None:
         translated.extend(
-            ["tokenizer:config", "--tokenizer.backend", legacy_tokenizer_backend]
+            ["--tokenizer.backend", legacy_tokenizer_backend]
         )
 
     return translated
@@ -426,24 +392,6 @@ def main(args: list[str] | None = None) -> None:
                 lambda *_args, **_kwargs: trainer.optimizers.update_hessian()
             )
 
-        if ezpz.distributed.get_rank() == 0 and ezpz.distributed.verify_wandb():
-            try:
-                run = ezpz.distributed.setup_wandb(
-                    project_name=WBPROJ_NAME,
-                    settings={"console": "wrap"},
-                )
-                wbconfig = {}
-                wbconfig |= {"env": _update_env()}
-                wbconfig |= config.to_dict()
-                # wbconfig |= {"config": asdict(config)}
-                wbconfig |= {"dist": ezpz.distributed.get_dist_info()}
-                if run is not None:
-                    run.config.update(wbconfig)
-            except Exception as e:
-                logger.warning("Unable to update `wandb.run.config`, continuing!")
-                if ezpz.distributed.get_rank() == 0:
-                    logger.exception(e)
-
         if config.checkpoint.create_seed_checkpoint:
             assert (
                 int(os.environ["WORLD_SIZE"]) == 1
@@ -465,9 +413,25 @@ def main(args: list[str] | None = None) -> None:
         raise
     else:
         trainer.close()
+        # Release DDP/FSDP wrappers while their process groups are still valid.
+        # In particular, native DDP can consult its group from C++ destructors;
+        # destroying the default group first causes intermittent XPU teardown
+        # segfaults after otherwise successful training.
+        del trainer
+        gc.collect()
         if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-        logger.info("Process group destroyed")
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                # Both explicit XCCL destruction and interpreter finalization
+                # intermittently segfault a nonzero rank after successful
+                # Aurora runs. Metrics/W&B and model objects are already closed
+                # above, so bypass only the unstable C++ finalizer path.
+                logger.info("Using clean XPU worker exit after successful training")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
+            else:
+                torch.distributed.destroy_process_group()
+                logger.info("Process group destroyed")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,152 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Experimental reverse-A4 payload scatter for the direct padded expert layout.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr size_t kThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+class FusedExpertTokenAddScoreToPaddedKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_expert_tokens(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 3, name,
+              " must have shape [experts, rows, model_dim]");
+}
+
+void check_bf16_scores(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name,
+              " must have shape [experts, rows]");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+inline bool is_valid_padded_row(int64_t row, const int64_t* counts,
+                                int64_t cap) {
+  return row % cap < counts[row / cap];
+}
+
+}  // namespace
+
+// Fuse the final BF16 dX add with the reverse-A4 scatter that appends the
+// router-score gradient.  Inputs are the two independently materialized BMM
+// results, so this preserves the ordinary ``bmm + bmm + add`` BF16 semantics.
+at::Tensor fused_expert_token_add_score_to_padded_bf16(
+    const at::Tensor& up_tokens, const at::Tensor& gate_tokens,
+    const at::Tensor& expert_scores, const at::Tensor& source_slots,
+    const at::Tensor& recv_counts, int64_t cap, int64_t payload_columns,
+    bool fuse_padding_zero) {
+  check_bf16_expert_tokens(up_tokens, "up_tokens");
+  check_bf16_expert_tokens(gate_tokens, "gate_tokens");
+  check_bf16_scores(expert_scores, "expert_scores");
+  check_i64_vector(source_slots, "source_slots");
+  check_i64_vector(recv_counts, "recv_counts");
+  TORCH_CHECK(up_tokens.sizes() == gate_tokens.sizes(),
+              "up_tokens and gate_tokens must have identical shapes");
+  TORCH_CHECK(expert_scores.size(0) == up_tokens.size(0) &&
+                  expert_scores.size(1) == up_tokens.size(1),
+              "expert_scores must have shape [experts, rows]");
+  TORCH_CHECK(up_tokens.device() == gate_tokens.device() &&
+                  up_tokens.device() == expert_scores.device() &&
+                  up_tokens.device() == source_slots.device() &&
+                  up_tokens.device() == recv_counts.device(),
+              "all inputs must share an XPU device");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+
+  const int64_t padded_rows = recv_counts.numel() * cap;
+  TORCH_CHECK(source_slots.numel() == padded_rows,
+              "source_slots must provide one slot per padded row");
+  const int64_t token_columns = up_tokens.size(2);
+  TORCH_CHECK(payload_columns == token_columns + 1 ||
+                  payload_columns == token_columns + 2,
+              "payload_columns must hold token, score, and optional ID columns");
+  const int64_t expert_rows = up_tokens.size(0) * up_tokens.size(1);
+  auto output = fuse_padding_zero
+      ? (expert_rows == 0 && padded_rows != 0
+             ? at::zeros({padded_rows, payload_columns}, up_tokens.options())
+             : at::empty({padded_rows, payload_columns}, up_tokens.options()))
+      : at::zeros({padded_rows, payload_columns}, up_tokens.options());
+  if (padded_rows == 0 || expert_rows == 0) {
+    return output;
+  }
+
+  const auto* up = reinterpret_cast<const bf16*>(up_tokens.data_ptr());
+  const auto* gate = reinterpret_cast<const bf16*>(gate_tokens.data_ptr());
+  const auto* scores = reinterpret_cast<const bf16*>(expert_scores.data_ptr());
+  const auto* slots = source_slots.data_ptr<int64_t>();
+  const auto* counts = recv_counts.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(up_tokens);
+  const size_t groups = static_cast<size_t>(
+      (padded_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<FusedExpertTokenAddScoreToPaddedKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < padded_rows; ++row) {
+          const bool valid = is_valid_padded_row(row, counts, cap);
+          if (!valid && !fuse_padding_zero) {
+            continue;
+          }
+          const int64_t slot = valid ? slots[row] : 0;
+          for (int64_t column = lane; column < payload_columns;
+               column += static_cast<int64_t>(kThreads)) {
+            if (valid && column < token_columns) {
+              out[row * payload_columns + column] = bf16(
+                  static_cast<float>(up[slot * token_columns + column]) +
+                  static_cast<float>(gate[slot * token_columns + column]));
+            } else if (valid && column == token_columns) {
+              out[row * payload_columns + column] = scores[slot];
+            } else {
+              out[row * payload_columns + column] = bf16(0.0f);
+            }
+          }
+        }
+      });
+  return output;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("fused_expert_token_add_score_to_padded_bf16",
+             &aurora_moe::fused_expert_token_add_score_to_padded_bf16,
+             "Fuse BF16 dX add and reverse-A4 payload scatter (XPU)");
+}

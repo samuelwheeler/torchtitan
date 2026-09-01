@@ -1,0 +1,1183 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact source-side EP routing kernels.  A route slot is a flattened
+// ``destination * cap + offset`` index.  Every input route owns exactly one
+// slot, so packing is collision-free and return reduction assigns one work
+// item to each output element instead of using contended index_add atomics.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <pybind11/stl.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace aurora_moe {
+
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr size_t kThreads = 256;
+constexpr int64_t kRowsPerWorkgroup = 4;
+
+class AtomicRouteSlotsKernel;
+class AtomicCompactRouteSlotsKernel;
+class AtomicCompactDestinationExpertSlotsKernel;
+template <class Scalar>
+class PackRoutesKernel;
+class PackRoutesPayloadKernel;
+class PackRoutesPayloadIdsKernel;
+class PackRoutesChunkedPayloadKernel;
+class PackRoutesChunkedPayloadIdsKernel;
+class PackCompactRoutesPayloadKernel;
+class PackCompactRoutesPayloadIdsKernel;
+class PackCompactTokensScoresKernel;
+class PackCompactTokensScorePayloadKernel;
+class PackTokenRowsKernel;
+class ReduceRouteRowsKernel;
+template <class Scalar>
+class UnpackRouteScalarsKernel;
+class FuseRouteRowsKernel;
+class ReduceRoutePayloadRowsKernel;
+class UnpackRoutePayloadScalarsKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+              " must have dtype torch.bfloat16");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_i64_route_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be rank 1");
+}
+
+void check_i64_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name,
+              " must have dtype torch.int64");
+  TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+template <class Scalar>
+std::vector<at::Tensor> pack_routes_impl(const at::Tensor& tokens,
+                                          const at::Tensor& scores,
+                                          const at::Tensor& expert_ids,
+                                          const at::Tensor& route_slots,
+                                          int64_t output_rows) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  auto packed_tokens = at::zeros({output_rows, hidden}, tokens.options());
+  auto packed_scores = at::zeros({output_rows}, scores.options());
+  auto packed_ids = at::full({output_rows}, -1, expert_ids.options());
+  if (routes == 0) {
+    return {packed_tokens, packed_scores, packed_ids};
+  }
+
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const Scalar*>(scores.data_ptr());
+  const auto* input_ids = expert_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(packed_tokens.data_ptr());
+  auto* output_scores = reinterpret_cast<Scalar*>(packed_scores.data_ptr());
+  auto* output_ids = packed_ids.data_ptr<int64_t>();
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackRoutesKernel<Scalar>>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * hidden + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output_scores[slot] = input_scores[route];
+            output_ids[slot] = input_ids[route];
+          }
+        }
+      });
+  return {packed_tokens, packed_scores, packed_ids};
+}
+
+std::vector<at::Tensor> pack_routes_payload_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots,
+    int64_t output_rows) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 1;
+  auto payload = at::zeros({output_rows, stride}, tokens.options());
+  auto packed_ids = at::full({output_rows}, -1, expert_ids.options());
+  if (routes == 0) {
+    return {payload, packed_ids};
+  }
+
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = expert_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto* output_ids = packed_ids.data_ptr<int64_t>();
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackRoutesPayloadKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[slot * stride + hidden] = input_scores[route];
+            output_ids[slot] = input_ids[route];
+          }
+        }
+      });
+  return {payload, packed_ids};
+}
+
+at::Tensor pack_routes_payload_ids_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots,
+    int64_t output_rows) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 2;
+  auto payload = at::zeros({output_rows, stride}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = local_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackRoutesPayloadIdsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[slot * stride + hidden] = input_scores[route];
+            output[slot * stride + hidden + 1] =
+                bf16(static_cast<float>(input_ids[route]));
+          }
+        }
+      });
+  return payload;
+}
+
+std::vector<at::Tensor> pack_routes_chunked_payload_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots,
+    int64_t num_destinations, int64_t cap, int64_t chunk_rows) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 1;
+  const int64_t chunks = (cap + chunk_rows - 1) / chunk_rows;
+  const int64_t output_rows = chunks * num_destinations * chunk_rows;
+  auto payload = at::zeros({output_rows, stride}, tokens.options());
+  auto packed_ids = at::full({output_rows}, -1, expert_ids.options());
+  if (routes == 0) {
+    return {payload, packed_ids};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = expert_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto* output_ids = packed_ids.data_ptr<int64_t>();
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackRoutesChunkedPayloadKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t destination = slot / cap;
+          const int64_t offset = slot - destination * cap;
+          const int64_t chunk = offset / chunk_rows;
+          const int64_t row = offset - chunk * chunk_rows;
+          const int64_t output_slot =
+              (chunk * num_destinations + destination) * chunk_rows + row;
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[output_slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[output_slot * stride + hidden] = input_scores[route];
+            output_ids[output_slot] = input_ids[route];
+          }
+        }
+      });
+  return {payload, packed_ids};
+}
+
+// Write the padded route slots directly in chunk-major transport order:
+// [chunk, destination, rows_per_chunk, token..., score, local_id].  This
+// avoids a full source-cap re-layout before a chunked all-to-all pipeline.
+at::Tensor pack_routes_chunked_payload_ids_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots,
+    int64_t num_destinations, int64_t cap, int64_t chunk_rows) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 2;
+  const int64_t chunks = (cap + chunk_rows - 1) / chunk_rows;
+  auto payload = at::zeros({chunks * num_destinations * chunk_rows, stride},
+                           tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = local_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackRoutesChunkedPayloadIdsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t destination = slot / cap;
+          const int64_t offset = slot - destination * cap;
+          const int64_t chunk = offset / chunk_rows;
+          const int64_t row = offset - chunk * chunk_rows;
+          const int64_t output_slot =
+              (chunk * num_destinations + destination) * chunk_rows + row;
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[output_slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[output_slot * stride + hidden] = input_scores[route];
+            output[output_slot * stride + hidden + 1] =
+                bf16(static_cast<float>(input_ids[route]));
+          }
+        }
+      });
+  return payload;
+}
+
+// Exact alltoallv source pack.  Unlike the padded transport functions above,
+// every compact row is owned by one route and route_slots is required to cover
+// [0, routes) exactly, so allocating with empty() is safe and avoids a full
+// zero-fill of the dynamic send buffer.
+std::vector<at::Tensor> pack_compact_routes_payload_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 1;
+  auto payload = at::empty({routes, stride}, tokens.options());
+  auto packed_ids = at::empty({routes}, expert_ids.options());
+  if (routes == 0) {
+    return {payload, packed_ids};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = expert_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto* output_ids = packed_ids.data_ptr<int64_t>();
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackCompactRoutesPayloadKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[slot * stride + hidden] = input_scores[route];
+            output_ids[slot] = input_ids[route];
+          }
+        }
+      });
+  return {payload, packed_ids};
+}
+
+at::Tensor pack_compact_routes_payload_ids_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 2;
+  auto payload = at::empty({routes, stride}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* input_ids = local_ids.data_ptr<int64_t>();
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackCompactRoutesPayloadIdsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[slot * stride + hidden] = input_scores[route];
+            output[slot * stride + hidden + 1] =
+                bf16(static_cast<float>(input_ids[route]));
+          }
+        }
+      });
+  return payload;
+}
+
+// The segmented transport deliberately keeps the D-wide token payload
+// contiguous.  Scores take a separate tiny collective, which lets the GEMM
+// consume a normal [routes, D] row-major operand without an expert-layout copy.
+std::vector<at::Tensor> pack_compact_tokens_scores_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& route_slots) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  auto packed_tokens = at::empty({routes, hidden}, tokens.options());
+  auto packed_scores = at::empty({routes}, scores.options());
+  if (routes == 0) {
+    return {packed_tokens, packed_scores};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(packed_tokens.data_ptr());
+  auto* output_scores = reinterpret_cast<bf16*>(packed_scores.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackCompactTokensScoresKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * hidden + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output_scores[slot] = input_scores[route];
+          }
+        }
+      });
+  return {packed_tokens, packed_scores};
+}
+
+// Exact source-side pack for the expert-major pipeline.  Unlike
+// pack_compact_routes_payload_impl this carries no expert-ID side buffer:
+// source/expert fragment counts are the routing metadata.  Keeping the score
+// adjacent to its token makes the dispatch one all-to-all-v while the
+// destination-side fused reorder restores a dense [rows, D] GEMM operand.
+at::Tensor pack_compact_tokens_score_payload_impl(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& route_slots) {
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  const int64_t stride = hidden + 1;
+  auto payload = at::empty({routes, stride}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* input_scores = reinterpret_cast<const bf16*>(scores.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackCompactTokensScorePayloadKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[slot * stride + column] = input[token * hidden + column];
+          }
+          if (lane == 0) {
+            output[slot * stride + hidden] = input_scores[route];
+          }
+        }
+      });
+  return payload;
+}
+
+template <class Scalar>
+at::Tensor unpack_route_scalars_impl(const at::Tensor& padded_values,
+                                     const at::Tensor& route_slots) {
+  const int64_t routes = route_slots.numel();
+  auto output = at::empty(route_slots.sizes(), padded_values.options());
+  if (routes == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const Scalar*>(padded_values.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<Scalar*>(output.data_ptr());
+  auto& queue = current_queue(padded_values);
+  queue.parallel_for<UnpackRouteScalarsKernel<Scalar>>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        out[route] = input[slots[route]];
+      });
+  return output;
+}
+
+}  // namespace
+
+// Generate a unique padded transport slot for every original route.  Atomic
+// ordering inside a destination is intentionally unspecified: the slot map
+// travels with the route through both all-to-all legs, so it cannot affect the
+// mathematical routing result or drop a route.
+at::Tensor route_slots_atomic_i64(const at::Tensor& destinations,
+                                  int64_t num_destinations,
+                                  int64_t cap) {
+  check_xpu_contiguous(destinations, "destinations");
+  TORCH_CHECK(destinations.scalar_type() == at::kLong,
+              "destinations must have dtype torch.int64");
+  TORCH_CHECK(destinations.dim() == 1, "destinations must be rank 1");
+  TORCH_CHECK(num_destinations > 0, "num_destinations must be positive");
+  TORCH_CHECK(cap >= 0, "cap must be nonnegative");
+  const int64_t routes = destinations.numel();
+  TORCH_CHECK(routes == 0 || cap > 0,
+              "nonempty routes require a positive distributed cap");
+  auto slots = at::empty_like(destinations);
+  if (routes == 0) {
+    return slots;
+  }
+  auto counters = at::zeros({num_destinations},
+                            destinations.options().dtype(at::kInt));
+  const auto* dest = destinations.data_ptr<int64_t>();
+  auto* counter_data = counters.data_ptr<int32_t>();
+  auto* output = slots.data_ptr<int64_t>();
+  auto& queue = current_queue(destinations);
+  queue.parallel_for<AtomicRouteSlotsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        const int64_t destination = dest[route];
+        using AtomicCounter = sycl::atomic_ref<
+            int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+            sycl::access::address_space::global_space>;
+        AtomicCounter counter(counter_data[destination]);
+        const int32_t offset = counter.fetch_add(1);
+        output[route] = destination * cap + static_cast<int64_t>(offset);
+      });
+  return slots;
+}
+
+// Generate a unique compact alltoallv slot per route.  destination_offsets
+// lives on device and supplies the exact exclusive start row for each
+// destination segment; unlike the padded form above, no cap or fill buffer is
+// involved.  Local atomic order is intentionally unspecified but all route
+// metadata follows the same slot through transport.
+at::Tensor compact_route_slots_atomic_i64(
+    const at::Tensor& destinations, const at::Tensor& destination_offsets) {
+  check_i64_vector(destinations, "destinations");
+  check_i64_vector(destination_offsets, "destination_offsets");
+  TORCH_CHECK(destinations.device() == destination_offsets.device(),
+              "destinations and destination_offsets must share an XPU device");
+  TORCH_CHECK(destination_offsets.numel() > 0,
+              "destination_offsets must be nonempty");
+  const int64_t routes = destinations.numel();
+  auto slots = at::empty_like(destinations);
+  if (routes == 0) {
+    return slots;
+  }
+  const int64_t destinations_count = destination_offsets.numel();
+  auto counters = at::zeros({destinations_count},
+                            destinations.options().dtype(at::kInt));
+  const auto* dest = destinations.data_ptr<int64_t>();
+  const auto* offsets = destination_offsets.data_ptr<int64_t>();
+  auto* counter_data = counters.data_ptr<int32_t>();
+  auto* output = slots.data_ptr<int64_t>();
+  auto& queue = current_queue(destinations);
+  queue.parallel_for<AtomicCompactRouteSlotsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        const int64_t destination = dest[route];
+        using AtomicCounter = sycl::atomic_ref<
+            int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+            sycl::access::address_space::global_space>;
+        AtomicCounter counter(counter_data[destination]);
+        const int32_t local_row = counter.fetch_add(1);
+        output[route] = offsets[destination] + static_cast<int64_t>(local_row);
+      });
+  return slots;
+}
+
+// Assign compact source slots in destination/expert order.  The caller builds
+// ``destination_expert_offsets[d, e]`` from the exact route histogram, so a
+// peer block is a concatenation of real expert segments and needs no ID field.
+at::Tensor compact_destination_expert_slots_atomic_i64(
+    const at::Tensor& destinations, const at::Tensor& local_ids,
+    const at::Tensor& destination_expert_offsets) {
+  check_i64_vector(destinations, "destinations");
+  check_i64_vector(local_ids, "local_ids");
+  check_i64_matrix(destination_expert_offsets, "destination_expert_offsets");
+  TORCH_CHECK(destinations.device() == local_ids.device() &&
+                  destinations.device() == destination_expert_offsets.device(),
+              "destination/expert slot inputs must share an XPU device");
+  TORCH_CHECK(destinations.numel() == local_ids.numel(),
+              "destinations and local_ids must have the same route count");
+  const int64_t num_destinations = destination_expert_offsets.size(0);
+  const int64_t experts = destination_expert_offsets.size(1) - 1;
+  TORCH_CHECK(num_destinations > 0 && experts > 0,
+              "destination/expert offsets must be [destinations, experts + 1]");
+  TORCH_CHECK(num_destinations * experts <= std::numeric_limits<int32_t>::max(),
+              "destination/expert counter count exceeds int32 limits");
+  const int64_t routes = destinations.numel();
+  auto slots = at::empty_like(destinations);
+  if (routes == 0) {
+    return slots;
+  }
+  auto counters = at::zeros({num_destinations * experts},
+                            destinations.options().dtype(at::kInt));
+  const auto* dest = destinations.data_ptr<int64_t>();
+  const auto* expert_ids = local_ids.data_ptr<int64_t>();
+  const auto* offsets = destination_expert_offsets.data_ptr<int64_t>();
+  auto* counter_data = counters.data_ptr<int32_t>();
+  auto* output = slots.data_ptr<int64_t>();
+  auto& queue = current_queue(destinations);
+  queue.parallel_for<AtomicCompactDestinationExpertSlotsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        const int64_t destination = dest[route];
+        const int64_t expert = expert_ids[route];
+        using AtomicCounter = sycl::atomic_ref<
+            int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+            sycl::access::address_space::global_space>;
+        AtomicCounter counter(counter_data[destination * experts + expert]);
+        const int32_t ordinal = counter.fetch_add(1);
+        output[route] = offsets[destination * (experts + 1) + expert] +
+            static_cast<int64_t>(ordinal);
+      });
+  return slots;
+}
+
+// Fused token/score/expert-ID pack.  Expert IDs may be either global or local
+// identifiers; the transport kernel treats them as opaque int64 metadata.
+std::vector<at::Tensor> pack_routes_bf16(const at::Tensor& tokens,
+                                         const at::Tensor& scores,
+                                         const at::Tensor& expert_ids,
+                                         const at::Tensor& route_slots,
+                                         int64_t output_rows) {
+  check_bf16_matrix(tokens, "tokens");
+  check_i64_route_matrix(expert_ids, "expert_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  check_xpu_contiguous(scores, "scores");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 ||
+                  scores.scalar_type() == at::kFloat,
+              "scores must have dtype torch.bfloat16 or torch.float32");
+  TORCH_CHECK(scores.dim() == 2, "scores must be rank 2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == expert_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  expert_ids.sizes() == route_slots.sizes(),
+              "scores, expert_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  TORCH_CHECK(output_rows >= route_slots.numel(),
+              "output_rows must cover every exact route");
+  if (scores.scalar_type() == at::kBFloat16) {
+    return pack_routes_impl<bf16>(tokens, scores, expert_ids, route_slots,
+                                  output_rows);
+  }
+  return pack_routes_impl<float>(tokens, scores, expert_ids, route_slots,
+                                 output_rows);
+}
+
+// BF16-only transport alternative that places a route score in the final
+// column of every token row.  The caller can send this payload in one EP
+// all-to-all instead of separate token and score collectives.
+std::vector<at::Tensor> pack_routes_payload_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots,
+    int64_t output_rows) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(expert_ids, "expert_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "fused payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == expert_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all fused-pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  expert_ids.sizes() == route_slots.sizes(),
+              "scores, expert_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  TORCH_CHECK(output_rows >= route_slots.numel(),
+              "output_rows must cover every exact route");
+  return pack_routes_payload_impl(tokens, scores, expert_ids, route_slots,
+                                  output_rows);
+}
+
+// Generic chunk-major padded transport with a separate exact int64 local-ID
+// buffer.  This is the dynamic fallback for local expert counts above 256.
+std::vector<at::Tensor> pack_routes_chunked_payload_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots,
+    int64_t num_destinations, int64_t cap, int64_t chunk_rows) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(expert_ids, "expert_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(num_destinations > 0 && cap >= 0 && chunk_rows > 0,
+              "destination count and chunk rows must be positive and cap nonnegative");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "chunked payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == expert_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all chunked pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  expert_ids.sizes() == route_slots.sizes(),
+              "scores, expert IDs, and route slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route slots must have the same token count");
+  TORCH_CHECK(route_slots.numel() == 0 || cap > 0,
+              "nonempty route slots require a positive cap");
+  TORCH_CHECK(route_slots.numel() <= num_destinations * cap,
+              "route slots exceed padded destination capacity");
+  return pack_routes_chunked_payload_impl(
+      tokens, scores, expert_ids, route_slots, num_destinations, cap, chunk_rows);
+}
+
+// One-collective forward transport for small local expert counts.  The final
+// two BF16 columns hold score and local expert ID respectively.  BF16 is
+// integer-exact for IDs in [0, 255], so configurations above 256 local
+// experts must use the separate int64-ID transport path.
+at::Tensor pack_routes_payload_ids_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots,
+    int64_t output_rows, int64_t local_count) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(local_ids, "local_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(local_count >= 1 && local_count <= 256,
+              "BF16 local IDs require local_count in [1, 256]");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "BF16 ID payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == local_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all BF16-ID pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  local_ids.sizes() == route_slots.sizes(),
+              "scores, local_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  TORCH_CHECK(output_rows >= route_slots.numel(),
+              "output_rows must cover every exact route");
+  return pack_routes_payload_ids_impl(tokens, scores, local_ids, route_slots,
+                                      output_rows);
+}
+
+std::vector<at::Tensor> pack_compact_tokens_scores_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& route_slots) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "compact scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == route_slots.device(),
+              "compact token/score inputs must share an XPU device");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0) &&
+                  scores.sizes() == route_slots.sizes(),
+              "compact token/score route shapes do not match");
+  return pack_compact_tokens_scores_impl(tokens, scores, route_slots);
+}
+
+at::Tensor pack_compact_tokens_score_payload_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& route_slots) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "compact payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == route_slots.device(),
+              "compact token/score payload inputs must share an XPU device");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0) &&
+                  scores.sizes() == route_slots.sizes(),
+              "compact token/score payload route shapes do not match");
+  return pack_compact_tokens_score_payload_impl(tokens, scores, route_slots);
+}
+
+// Small-ID counterpart which materializes a chunk-major padded transport
+// layout directly.  It is exact for arbitrary dynamic cap/chunk sizes; the
+// final chunk's unused rows are zero padding and no route is discarded.
+at::Tensor pack_routes_chunked_payload_ids_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots,
+    int64_t num_destinations, int64_t cap, int64_t chunk_rows,
+    int64_t local_count) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(local_ids, "local_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(local_count >= 1 && local_count <= 256,
+              "BF16 local IDs require local_count in [1, 256]");
+  TORCH_CHECK(num_destinations > 0 && cap >= 0 && chunk_rows > 0,
+              "destination count and chunk rows must be positive and cap nonnegative");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "BF16 ID payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == local_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all BF16-ID pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  local_ids.sizes() == route_slots.sizes(),
+              "scores, local_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  TORCH_CHECK(route_slots.numel() == 0 || cap > 0,
+              "nonempty route slots require a positive cap");
+  TORCH_CHECK(route_slots.numel() <= num_destinations * cap,
+              "route slots exceed padded destination capacity");
+  return pack_routes_chunked_payload_ids_impl(
+      tokens, scores, local_ids, route_slots, num_destinations, cap, chunk_rows);
+}
+
+// Exact alltoallv payload with a separate opaque int64 expert-ID buffer.  This
+// is the generic local_count fallback: only the small-ID alternative below
+// encodes IDs in BF16.  route_slots must be the compact permutation emitted
+// by compact_route_slots_atomic_i64, so every output row is written exactly
+// once and no zero-fill allocation is needed.
+std::vector<at::Tensor> pack_compact_routes_payload_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& expert_ids, const at::Tensor& route_slots) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(expert_ids, "expert_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "compact payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == expert_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all compact-pack inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  expert_ids.sizes() == route_slots.sizes(),
+              "scores, expert_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  return pack_compact_routes_payload_impl(tokens, scores, expert_ids,
+                                          route_slots);
+}
+
+// One-collective exact alltoallv payload for configurations with at most 256
+// local experts.  IDs remain exact because valid local IDs are [0, 255].
+at::Tensor pack_compact_routes_payload_ids_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& local_ids, const at::Tensor& route_slots,
+    int64_t local_count) {
+  check_bf16_matrix(tokens, "tokens");
+  check_xpu_contiguous(scores, "scores");
+  check_i64_route_matrix(local_ids, "local_ids");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(local_count >= 1 && local_count <= 256,
+              "compact BF16 local IDs require local_count in [1, 256]");
+  TORCH_CHECK(scores.scalar_type() == at::kBFloat16 && scores.dim() == 2,
+              "compact BF16-ID payload scores must be BF16 rank-2");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.device() == local_ids.device() &&
+                  tokens.device() == route_slots.device(),
+              "all compact BF16-ID inputs must share an XPU device");
+  TORCH_CHECK(scores.sizes() == route_slots.sizes() &&
+                  local_ids.sizes() == route_slots.sizes(),
+              "scores, local_ids, and route_slots must share shape [tokens, top_k]");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  return pack_compact_routes_payload_ids_impl(tokens, scores, local_ids,
+                                              route_slots);
+}
+
+// Copy an unweighted token or output-gradient row into every padded route
+// slot.  This is used for the backward dispatch leg.
+at::Tensor pack_token_rows_bf16(const at::Tensor& tokens,
+                                 const at::Tensor& route_slots,
+                                 int64_t output_rows) {
+  check_bf16_matrix(tokens, "tokens");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(tokens.device() == route_slots.device(),
+              "tokens and route_slots must share an XPU device");
+  TORCH_CHECK(tokens.size(0) == route_slots.size(0),
+              "tokens and route_slots must have the same token count");
+  TORCH_CHECK(output_rows >= route_slots.numel(),
+              "output_rows must cover every exact route");
+  const int64_t routes = route_slots.numel();
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = tokens.size(1);
+  auto output = at::zeros({output_rows, hidden}, tokens.options());
+  if (routes == 0 || hidden == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(tokens);
+  const size_t groups = static_cast<size_t>(
+      (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<PackTokenRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_route =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t route = base_route;
+             route < base_route + kRowsPerWorkgroup && route < routes; ++route) {
+          const int64_t slot = slots[route];
+          const int64_t token = route / top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            out[slot * hidden + column] = input[token * hidden + column];
+          }
+        }
+      });
+  return output;
+}
+
+// Each output element is owned by exactly one work item.  It reads the
+// top-k return slots and accumulates in FP32, avoiding source-side atomic
+// contention from index_add_ while retaining every routed contribution.
+at::Tensor reduce_route_rows_bf16(const at::Tensor& route_values,
+                                  const at::Tensor& route_slots) {
+  check_bf16_matrix(route_values, "route_values");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(route_values.device() == route_slots.device(),
+              "route_values and route_slots must share an XPU device");
+  const int64_t tokens = route_slots.size(0);
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = route_values.size(1);
+  auto output = at::empty({tokens, hidden}, route_values.options());
+  if (tokens == 0 || hidden == 0) {
+    return output;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(route_values.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto& queue = current_queue(route_values);
+  const size_t groups = static_cast<size_t>(
+      (tokens + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<ReduceRouteRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_token =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t token = base_token;
+             token < base_token + kRowsPerWorkgroup && token < tokens; ++token) {
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            float sum = 0.0f;
+            const int64_t first_route = token * top_k;
+            for (int64_t choice = 0; choice < top_k; ++choice) {
+              const int64_t slot = slots[first_route + choice];
+              sum += static_cast<float>(input[slot * hidden + column]);
+            }
+            out[token * hidden + column] = bf16(sum);
+          }
+        }
+      });
+  return output;
+}
+
+// Append one BF16 scalar to each vector row.  This is used to combine input
+// and router-score gradients before the backward return all-to-all.
+at::Tensor fuse_route_rows_bf16(const at::Tensor& route_values,
+                                const at::Tensor& route_scalars) {
+  check_bf16_matrix(route_values, "route_values");
+  check_xpu_contiguous(route_scalars, "route_scalars");
+  TORCH_CHECK(route_scalars.scalar_type() == at::kBFloat16 &&
+                  route_scalars.dim() == 1,
+              "route_scalars must be BF16 rank-1");
+  TORCH_CHECK(route_values.device() == route_scalars.device(),
+              "route_values and route_scalars must share an XPU device");
+  TORCH_CHECK(route_scalars.numel() == route_values.size(0),
+              "route_scalars must provide one scalar per route row");
+  const int64_t rows = route_values.size(0);
+  const int64_t hidden = route_values.size(1);
+  const int64_t stride = hidden + 1;
+  auto payload = at::empty({rows, stride}, route_values.options());
+  if (rows == 0) {
+    return payload;
+  }
+  const auto* input = reinterpret_cast<const bf16*>(route_values.data_ptr());
+  const auto* scalars = reinterpret_cast<const bf16*>(route_scalars.data_ptr());
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  auto& queue = current_queue(route_values);
+  const size_t groups = static_cast<size_t>(
+      (rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<FuseRouteRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_row =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = base_row;
+             row < base_row + kRowsPerWorkgroup && row < rows; ++row) {
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            output[row * stride + column] = input[row * hidden + column];
+          }
+          if (lane == 0) {
+            output[row * stride + hidden] = scalars[row];
+          }
+        }
+      });
+  return payload;
+}
+
+// The inverse of the fused backward transport layout.  It launches one
+// owner-per-token vector reduction and one owner-per-route scalar gather;
+// neither output performs an atomic operation.
+std::vector<at::Tensor> reduce_route_payload_bf16(
+    const at::Tensor& payload, const at::Tensor& route_slots) {
+  check_bf16_matrix(payload, "payload");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(payload.device() == route_slots.device(),
+              "payload and route_slots must share an XPU device");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must contain at least one vector column and one scalar");
+  const int64_t tokens = route_slots.size(0);
+  const int64_t top_k = route_slots.size(1);
+  const int64_t hidden = payload.size(1) - 1;
+  const int64_t stride = hidden + 1;
+  auto output = at::empty({tokens, hidden}, payload.options());
+  auto scalars = at::empty(route_slots.sizes(), payload.options());
+  if (tokens == 0) {
+    return {output, scalars};
+  }
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* slots = route_slots.data_ptr<int64_t>();
+  auto* out = reinterpret_cast<bf16*>(output.data_ptr());
+  auto* scalar_out = reinterpret_cast<bf16*>(scalars.data_ptr());
+  auto& queue = current_queue(payload);
+  const size_t groups = static_cast<size_t>(
+      (tokens + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup);
+  queue.parallel_for<ReduceRoutePayloadRowsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(groups * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t base_token =
+            static_cast<int64_t>(item.get_group(0)) * kRowsPerWorkgroup;
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t token = base_token;
+             token < base_token + kRowsPerWorkgroup && token < tokens; ++token) {
+          const int64_t first_route = token * top_k;
+          for (int64_t column = lane; column < hidden;
+               column += static_cast<int64_t>(kThreads)) {
+            float sum = 0.0f;
+            for (int64_t choice = 0; choice < top_k; ++choice) {
+              const int64_t slot = slots[first_route + choice];
+              sum += static_cast<float>(input[slot * stride + column]);
+            }
+            out[token * hidden + column] = bf16(sum);
+          }
+        }
+      });
+  const int64_t routes = route_slots.numel();
+  queue.parallel_for<UnpackRoutePayloadScalarsKernel>(
+      sycl::range<1>(static_cast<size_t>(routes)), [=](sycl::id<1> index) {
+        const int64_t route = static_cast<int64_t>(index[0]);
+        scalar_out[route] = input[slots[route] * stride + hidden];
+      });
+  return {output, scalars};
+}
+
+// There is one scalar per original route, so score-gradient return is a
+// direct indexed gather rather than an atomic scatter/add.
+at::Tensor unpack_route_scalars(const at::Tensor& padded_values,
+                                const at::Tensor& route_slots) {
+  check_xpu_contiguous(padded_values, "padded_values");
+  check_i64_route_matrix(route_slots, "route_slots");
+  TORCH_CHECK(padded_values.scalar_type() == at::kBFloat16 ||
+                  padded_values.scalar_type() == at::kFloat,
+              "padded_values must have dtype torch.bfloat16 or torch.float32");
+  TORCH_CHECK(padded_values.dim() == 1, "padded_values must be rank 1");
+  TORCH_CHECK(padded_values.device() == route_slots.device(),
+              "padded_values and route_slots must share an XPU device");
+  TORCH_CHECK(padded_values.numel() >= route_slots.numel(),
+              "padded_values must cover every exact route");
+  if (padded_values.scalar_type() == at::kBFloat16) {
+    return unpack_route_scalars_impl<bf16>(padded_values, route_slots);
+  }
+  return unpack_route_scalars_impl<float>(padded_values, route_slots);
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("route_slots_atomic_i64", &aurora_moe::route_slots_atomic_i64,
+             "Create exact padded EP route slots (int64/XPU)");
+  module.def("compact_route_slots_atomic_i64",
+             &aurora_moe::compact_route_slots_atomic_i64,
+             "Create exact compact alltoallv route slots from device offsets (int64/XPU)");
+  module.def("compact_destination_expert_slots_atomic_i64",
+             &aurora_moe::compact_destination_expert_slots_atomic_i64,
+             "Create exact compact destination/expert route slots (int64/XPU)");
+  module.def("pack_routes_bf16", &aurora_moe::pack_routes_bf16,
+             "Pack BF16 tokens, scores, and int64 IDs into EP slots (XPU)");
+  module.def("pack_routes_payload_bf16", &aurora_moe::pack_routes_payload_bf16,
+             "Pack BF16 token/score payload and IDs into EP slots (XPU)");
+  module.def("pack_routes_chunked_payload_bf16",
+             &aurora_moe::pack_routes_chunked_payload_bf16,
+             "Pack BF16 token/score payload and IDs into chunked EP slots (XPU)");
+  module.def("pack_routes_payload_ids_bf16",
+             &aurora_moe::pack_routes_payload_ids_bf16,
+             "Pack BF16 token/score/exact-small-ID payload into EP slots (XPU)");
+  module.def("pack_routes_chunked_payload_ids_bf16",
+             &aurora_moe::pack_routes_chunked_payload_ids_bf16,
+             "Pack BF16 token/score/small-ID payload into chunked EP slots (XPU)");
+  module.def("pack_compact_routes_payload_bf16",
+             &aurora_moe::pack_compact_routes_payload_bf16,
+             "Pack exact non-padded BF16 token/score payload plus int64 IDs (XPU)");
+  module.def("pack_compact_routes_payload_ids_bf16",
+             &aurora_moe::pack_compact_routes_payload_ids_bf16,
+             "Pack exact non-padded BF16 token/score/small-ID payload (XPU)");
+  module.def("pack_compact_tokens_scores_bf16",
+             &aurora_moe::pack_compact_tokens_scores_bf16,
+             "Pack exact non-padded BF16 token and score buffers (XPU)");
+  module.def("pack_compact_tokens_score_payload_bf16",
+             &aurora_moe::pack_compact_tokens_score_payload_bf16,
+             "Pack one exact non-padded BF16 token/score payload (XPU)");
+  module.def("pack_token_rows_bf16", &aurora_moe::pack_token_rows_bf16,
+             "Pack BF16 token rows into exact EP slots (XPU)");
+  module.def("reduce_route_rows_bf16", &aurora_moe::reduce_route_rows_bf16,
+             "No-atomic BF16 reduction from EP slots to tokens (XPU)");
+  module.def("fuse_route_rows_bf16", &aurora_moe::fuse_route_rows_bf16,
+             "Fuse BF16 route vectors and scalars for EP transport (XPU)");
+  module.def("reduce_route_payload_bf16", &aurora_moe::reduce_route_payload_bf16,
+             "Reduce BF16 vector/scalar EP payload without atomics (XPU)");
+  module.def("unpack_route_scalars", &aurora_moe::unpack_route_scalars,
+             "Gather BF16/FP32 scalar slots to canonical routes (XPU)");
+}

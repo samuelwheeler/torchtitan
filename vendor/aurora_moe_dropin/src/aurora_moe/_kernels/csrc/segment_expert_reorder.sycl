@@ -1,0 +1,1296 @@
+// Copyright (c) 2026
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Exact source/expert-fragment to logical-expert-major packing for dW probes.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace aurora_moe {
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+constexpr size_t kThreads = 256;
+// One physical source/expert fragment can contain millions of BF16 elements.
+// The original one-workgroup-per-fragment kernel consequently occupied only
+// ``sources * experts`` workgroups (36 at the DP=2/EP=12 target).  This is a
+// scheduling chunk, never a capacity or padded data extent: inactive chunks
+// simply return before touching memory.
+constexpr int64_t kElementsPerWorkgroup = 64 * 1024;
+// The row-tiled variant deliberately maps one whole row interval per
+// workgroup.  It avoids a runtime divide/modulo for every BF16 element in the
+// D-wide compact permutations.  This is only a scheduling grain: true row
+// counts, source count, expert count, and column count stay runtime values.
+constexpr int64_t kRowsPerWorkgroup = 32;
+
+class SegmentsToExpertMajorKernel;
+class PairSegmentsToExpertMajorKernel;
+class ExpertMajorToSegmentsKernel;
+class ParallelSegmentsToExpertMajorKernel;
+class ParallelPairSegmentsToExpertMajorKernel;
+class ParallelExpertMajorToSegmentsKernel;
+class ParallelExpertMajorToSegmentsScaledKernel;
+class ParallelPayloadToExpertMajorKernel;
+class ParallelPayloadAndGradToExpertMajorScaledKernel;
+class ParallelExpertMajorToPayloadKernel;
+class ParallelExpertMajorToPayloadZeroScoreKernel;
+class RowParallelExpertMajorToSegmentsScaledKernel;
+class RowParallelPayloadToExpertMajorKernel;
+class RowParallelPayloadAndGradToExpertMajorScaledKernel;
+class RowParallelExpertMajorToPayloadZeroScoreKernel;
+
+void check_xpu_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
+              " must be an XPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16 && tensor.dim() == 2,
+              name, " must be a BF16 rank-two tensor");
+}
+
+void check_bf16_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16 && tensor.dim() == 1,
+              name, " must be a BF16 rank-one tensor");
+}
+
+void check_i32_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kInt && tensor.dim() == 2,
+              name, " must be an int32 rank-two tensor");
+}
+
+void check_i64_matrix(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong && tensor.dim() == 2,
+              name, " must be an int64 rank-two tensor");
+}
+
+void check_i64_vector(const at::Tensor& tensor, const char* name) {
+  check_xpu_contiguous(tensor, name);
+  TORCH_CHECK(tensor.scalar_type() == at::kLong && tensor.dim() == 1,
+              name, " must be an int64 rank-one tensor");
+}
+
+struct ReorderMetadata {
+  const int32_t* counts;
+  const int64_t* source_expert_offsets;
+  const int64_t* source_offsets;
+  const int64_t* expert_offsets;
+  const int64_t* expert_source_offsets;
+  int32_t sources;
+  int32_t experts;
+};
+
+ReorderMetadata check_metadata(
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets,
+    const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& reference) {
+  check_i32_matrix(source_expert_counts, "source_expert_counts");
+  check_i64_matrix(source_expert_offsets, "source_expert_offsets");
+  check_i64_vector(source_offsets, "source_offsets");
+  check_i64_vector(expert_offsets, "expert_offsets");
+  check_i64_matrix(expert_source_offsets, "expert_source_offsets");
+  TORCH_CHECK(source_expert_counts.device() == reference.device() &&
+                  source_expert_offsets.device() == reference.device() &&
+                  source_offsets.device() == reference.device() &&
+                  expert_offsets.device() == reference.device() &&
+                  expert_source_offsets.device() == reference.device(),
+              "reorder metadata must share the value device");
+  const int64_t sources = source_expert_counts.size(0);
+  const int64_t experts = source_expert_counts.size(1);
+  TORCH_CHECK(sources > 0 && experts > 0 &&
+                  source_expert_offsets.size(0) == sources &&
+                  source_expert_offsets.size(1) == experts + 1 &&
+                  source_offsets.numel() == sources + 1 &&
+                  expert_offsets.numel() == experts + 1 &&
+                  expert_source_offsets.size(0) == sources &&
+                  expert_source_offsets.size(1) == experts,
+              "invalid source/expert reorder metadata shape");
+  TORCH_CHECK(sources * experts <= std::numeric_limits<int32_t>::max(),
+              "source/expert group count exceeds int32 limits");
+  return {source_expert_counts.data_ptr<int32_t>(),
+          source_expert_offsets.data_ptr<int64_t>(),
+          source_offsets.data_ptr<int64_t>(),
+          expert_offsets.data_ptr<int64_t>(),
+          expert_source_offsets.data_ptr<int64_t>(),
+          static_cast<int32_t>(sources), static_cast<int32_t>(experts)};
+}
+
+sycl::queue& current_queue(const at::Tensor& tensor) {
+  return c10::xpu::getCurrentXPUStream(tensor.get_device()).queue();
+}
+
+const int64_t* check_parallel_block_offsets(
+    const at::Tensor& fragment_block_offsets,
+    const ReorderMetadata& metadata,
+    const at::Tensor& reference) {
+  check_i64_vector(fragment_block_offsets, "fragment_block_offsets");
+  TORCH_CHECK(fragment_block_offsets.device() == reference.device() &&
+                  fragment_block_offsets.numel() ==
+                      static_cast<int64_t>(metadata.sources) * metadata.experts + 1,
+              "fragment_block_offsets must be an XPU int64 [sources * experts + 1] vector");
+  return fragment_block_offsets.data_ptr<int64_t>();
+}
+
+const int64_t* check_parallel_row_block_offsets(
+    const at::Tensor& fragment_row_block_offsets,
+    const ReorderMetadata& metadata,
+    const at::Tensor& reference) {
+  check_i64_vector(fragment_row_block_offsets, "fragment_row_block_offsets");
+  TORCH_CHECK(fragment_row_block_offsets.device() == reference.device() &&
+                  fragment_row_block_offsets.numel() ==
+                      static_cast<int64_t>(metadata.sources) * metadata.experts + 1,
+              "fragment_row_block_offsets must be an XPU int64 "
+              "[sources * experts + 1] vector");
+  return fragment_row_block_offsets.data_ptr<int64_t>();
+}
+
+int64_t parallel_launch_blocks(int64_t routes, int64_t columns,
+                               int32_t groups) {
+  TORCH_CHECK(columns > 0 && routes <=
+                  (std::numeric_limits<int64_t>::max() - kElementsPerWorkgroup) / columns,
+              "parallel reorder extent exceeds int64 limits");
+  // The extra ``groups`` covers the case where many short nonempty fragments
+  // each need one workgroup (for example a scalar score vector).
+  return (routes * columns + kElementsPerWorkgroup - 1) /
+             kElementsPerWorkgroup +
+         groups;
+}
+
+int64_t row_parallel_launch_blocks(int64_t routes, int32_t groups) {
+  TORCH_CHECK(routes <= std::numeric_limits<int64_t>::max() - kRowsPerWorkgroup,
+              "row-parallel reorder route extent exceeds int64 limits");
+  // sum(ceil(fragment_rows / grain)) is at most
+  // ceil(total_rows / grain) + groups - 1.  The small overlaunch keeps the
+  // total schedule device-resident and avoids a host read of its final offset.
+  return (routes + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup + groups;
+}
+
+}  // namespace
+
+at::Tensor segments_to_expert_major_bf16(
+    const at::Tensor& values, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets) {
+  check_bf16_matrix(values, "values");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<SegmentsToExpertMajorKernel>(
+      sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(groups) * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int32_t group = static_cast<int32_t>(item.get_group(0));
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        for (int64_t element = static_cast<int64_t>(item.get_local_id(0));
+             element < elements; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          output_ptr[(expert_begin + row) * columns + column] =
+              input[(source_begin + row) * columns + column];
+        }
+      });
+  return output;
+}
+
+std::vector<at::Tensor> pair_segments_to_expert_major_bf16(
+    const at::Tensor& first, const at::Tensor& second,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets) {
+  check_bf16_matrix(first, "first");
+  check_bf16_matrix(second, "second");
+  TORCH_CHECK(first.device() == second.device() && first.size(0) == second.size(0),
+              "paired values must share device and route count");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, first);
+  const int64_t routes = first.size(0);
+  auto first_output = at::empty_like(first);
+  auto second_output = at::empty_like(second);
+  if (routes == 0) {
+    return {first_output, second_output};
+  }
+  const int64_t first_columns = first.size(1);
+  const int64_t second_columns = second.size(1);
+  const int32_t groups = metadata.sources * metadata.experts;
+  const auto* first_input = reinterpret_cast<const bf16*>(first.data_ptr());
+  const auto* second_input = reinterpret_cast<const bf16*>(second.data_ptr());
+  auto* first_out = reinterpret_cast<bf16*>(first_output.data_ptr());
+  auto* second_out = reinterpret_cast<bf16*>(second_output.data_ptr());
+  current_queue(first).parallel_for<PairSegmentsToExpertMajorKernel>(
+      sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(groups) * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int32_t group = static_cast<int32_t>(item.get_group(0));
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        const int64_t first_elements = static_cast<int64_t>(rows) * first_columns;
+        for (int64_t element = lane; element < first_elements;
+             element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / first_columns;
+          const int64_t column = element - row * first_columns;
+          first_out[(expert_begin + row) * first_columns + column] =
+              first_input[(source_begin + row) * first_columns + column];
+        }
+        const int64_t second_elements = static_cast<int64_t>(rows) * second_columns;
+        for (int64_t element = lane; element < second_elements;
+             element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / second_columns;
+          const int64_t column = element - row * second_columns;
+          second_out[(expert_begin + row) * second_columns + column] =
+              second_input[(source_begin + row) * second_columns + column];
+        }
+      });
+  return {first_output, second_output};
+}
+
+at::Tensor expert_major_to_segments_bf16(
+    const at::Tensor& values, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets) {
+  check_bf16_matrix(values, "values");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<ExpertMajorToSegmentsKernel>(
+      sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(groups) * kThreads),
+                        sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int32_t group = static_cast<int32_t>(item.get_group(0));
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        for (int64_t element = static_cast<int64_t>(item.get_local_id(0));
+             element < elements; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          output_ptr[(source_begin + row) * columns + column] =
+              input[(expert_begin + row) * columns + column];
+        }
+      });
+  return output;
+}
+
+at::Tensor segments_to_expert_major_parallel_bf16(
+    const at::Tensor& values, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(values, "values");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<ParallelSegmentsToExpertMajorKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          output_ptr[(expert_begin + row) * columns + column] =
+              input[(source_begin + row) * columns + column];
+        }
+      });
+  return output;
+}
+
+std::vector<at::Tensor> pair_segments_to_expert_major_parallel_bf16(
+    const at::Tensor& first, const at::Tensor& second,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(first, "first");
+  check_bf16_matrix(second, "second");
+  TORCH_CHECK(first.device() == second.device() && first.size(0) == second.size(0),
+              "paired values must share device and route count");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, first);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, first);
+  const int64_t routes = first.size(0);
+  auto first_output = at::empty_like(first);
+  auto second_output = at::empty_like(second);
+  if (routes == 0) {
+    return {first_output, second_output};
+  }
+  const int64_t first_columns = first.size(1);
+  const int64_t second_columns = second.size(1);
+  const int64_t schedule_columns = std::max(first_columns, second_columns);
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(
+      routes, schedule_columns, groups);
+  const auto* first_input = reinterpret_cast<const bf16*>(first.data_ptr());
+  const auto* second_input = reinterpret_cast<const bf16*>(second.data_ptr());
+  auto* first_out = reinterpret_cast<bf16*>(first_output.data_ptr());
+  auto* second_out = reinterpret_cast<bf16*>(second_output.data_ptr());
+  current_queue(first).parallel_for<ParallelPairSegmentsToExpertMajorKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t block_in_fragment = workgroup - block_offsets[group];
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        const int64_t first_elements = static_cast<int64_t>(rows) * first_columns;
+        const int64_t first_begin = block_in_fragment * kElementsPerWorkgroup;
+        const int64_t first_stop = sycl::min(
+            first_elements, first_begin + kElementsPerWorkgroup);
+        for (int64_t element = first_begin + lane; element < first_stop;
+             element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / first_columns;
+          const int64_t column = element - row * first_columns;
+          first_out[(expert_begin + row) * first_columns + column] =
+              first_input[(source_begin + row) * first_columns + column];
+        }
+        const int64_t second_elements = static_cast<int64_t>(rows) * second_columns;
+        const int64_t second_begin = block_in_fragment * kElementsPerWorkgroup;
+        const int64_t second_stop = sycl::min(
+            second_elements, second_begin + kElementsPerWorkgroup);
+        for (int64_t element = second_begin + lane; element < second_stop;
+             element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / second_columns;
+          const int64_t column = element - row * second_columns;
+          second_out[(expert_begin + row) * second_columns + column] =
+              second_input[(source_begin + row) * second_columns + column];
+        }
+      });
+  return {first_output, second_output};
+}
+
+at::Tensor expert_major_to_segments_parallel_bf16(
+    const at::Tensor& values, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(values, "values");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<ParallelExpertMajorToSegmentsKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          output_ptr[(source_begin + row) * columns + column] =
+              input[(expert_begin + row) * columns + column];
+        }
+      });
+  return output;
+}
+
+// Forward routed outputs are logically weighted by their router score before
+// returning to source-major all-to-all-v order.  Combining that multiplication
+// with the already-required expert-major inverse permutation removes a full
+// [routes, D] BF16 temporary and one global-memory pass.  The score is indexed
+// in expert-major order, so this remains exact for unequal/zero fragments and
+// has no capacity or padding representation.
+at::Tensor expert_major_to_segments_scaled_parallel_bf16(
+    const at::Tensor& values, const at::Tensor& scores,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(values, "values");
+  check_bf16_vector(scores, "scores");
+  TORCH_CHECK(values.device() == scores.device() &&
+                  values.size(0) == scores.numel(),
+              "expert-major values and scores must share device and route count");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  const auto* score_ptr = reinterpret_cast<const bf16*>(scores.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<ParallelExpertMajorToSegmentsScaledKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          output_ptr[source_row * columns + column] = bf16(
+              static_cast<float>(input[expert_row * columns + column]) *
+              static_cast<float>(score_ptr[expert_row]));
+        }
+      });
+  return output;
+}
+
+// Unpack a single compact [token..., score] payload directly into the two
+// dense expert-major operands.  The scheduling extent is the D-wide GEMM
+// input, not D+1, so it stays an exact source/expert fragment schedule rather
+// than a capacity representation.  Every row's column zero owns its score
+// copy, which avoids a second scalar pass or a score all-to-all-v.
+std::vector<at::Tensor> payload_to_expert_major_parallel_bf16(
+    const at::Tensor& payload, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(payload, "payload");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must have one or more token columns plus a score column");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, payload);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, payload);
+  const int64_t routes = payload.size(0);
+  const int64_t columns = payload.size(1) - 1;
+  auto tokens = at::empty({routes, columns}, payload.options());
+  auto scores = at::empty({routes}, payload.options());
+  if (routes == 0) {
+    return {tokens, scores};
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(payload).parallel_for<ParallelPayloadToExpertMajorKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          token_out[expert_row * columns + column] =
+              input[source_row * payload_stride + column];
+          if (column == 0) {
+            score_out[expert_row] = input[source_row * payload_stride + columns];
+          }
+        }
+      });
+  return {tokens, scores};
+}
+
+// Router-gradient-free expert training needs two compact values in backward:
+// the token operand for dW and `dY * route_score` for dX/dW-down.  Both are
+// derived from the same physical payload/gradient rows.  Fusing their exact
+// source/expert-to-expert-major permutation avoids a separate D-wide gradient
+// pack and score-multiply pass.  It is schedule-generic: sources, experts,
+// row counts, and column count are runtime data; blocks only describe work.
+std::vector<at::Tensor> payload_and_grad_to_expert_major_scaled_parallel_bf16(
+    const at::Tensor& payload, const at::Tensor& grad_output,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(payload, "payload");
+  check_bf16_matrix(grad_output, "grad_output");
+  TORCH_CHECK(payload.device() == grad_output.device() &&
+                  payload.size(0) == grad_output.size(0) &&
+                  payload.size(1) == grad_output.size(1) + 1,
+              "payload must be [routes, grad_output.columns + 1] on the same device");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, payload);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, payload);
+  const int64_t routes = payload.size(0);
+  const int64_t columns = grad_output.size(1);
+  auto tokens = at::empty({routes, columns}, payload.options());
+  auto scaled_grad = at::empty_like(grad_output);
+  if (routes == 0) {
+    return {tokens, scaled_grad};
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* payload_ptr = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* grad_ptr = reinterpret_cast<const bf16*>(grad_output.data_ptr());
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* scaled_grad_out = reinterpret_cast<bf16*>(scaled_grad.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(payload).parallel_for<ParallelPayloadAndGradToExpertMajorScaledKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          const float score = static_cast<float>(
+              payload_ptr[source_row * payload_stride + columns]);
+          token_out[expert_row * columns + column] =
+              payload_ptr[source_row * payload_stride + column];
+          scaled_grad_out[expert_row * columns + column] = bf16(
+              static_cast<float>(grad_ptr[source_row * columns + column]) * score);
+        }
+      });
+  return {tokens, scaled_grad};
+}
+
+// Inverse of payload_to_expert_major_parallel_bf16, used by custom-autograd
+// backward to produce the exact [dX..., dscore] return payload in one
+// bandwidth pass.  It replaces an inverse token reorder, inverse score
+// reorder, and a separate D-wide fuse kernel.
+at::Tensor expert_major_to_payload_parallel_bf16(
+    const at::Tensor& tokens, const at::Tensor& scores,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(tokens, "tokens");
+  check_bf16_vector(scores, "scores");
+  TORCH_CHECK(tokens.device() == scores.device() &&
+                  tokens.size(0) == scores.numel(),
+              "expert-major tokens and scores must share device and route count");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, tokens);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, tokens);
+  const int64_t routes = tokens.size(0);
+  const int64_t columns = tokens.size(1);
+  auto payload = at::empty({routes, columns + 1}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* token_in = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  const auto* score_in = reinterpret_cast<const bf16*>(scores.data_ptr());
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(tokens).parallel_for<ParallelExpertMajorToPayloadKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          output[source_row * payload_stride + column] =
+              token_in[expert_row * columns + column];
+          if (column == 0) {
+            output[source_row * payload_stride + columns] = score_in[expert_row];
+          }
+        }
+      });
+  return payload;
+}
+
+// Return a compact payload gradient when router-score gradients are explicitly
+// outside scope.  The token gradient still follows the exact inverse mapping;
+// the final score column is written as BF16 zero without allocating or reading
+// a route-sized zero vector.
+at::Tensor expert_major_to_payload_zero_score_parallel_bf16(
+    const at::Tensor& tokens, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_block_offsets) {
+  check_bf16_matrix(tokens, "tokens");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, tokens);
+  const auto* block_offsets = check_parallel_block_offsets(
+      fragment_block_offsets, metadata, tokens);
+  const int64_t routes = tokens.size(0);
+  const int64_t columns = tokens.size(1);
+  auto payload = at::empty({routes, columns + 1}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = parallel_launch_blocks(routes, columns, groups);
+  const auto* token_in = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(tokens).parallel_for<ParallelExpertMajorToPayloadZeroScoreKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t elements = static_cast<int64_t>(rows) * columns;
+        const int64_t first = (workgroup - block_offsets[group]) *
+            kElementsPerWorkgroup;
+        const int64_t stop = sycl::min(elements, first + kElementsPerWorkgroup);
+        for (int64_t element = first + static_cast<int64_t>(item.get_local_id(0));
+             element < stop; element += static_cast<int64_t>(kThreads)) {
+          const int64_t row = element / columns;
+          const int64_t column = element - row * columns;
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          output[source_row * payload_stride + column] =
+              token_in[expert_row * columns + column];
+          if (column == 0) {
+            output[source_row * payload_stride + columns] = bf16(0.0f);
+          }
+        }
+      });
+  return payload;
+}
+
+// Row-tiled counterparts for the payload path.  The original element-tiled
+// implementation is retained for A/B.  These kernels use a width-independent
+// fragment schedule produced once by `make_expert_major_layout`, then copy a
+// small true-row interval per workgroup.  This avoids an integer divide and
+// modulo for every BF16 element while preserving the exact source/expert
+// mapping for arbitrary dynamic shapes.
+at::Tensor expert_major_to_segments_scaled_row_parallel_bf16(
+    const at::Tensor& values, const at::Tensor& scores,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_row_block_offsets) {
+  check_bf16_matrix(values, "values");
+  check_bf16_vector(scores, "scores");
+  TORCH_CHECK(values.device() == scores.device() &&
+                  values.size(0) == scores.numel(),
+              "expert-major values and scores must share device and route count");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, values);
+  const auto* block_offsets = check_parallel_row_block_offsets(
+      fragment_row_block_offsets, metadata, values);
+  const int64_t routes = values.size(0);
+  const int64_t columns = values.size(1);
+  auto output = at::empty_like(values);
+  if (routes == 0) {
+    return output;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = row_parallel_launch_blocks(routes, groups);
+  const auto* input = reinterpret_cast<const bf16*>(values.data_ptr());
+  const auto* score_ptr = reinterpret_cast<const bf16*>(scores.data_ptr());
+  auto* output_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+  current_queue(values).parallel_for<RowParallelExpertMajorToSegmentsScaledKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t first_row = (workgroup - block_offsets[group]) *
+            kRowsPerWorkgroup;
+        const int64_t stop_row = sycl::min(
+            static_cast<int64_t>(rows), first_row + kRowsPerWorkgroup);
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = first_row; row < stop_row; ++row) {
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          const float score = static_cast<float>(score_ptr[expert_row]);
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            output_ptr[source_row * columns + column] = bf16(
+                static_cast<float>(input[expert_row * columns + column]) * score);
+          }
+        }
+      });
+  return output;
+}
+
+std::vector<at::Tensor> payload_to_expert_major_row_parallel_bf16(
+    const at::Tensor& payload, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_row_block_offsets) {
+  check_bf16_matrix(payload, "payload");
+  TORCH_CHECK(payload.size(1) >= 2,
+              "payload must have one or more token columns plus a score column");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, payload);
+  const auto* block_offsets = check_parallel_row_block_offsets(
+      fragment_row_block_offsets, metadata, payload);
+  const int64_t routes = payload.size(0);
+  const int64_t columns = payload.size(1) - 1;
+  auto tokens = at::empty({routes, columns}, payload.options());
+  auto scores = at::empty({routes}, payload.options());
+  if (routes == 0) {
+    return {tokens, scores};
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = row_parallel_launch_blocks(routes, groups);
+  const auto* input = reinterpret_cast<const bf16*>(payload.data_ptr());
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* score_out = reinterpret_cast<bf16*>(scores.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(payload).parallel_for<RowParallelPayloadToExpertMajorKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t first_row = (workgroup - block_offsets[group]) *
+            kRowsPerWorkgroup;
+        const int64_t stop_row = sycl::min(
+            static_cast<int64_t>(rows), first_row + kRowsPerWorkgroup);
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = first_row; row < stop_row; ++row) {
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          if (lane == 0) {
+            score_out[expert_row] = input[source_row * payload_stride + columns];
+          }
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            token_out[expert_row * columns + column] =
+                input[source_row * payload_stride + column];
+          }
+        }
+      });
+  return {tokens, scores};
+}
+
+std::vector<at::Tensor> payload_and_grad_to_expert_major_scaled_row_parallel_bf16(
+    const at::Tensor& payload, const at::Tensor& grad_output,
+    const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_row_block_offsets) {
+  check_bf16_matrix(payload, "payload");
+  check_bf16_matrix(grad_output, "grad_output");
+  TORCH_CHECK(payload.device() == grad_output.device() &&
+                  payload.size(0) == grad_output.size(0) &&
+                  payload.size(1) == grad_output.size(1) + 1,
+              "payload must be [routes, grad_output.columns + 1] on the same device");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, payload);
+  const auto* block_offsets = check_parallel_row_block_offsets(
+      fragment_row_block_offsets, metadata, payload);
+  const int64_t routes = payload.size(0);
+  const int64_t columns = grad_output.size(1);
+  auto tokens = at::empty({routes, columns}, payload.options());
+  auto scaled_grad = at::empty_like(grad_output);
+  if (routes == 0) {
+    return {tokens, scaled_grad};
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = row_parallel_launch_blocks(routes, groups);
+  const auto* payload_ptr = reinterpret_cast<const bf16*>(payload.data_ptr());
+  const auto* grad_ptr = reinterpret_cast<const bf16*>(grad_output.data_ptr());
+  auto* token_out = reinterpret_cast<bf16*>(tokens.data_ptr());
+  auto* scaled_grad_out = reinterpret_cast<bf16*>(scaled_grad.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(payload).parallel_for<RowParallelPayloadAndGradToExpertMajorScaledKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t first_row = (workgroup - block_offsets[group]) *
+            kRowsPerWorkgroup;
+        const int64_t stop_row = sycl::min(
+            static_cast<int64_t>(rows), first_row + kRowsPerWorkgroup);
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = first_row; row < stop_row; ++row) {
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          const float score = static_cast<float>(
+              payload_ptr[source_row * payload_stride + columns]);
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            token_out[expert_row * columns + column] =
+                payload_ptr[source_row * payload_stride + column];
+            scaled_grad_out[expert_row * columns + column] = bf16(
+                static_cast<float>(grad_ptr[source_row * columns + column]) * score);
+          }
+        }
+      });
+  return {tokens, scaled_grad};
+}
+
+at::Tensor expert_major_to_payload_zero_score_row_parallel_bf16(
+    const at::Tensor& tokens, const at::Tensor& source_expert_counts,
+    const at::Tensor& source_expert_offsets, const at::Tensor& source_offsets,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_source_offsets,
+    const at::Tensor& fragment_row_block_offsets) {
+  check_bf16_matrix(tokens, "tokens");
+  const auto metadata = check_metadata(
+      source_expert_counts, source_expert_offsets, source_offsets,
+      expert_offsets, expert_source_offsets, tokens);
+  const auto* block_offsets = check_parallel_row_block_offsets(
+      fragment_row_block_offsets, metadata, tokens);
+  const int64_t routes = tokens.size(0);
+  const int64_t columns = tokens.size(1);
+  auto payload = at::empty({routes, columns + 1}, tokens.options());
+  if (routes == 0) {
+    return payload;
+  }
+  const int32_t groups = metadata.sources * metadata.experts;
+  const int64_t launch_blocks = row_parallel_launch_blocks(routes, groups);
+  const auto* token_in = reinterpret_cast<const bf16*>(tokens.data_ptr());
+  auto* output = reinterpret_cast<bf16*>(payload.data_ptr());
+  const int64_t payload_stride = columns + 1;
+  current_queue(tokens).parallel_for<RowParallelExpertMajorToPayloadZeroScoreKernel>(
+      sycl::nd_range<1>(
+          sycl::range<1>(static_cast<size_t>(launch_blocks) * kThreads),
+          sycl::range<1>(kThreads)),
+      [=](sycl::nd_item<1> item) {
+        const int64_t workgroup = static_cast<int64_t>(item.get_group(0));
+        if (workgroup >= block_offsets[groups]) {
+          return;
+        }
+        int32_t lower = 0;
+        int32_t upper = groups;
+        while (lower + 1 < upper) {
+          const int32_t middle = lower + (upper - lower) / 2;
+          if (block_offsets[middle] <= workgroup) {
+            lower = middle;
+          } else {
+            upper = middle;
+          }
+        }
+        const int32_t group = lower;
+        const int32_t source = group / metadata.experts;
+        const int32_t expert = group - source * metadata.experts;
+        const int32_t rows = metadata.counts[group];
+        const int64_t source_begin = metadata.source_offsets[source] +
+            metadata.source_expert_offsets[source * (metadata.experts + 1) + expert];
+        const int64_t expert_begin = metadata.expert_offsets[expert] +
+            metadata.expert_source_offsets[group];
+        const int64_t first_row = (workgroup - block_offsets[group]) *
+            kRowsPerWorkgroup;
+        const int64_t stop_row = sycl::min(
+            static_cast<int64_t>(rows), first_row + kRowsPerWorkgroup);
+        const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+        for (int64_t row = first_row; row < stop_row; ++row) {
+          const int64_t source_row = source_begin + row;
+          const int64_t expert_row = expert_begin + row;
+          if (lane == 0) {
+            output[source_row * payload_stride + columns] = bf16(0.0f);
+          }
+          for (int64_t column = lane; column < columns;
+               column += static_cast<int64_t>(kThreads)) {
+            output[source_row * payload_stride + column] =
+                token_in[expert_row * columns + column];
+          }
+        }
+      });
+  return payload;
+}
+
+}  // namespace aurora_moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("segments_to_expert_major_bf16",
+             &aurora_moe::segments_to_expert_major_bf16,
+             "Exact source/expert fragments to expert-major BF16 rows on XPU");
+  module.def("pair_segments_to_expert_major_bf16",
+             &aurora_moe::pair_segments_to_expert_major_bf16,
+             "Fused pair of exact source/expert to expert-major BF16 row packs on XPU");
+  module.def("expert_major_to_segments_bf16",
+             &aurora_moe::expert_major_to_segments_bf16,
+             "Exact expert-major BF16 rows back to source/expert fragments on XPU");
+  module.def("segments_to_expert_major_parallel_bf16",
+             &aurora_moe::segments_to_expert_major_parallel_bf16,
+             "Parallel exact source/expert to expert-major BF16 row pack on XPU");
+  module.def("pair_segments_to_expert_major_parallel_bf16",
+             &aurora_moe::pair_segments_to_expert_major_parallel_bf16,
+             "Parallel fused pair source/expert to expert-major BF16 row pack on XPU");
+  module.def("expert_major_to_segments_parallel_bf16",
+             &aurora_moe::expert_major_to_segments_parallel_bf16,
+             "Parallel exact expert-major BF16 rows back to source/expert fragments on XPU");
+  module.def("expert_major_to_segments_scaled_parallel_bf16",
+             &aurora_moe::expert_major_to_segments_scaled_parallel_bf16,
+             "Parallel exact score-scaled expert-major BF16 rows back to source/expert fragments on XPU");
+  module.def("payload_to_expert_major_parallel_bf16",
+             &aurora_moe::payload_to_expert_major_parallel_bf16,
+             "Parallel exact compact token/score payload to expert-major BF16 operands on XPU");
+  module.def("payload_and_grad_to_expert_major_scaled_parallel_bf16",
+             &aurora_moe::payload_and_grad_to_expert_major_scaled_parallel_bf16,
+             "Parallel exact payload/token and score-scaled gradient pack on XPU");
+  module.def("expert_major_to_payload_parallel_bf16",
+             &aurora_moe::expert_major_to_payload_parallel_bf16,
+             "Parallel exact expert-major BF16 token/score operands to compact payload on XPU");
+  module.def("expert_major_to_payload_zero_score_parallel_bf16",
+             &aurora_moe::expert_major_to_payload_zero_score_parallel_bf16,
+             "Parallel exact expert-major token gradient to compact zero-score payload on XPU");
+  module.def("expert_major_to_segments_scaled_row_parallel_bf16",
+             &aurora_moe::expert_major_to_segments_scaled_row_parallel_bf16,
+             "Row-parallel exact score-scaled expert-major BF16 rows back to source/expert fragments on XPU");
+  module.def("payload_to_expert_major_row_parallel_bf16",
+             &aurora_moe::payload_to_expert_major_row_parallel_bf16,
+             "Row-parallel exact compact token/score payload to expert-major BF16 operands on XPU");
+  module.def("payload_and_grad_to_expert_major_scaled_row_parallel_bf16",
+             &aurora_moe::payload_and_grad_to_expert_major_scaled_row_parallel_bf16,
+             "Row-parallel exact payload/token and score-scaled gradient pack on XPU");
+  module.def("expert_major_to_payload_zero_score_row_parallel_bf16",
+             &aurora_moe::expert_major_to_payload_zero_score_row_parallel_bf16,
+             "Row-parallel exact expert-major token gradient to compact zero-score payload on XPU");
+}
