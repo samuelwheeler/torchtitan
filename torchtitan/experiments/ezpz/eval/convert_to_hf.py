@@ -71,6 +71,23 @@ def _checkpoint_load_state_dict(
     return load_state_dict
 
 
+def _prepare_hf_state_dict(
+    state_dict: dict[str, torch.Tensor], target_dtype: torch.dtype
+) -> dict[str, torch.Tensor]:
+    """Cast and pack tensors for safetensors serialization.
+
+    State-dict adapters may return inexpensive transpose or slice views.  The
+    Hugging Face storage writer ultimately serializes with safetensors, which
+    requires every tensor to be contiguous.  Pack after the dtype conversion
+    so a lower-precision export does not first duplicate the full checkpoint
+    in FP32.
+    """
+    return {
+        key: value.to(dtype=target_dtype).contiguous()
+        for key, value in state_dict.items()
+    }
+
+
 @torch.inference_mode()
 def convert_to_hf(
     input_dir,
@@ -169,10 +186,10 @@ def convert_to_hf(
         thread_count_consolidation=5,
     )
 
-    # map and apply export dtype if needed
+    # Map to the export dtype and materialize adapter-produced tensor views.
+    # safetensors rejects non-contiguous views (notably transposed MoE experts).
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
-    if target_dtype != torch.float32:
-        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
+    hf_state_dict = _prepare_hf_state_dict(hf_state_dict, target_dtype)
 
     dcp.save(
         hf_state_dict,
