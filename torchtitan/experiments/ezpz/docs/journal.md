@@ -7364,3 +7364,28 @@ Need to investigate QK-Norm and Muon schedule tweak crashes.
 - Merged upstream main into ezpz branch
 - Upstream changes included GraphTrainer bucketing fixes,
   SAC + FSDP improvements, and Qwen3-VL fused QKV support
+
+---
+
+## 2026-10-02 — AGPT 12B2A Hugging Face export
+
+- Added an `AGPTMoEStateDictAdapter` to the existing DCP-to-HF converter and a
+  Transformers remote-code model that preserves the training model's GQA,
+  ComplexRoPE, top-3 biased selection, original unnormalized routing weights,
+  36 routed experts, and always-on shared expert.
+- The first real conversion (`8900811`) exposed non-contiguous Sonic expert
+  transpose views at the safetensors writer. Export tensors are now cast and
+  packed at the serialization boundary; the regression test covers both BF16
+  conversion and same-dtype exports.
+- Job `8900883` exported the historical step-27000 12B-total/2B-active DCP and
+  exited zero. The HF logits matched the current native reference at 0.448%
+  relative RMS / 0.999770 cosine / 96.875% top-1 agreement, and the frozen
+  Sonic oracle at 0.477% / 0.999770 / 98.438%. Final-token top-10 predictions
+  were identical to both references.
+- Job `8900986` then loaded the artifact through unmodified lm-eval-harness
+  0.4.10's `hf` backend with Transformers 4.57.6 and completed an ARC-Easy
+  likelihood smoke on XPU (8/8 requests, exit zero). The two-document 2/2
+  score is only an integration check, not a reportable model metric.
+- The focused CPU suite passed 12/12 tests, including the pre-existing dense
+  converter schema tests. The generated model also passed AutoModel save/load,
+  forward, and generation tests.

@@ -43,3 +43,13 @@ been host-tested with Transformers 4.57.6, the version in Aurora frameworks
 
 For conversion alone, add `--convert-only`. To evaluate an existing export,
 add `--eval-only` and use the same `--output-root`.
+
+## Validation
+
+The historical step-27000 checkpoint was exported in BF16 and compared on the
+same 64-token input with both the current native TorchTitan implementation and
+the frozen Sonic training implementation. The HF logits had relative RMS error
+below 0.5%, cosine similarity 0.999770, and at least 96.875% top-1 agreement
+against each reference; all three paths produced the same final-token top-10.
+The exported directory also completed an ARC-Easy likelihood smoke through
+lm-eval 0.4.10's standard `hf` backend on XPU.
