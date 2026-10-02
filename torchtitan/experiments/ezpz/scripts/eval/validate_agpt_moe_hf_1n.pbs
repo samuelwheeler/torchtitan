@@ -1,0 +1,73 @@
+#!/bin/bash --login
+#PBS -A AuroraGPT
+#PBS -q debug
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -N CODEX_MOE_HF_EXPORT
+#PBS -j oe
+
+set -o pipefail
+
+module load oneapi/release/2025.3.1 hdf5 pti-gpu frameworks/2025.3.1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+export ftp_proxy=http://proxy.alcf.anl.gov:3128
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+for name in TT_REPO TT_SOURCE_SHA TT_DCP TT_TOKENIZER TT_OUTPUT_ROOT TT_DEPS \
+    TT_CONVERT_PY TT_REFERENCE_PRIMARY; do
+    if [[ -z "${!name}" ]]; then
+        echo "${name} is required" >&2
+        exit 2
+    fi
+done
+RUN=${TT_OUTPUT_ROOT}/hf-export-runs/${PBS_JOBID%%.*}
+cd "${TT_REPO}" || exit 2
+if [[ "$(git rev-parse HEAD)" != "${TT_SOURCE_SHA}" ]]; then
+    echo "Source SHA changed after submission" >&2
+    exit 2
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Source worktree has uncommitted changes" >&2
+    exit 2
+fi
+for path in "${TT_DCP}" "${TT_TOKENIZER}/tokenizer.model" "${TT_DEPS}" \
+    "${TT_CONVERT_PY}" "${TT_REFERENCE_PRIMARY}"; do
+    if [[ ! -e "${path}" ]]; then
+        echo "Missing required input: ${path}" >&2
+        exit 2
+    fi
+done
+if [[ -n "${TT_REFERENCE_SECONDARY:-}" && ! -e "${TT_REFERENCE_SECONDARY}" ]]; then
+    echo "Missing secondary reference: ${TT_REFERENCE_SECONDARY}" >&2
+    exit 2
+fi
+if [[ -e "${RUN}" ]]; then
+    echo "Refusing to reuse output directory: ${RUN}" >&2
+    exit 2
+fi
+mkdir -p "${RUN}/hf" "${RUN}/validation" "${RUN}/hf-home"
+
+export PYTHONPATH=${TT_DEPS}:${TT_REPO}
+"${TT_CONVERT_PY}" -u -m torchtitan.experiments.ezpz.eval.convert_to_hf \
+    "${TT_DCP}" "${RUN}/hf" \
+    --hf_assets_path "${TT_TOKENIZER}" \
+    --model_name experiments.ezpz.moe \
+    --model_flavor AGPT_2B_50K_MOE_sdpa_aurora_full_sonic \
+    --export_dtype bfloat16 || exit $?
+
+unset PYTHONPATH
+export HF_HOME=${RUN}/hf-home
+export HF_MODULES_CACHE=${RUN}/hf-home/modules
+REFERENCE_ARGS=(--reference "${TT_REFERENCE_PRIMARY}")
+if [[ -n "${TT_REFERENCE_SECONDARY:-}" ]]; then
+    REFERENCE_ARGS+=(--reference "${TT_REFERENCE_SECONDARY}")
+fi
+python3 -u torchtitan/experiments/ezpz/scripts/eval/validate_agpt_moe_hf.py \
+    --hf-checkpoint "${RUN}/hf" \
+    "${REFERENCE_ARGS[@]}" \
+    --output "${RUN}/validation" \
+    --device xpu:0
