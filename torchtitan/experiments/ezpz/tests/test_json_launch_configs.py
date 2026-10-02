@@ -125,9 +125,13 @@ def test_retained_agpt_json_factories_load(
     assert type(cfg.optim.optimizer.optimizers[0]).__qualname__ == "AdamW.Config"
     assert cfg.optim.optimizer.optimizers[0].lr == pytest.approx(2.2e-4)
     if backend is not None:
+        from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
+            AGPTMoEStateDictAdapter,
+        )
+
         assert cfg.parallelism.expert_parallel_degree == 12
         assert _expert_backends(cfg) == {backend}
-        assert cfg.model.build().state_dict_adapter_cls is None
+        assert cfg.model.build().state_dict_adapter_cls is AGPTMoEStateDictAdapter
 
 
 def test_agpt_json_rejects_checkpoint_rotation(monkeypatch, tmp_path):

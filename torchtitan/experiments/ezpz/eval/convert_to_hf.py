@@ -88,16 +88,19 @@ def convert_to_hf(
         model_module = importlib.import_module(f"torchtitan.models.{model_name}")
     model_config = model_module.model_registry(model_flavor)
 
-    with torch.device("cpu"):
-        model = model_config.build()
-    adapter_cls = type(model).state_dict_adapter_cls
-    model = ModelWrapper(model)
+    with torch.device("meta"):
+        model_probe = model_config.build()
+    adapter_cls = type(model_probe).state_dict_adapter_cls
+    del model_probe
 
     assert adapter_cls is not None, (
         "trying to convert checkpoint from DCP to HF safetensors format, "
         "but the model has no state dict adapter."
     )
     sd_adapter = adapter_cls(model_config, hf_assets_path)
+    validate_hf_assets = getattr(sd_adapter, "validate_hf_assets", None)
+    if validate_hf_assets is not None:
+        validate_hf_assets()
 
     # RoPE convention is NOT recoverable from the checkpoint: both rope caches
     # are registered with persistent=False, so nothing on disk says which one
@@ -133,15 +136,23 @@ def convert_to_hf(
         "docs/guides/known-bugs/rope-flavor-mismatch.md"
     )
 
-    # Allocate model memory, then match its state-dict representation to the
-    # exact schema recorded by this checkpoint. Historical AGPT checkpoints
-    # store logical split Q/K/V and gate/up tensors, while current model builds
-    # expose physically fused wqkv and w13 parameters.
-    state_dict = model._get_state_dict()
-    checkpoint_keys = set(
-        dcp.FileSystemReader(input_dir).read_metadata().state_dict_metadata
+    metadata = dcp.FileSystemReader(input_dir).read_metadata().state_dict_metadata
+    checkpoint_keys = set(metadata)
+    checkpoint_state_dict = getattr(sd_adapter, "checkpoint_state_dict", None)
+    custom_state_dict = (
+        checkpoint_state_dict(metadata) if checkpoint_state_dict is not None else None
     )
-    state_dict = _checkpoint_load_state_dict(state_dict, sd_adapter, checkpoint_keys)
+    if custom_state_dict is not None:
+        state_dict = custom_state_dict
+    else:
+        # Match the live model representation to the schema in this checkpoint.
+        # Historical dense AGPT checkpoints store logical Q/K/V and gate/up
+        # tensors, while current models expose physically fused parameters.
+        with torch.device("cpu"):
+            model = ModelWrapper(model_config.build())
+        state_dict = _checkpoint_load_state_dict(
+            model._get_state_dict(), sd_adapter, checkpoint_keys
+        )
     dcp.load(
         state_dict,
         checkpoint_id=input_dir,
@@ -167,6 +178,10 @@ def convert_to_hf(
         hf_state_dict,
         storage_writer=storage_writer,
     )
+
+    write_hf_assets = getattr(sd_adapter, "write_hf_assets", None)
+    if write_hf_assets is not None:
+        write_hf_assets(output_dir, export_dtype)
 
     # Provenance for the export: which flavor produced it, and therefore which
     # RoPE convention the weights are in. Without this there is no way to audit

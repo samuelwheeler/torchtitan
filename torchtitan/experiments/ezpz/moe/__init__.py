@@ -1480,14 +1480,15 @@ def model_registry(
             "cannot be derived"
         )
 
-    # The full-Sonic backend has no compatible HF adapter. Model ownership
-    # makes this a class-level contract, so use a tiny backend-specific subclass
-    # instead of carrying a registry-side callable bundle.
+    # The AGPT GQA/Sonic flavor exports through its own HF model because the
+    # generic DeepSeek adapter assumes MLA and different router semantics.
     if flavor == "AGPT_2B_50K_MOE_sdpa_aurora_full_sonic":
         from dataclasses import fields
 
+        from .agpt_hf_state_dict_adapter import AGPTMoEStateDictAdapter
+
         class _SonicMoeModel(moeModel):
-            state_dict_adapter_cls = None
+            state_dict_adapter_cls = AGPTMoEStateDictAdapter
 
             @dataclasses.dataclass(kw_only=True, slots=True)
             class Config(moeModel.Config):
