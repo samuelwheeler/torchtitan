@@ -66,7 +66,9 @@ blendcorpus, mpi4py, ezpz, torch"`.
 be missing files a recent commit moved or added.
 For deliberate feature-branch validation, set `PREFLIGHT_SOURCE_SHA` to the
 reviewed commit instead of comparing with the tracking branch. The PBS script
-must independently assert that SHA and reject uncommitted source changes.
+must independently assert that SHA and reject tracked and untracked changes.
+Use `check_source.sh <worktree> <full SHA>`; ignored output/cache directories
+remain allowed.
 
 ## Eval-job traps specifically
 

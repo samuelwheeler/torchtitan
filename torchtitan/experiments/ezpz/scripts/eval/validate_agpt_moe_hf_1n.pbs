@@ -26,14 +26,8 @@ for name in TT_REPO TT_SOURCE_SHA TT_DCP TT_TOKENIZER TT_OUTPUT_ROOT TT_DEPS \
 done
 RUN=${TT_OUTPUT_ROOT}/hf-export-runs/${PBS_JOBID%%.*}
 cd "${TT_REPO}" || exit 2
-if [[ "$(git rev-parse HEAD)" != "${TT_SOURCE_SHA}" ]]; then
-    echo "Source SHA changed after submission" >&2
-    exit 2
-fi
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "Source worktree has uncommitted changes" >&2
-    exit 2
-fi
+bash torchtitan/experiments/ezpz/.agents/skills/alcf-job-preflight/check_source.sh \
+    "${TT_REPO}" "${TT_SOURCE_SHA}" || exit $?
 for path in "${TT_DCP}" "${TT_TOKENIZER}/tokenizer.model" "${TT_DEPS}" \
     "${TT_CONVERT_PY}" "${TT_REFERENCE_PRIMARY}"; do
     if [[ ! -e "${path}" ]]; then
@@ -49,7 +43,7 @@ if [[ -e "${RUN}" ]]; then
     echo "Refusing to reuse output directory: ${RUN}" >&2
     exit 2
 fi
-mkdir -p "${RUN}/hf" "${RUN}/validation" "${RUN}/hf-home"
+mkdir -p "${RUN}/validation" "${RUN}/hf-home"
 if [[ "${TT_TEST_DTENSOR:-0}" == "1" ]]; then
     PYTHONPATH=${TT_DEPS}:${TT_REPO} "${TT_CONVERT_PY}" -m pytest \
         -p no:cacheprovider torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_dtensor.py \
