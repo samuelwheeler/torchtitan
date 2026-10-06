@@ -78,7 +78,13 @@ def test_hf_to_native_reverses_permutation_and_stacks_experts(tiny_moe_config):
     )
 
 
-def test_legacy_checkpoint_schema_rejects_extra_model_keys(tiny_moe_config):
+@pytest.mark.parametrize(
+    "unexpected_key",
+    ["layers.0.unexpected.weight", "extra_embedding.weight", "model.extra.weight"],
+)
+def test_legacy_checkpoint_schema_rejects_extra_model_keys(
+    tiny_moe_config, unexpected_key
+):
     adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     metadata = {
         key: SimpleNamespace(
@@ -87,7 +93,15 @@ def test_legacy_checkpoint_schema_rejects_extra_model_keys(tiny_moe_config):
         for key in adapter._legacy_keys()
     }
     assert set(adapter.checkpoint_state_dict(metadata)) == adapter._legacy_keys()
-    metadata["layers.0.unexpected.weight"] = next(iter(metadata.values()))
+    for key in (
+        "optimizer.state.norm.weight.exp_avg",
+        "lr_scheduler.last_epoch",
+        "train_state.step",
+        "dataloader.state",
+    ):
+        metadata[key] = next(iter(metadata.values()))
+    assert set(adapter.checkpoint_state_dict(metadata)) == adapter._legacy_keys()
+    metadata[unexpected_key] = next(iter(metadata.values()))
     with pytest.raises(RuntimeError, match="unexpected"):
         adapter.checkpoint_state_dict(metadata)
 

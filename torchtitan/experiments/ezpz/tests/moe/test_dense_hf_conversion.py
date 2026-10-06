@@ -24,6 +24,10 @@ from torchtitan.experiments.ezpz.agpt.hf_state_dict_adapter import (
     AGPTDenseStateDictAdapter,
 )
 from torchtitan.experiments.ezpz.eval.convert_to_hf import convert_to_hf
+from torchtitan.experiments.ezpz.tests.moe.hf_reference import (
+    logical_state_dict,
+    reference_hf_state_dict,
+)
 
 
 def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
@@ -49,7 +53,10 @@ def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
 
 
 @pytest.mark.parametrize("layout", ["native", "legacy"])
-def test_dense_dcp_hf_weights_and_logits(layout, tmp_path, tokenizer_dir, monkeypatch):
+@pytest.mark.parametrize("assets_mode", ["generated", "static"])
+def test_dense_dcp_hf_weights_and_logits(
+    layout, assets_mode, tmp_path, tokenizer_dir, monkeypatch
+):
     template = agpt.model_registry("2b_50k")
     small = agpt._build_agpt_config(
         dim=16,
@@ -67,15 +74,31 @@ def test_dense_dcp_hf_weights_and_logits(layout, tmp_path, tokenizer_dir, monkey
     torch.manual_seed(17)
     native = config.build().eval()
     native.init_states(buffer_device=torch.device("cpu"))
-    adapter = AGPTDenseStateDictAdapter(config, tokenizer_dir)
     source = native.state_dict()
-    expected = adapter.to_hf(source)
+    expected = reference_hf_state_dict(source, config)
     if layout == "legacy":
-        source = adapter.native_fused_to_logical(source)
+        source = logical_state_dict(source, config)
+    static_config = None
+    if assets_mode == "static":
+        static_assets = tmp_path / "static-assets"
+        static_assets.mkdir()
+        AGPTDenseStateDictAdapter(config, tokenizer_dir).write_hf_assets(
+            static_assets, "float32"
+        )
+        AutoTokenizer.from_pretrained(static_assets).save_pretrained(static_assets)
+        tokenizer_dir = static_assets
+        static_config = static_assets / "config.json"
+        monkeypatch.setattr(AGPTDenseStateDictAdapter, "write_hf_assets", None)
     checkpoint, output = tmp_path / "dcp", tmp_path / "hf"
     dcp.save(source, checkpoint_id=checkpoint)
     convert_to_hf(
-        checkpoint, output, "experiments.ezpz.agpt", "2b_50k", tokenizer_dir, "float32"
+        checkpoint,
+        output,
+        "experiments.ezpz.agpt",
+        "2b_50k",
+        tokenizer_dir,
+        "float32",
+        static_config,
     )
     actual = {}
     for shard in output.glob("*.safetensors"):

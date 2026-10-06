@@ -170,8 +170,9 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
         if marker not in metadata:
             return None
         expected = self._legacy_keys()
+        training_components = {"optimizer", "lr_scheduler", "train_state", "dataloader"}
         actual = {
-            key for key in metadata if key.startswith("layers.") or key in self._TOP_MAP
+            key for key in metadata if key.split(".", 1)[0] not in training_components
         }
         if actual != expected:
             missing = sorted(expected - actual)
