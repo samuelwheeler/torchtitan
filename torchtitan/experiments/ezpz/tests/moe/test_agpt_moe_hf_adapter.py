@@ -6,19 +6,6 @@ import torch
 from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
     AGPTMoEStateDictAdapter,
 )
-from torchtitan.models.common.rope import ComplexRoPE
-
-
-def _adapter():
-    attention = SimpleNamespace(
-        n_heads=2,
-        n_kv_heads=1,
-        head_dim=4,
-        rope=ComplexRoPE.Config(dim=4, max_context_length=16),
-    )
-    layer = SimpleNamespace(attention=attention, moe=SimpleNamespace(num_experts=2))
-    config = SimpleNamespace(layers=[layer], dim=8)
-    return AGPTMoEStateDictAdapter(config, None)
 
 
 def _legacy_state():
@@ -45,8 +32,8 @@ def _legacy_state():
     return state
 
 
-def test_legacy_sonic_to_hf_is_strict_and_transposes_experts():
-    adapter = _adapter()
+def test_legacy_sonic_to_hf_is_strict_and_transposes_experts(tiny_moe_config):
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     source = _legacy_state()
     hf = adapter.to_hf(source)
 
@@ -65,25 +52,25 @@ def test_legacy_sonic_to_hf_is_strict_and_transposes_experts():
     assert torch.equal(hf["model.layers.0.self_attn.q_proj.weight"], expected_q)
 
 
-def test_hf_to_logical_native_reverses_permutation_and_stacks_experts():
-    adapter = _adapter()
+def test_hf_to_native_reverses_permutation_and_stacks_experts(tiny_moe_config):
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     source = _legacy_state()
     hf = adapter.to_hf(source)
-    adapter._native_fused_linears_from_hf = lambda state, **kwargs: state
     native = adapter.from_hf(hf)
+    logical = adapter._native_fused_linears_to_hf(native, split_routed_experts=True)
 
     assert torch.equal(
-        native["layers.0.attention.qkv_linear.wq.weight"],
+        logical["layers.0.attention.qkv_linear.wq.weight"],
         source["layers.0.attention.qkv_linear.wq.weight"],
     )
     assert torch.equal(
-        native["layers.0.moe.routed_experts.w3_EFD"],
+        logical["layers.0.moe.routed_experts.w3_EFD"],
         source["layers.0.moe.experts.aurora_up"].transpose(-2, -1),
     )
 
 
-def test_legacy_checkpoint_schema_rejects_extra_model_keys():
-    adapter = _adapter()
+def test_legacy_checkpoint_schema_rejects_extra_model_keys(tiny_moe_config):
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     metadata = {
         key: SimpleNamespace(
             size=torch.Size([1]), properties=SimpleNamespace(dtype=torch.float32)
@@ -94,3 +81,37 @@ def test_legacy_checkpoint_schema_rejects_extra_model_keys():
     metadata["layers.0.unexpected.weight"] = next(iter(metadata.values()))
     with pytest.raises(RuntimeError, match="unexpected"):
         adapter.checkpoint_state_dict(metadata)
+
+
+def test_current_fused_native_round_trip_and_shared_forward(tiny_moe_config):
+    model = tiny_moe_config.build()
+    source = model.state_dict()
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
+    hf = adapter.to_hf(source)
+    restored = adapter.from_hf(hf)
+    assert set(restored) == set(source)
+    for key in source:
+        torch.testing.assert_close(restored[key], source[key], rtol=0, atol=0)
+    shared = model.layers["0"].moe.shared_experts
+    tokens = torch.randn(5, 8)
+    gate = hf["model.layers.0.mlp.shared_experts.gate_proj.weight"]
+    up = hf["model.layers.0.mlp.shared_experts.up_proj.weight"]
+    down = hf["model.layers.0.mlp.shared_experts.down_proj.weight"]
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.silu(tokens @ gate.T) * (tokens @ up.T), down
+    )
+    torch.testing.assert_close(shared(tokens), expected)
+
+
+def test_registered_full_model_round_trip_shapes():
+    from torchtitan.experiments.ezpz.moe import model_registry
+
+    config = model_registry("AGPT_2B_50K_MOE_sdpa_aurora_full_sonic")
+    with torch.device("meta"):
+        source = config.build().state_dict()
+    adapter = AGPTMoEStateDictAdapter(config, None)
+    restored = adapter.from_hf(adapter.to_hf(source))
+    assert set(restored) == set(source)
+    assert {key: value.shape for key, value in restored.items()} == {
+        key: value.shape for key, value in source.items()
+    }

@@ -25,3 +25,23 @@ def test_prepare_hf_state_dict_packs_without_dtype_change():
     assert weight.dtype == torch.float32
     assert weight.is_contiguous()
     torch.testing.assert_close(weight, transposed)
+
+
+def test_prepare_preserves_exact_fp32_routing_bias(tiny_moe_config, tmp_path):
+    from safetensors.torch import load_file, save_file
+    from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
+        AGPTMoEStateDictAdapter,
+    )
+
+    key = "model.layers.0.mlp.expert_bias"
+    bias = torch.tensor([0.001003, 0.001004], dtype=torch.float32)
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
+    prepared = _prepare_hf_state_dict(
+        {key: bias, "weight": torch.ones(2)}, torch.bfloat16,
+        adapter.hf_dtype_overrides(),
+    )
+    save_file(prepared, tmp_path / "model.safetensors")
+    loaded = load_file(tmp_path / "model.safetensors")
+    assert loaded["weight"].dtype == torch.bfloat16
+    assert loaded[key].dtype == torch.float32
+    torch.testing.assert_close(loaded[key], bias, rtol=0, atol=0)

@@ -77,6 +77,10 @@ def test_auto_model_remote_code_round_trip(tmp_path):
         "AutoModelForCausalLM": "modeling_agpt_moe.AGPTMoEForCausalLM",
     }
     model = AGPTMoEForCausalLM(config).eval()
+    with torch.no_grad():
+        model.model.layers[0].mlp.expert_bias.copy_(
+            torch.tensor([0.001003, 0.001004, -0.002007])
+        )
     model.save_pretrained(tmp_path)
     source = Path(__file__).parents[2] / "eval/hf_agpt_moe"
     for name in ("configuration_agpt_moe.py", "modeling_agpt_moe.py"):
@@ -90,3 +94,42 @@ def test_auto_model_remote_code_round_trip(tmp_path):
         expected = model(input_ids).logits
         actual = loaded(input_ids).logits
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
+    bf16_model = AutoModelForCausalLM.from_pretrained(
+        tmp_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+    )
+    assert bf16_model.model.layers[0].mlp.gate.weight.dtype == torch.bfloat16
+    assert bf16_model.model.layers[0].mlp.expert_bias.dtype == torch.float32
+    torch.testing.assert_close(
+        bf16_model.model.layers[0].mlp.expert_bias,
+        model.model.layers[0].mlp.expert_bias, rtol=0, atol=0,
+    )
+
+
+def test_native_and_hf_logits_match(tiny_moe_config, monkeypatch):
+    from torchtitan.experiments.ezpz import agpt
+    from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import _config
+    from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
+        AGPTMoEStateDictAdapter,
+    )
+
+    torch.manual_seed(17)
+    native = tiny_moe_config.build().eval()
+    native.init_states(buffer_device=torch.device("cpu"))
+    # The native for_loop expert backend computes in BF16 even on CPU.
+    for parameter in native.parameters():
+        parameter.data = parameter.data.bfloat16()
+    adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
+    hf = AGPTMoEForCausalLM(AGPTMoEConfig(**_config(tiny_moe_config, "bfloat16"))).eval()
+    for parameter in hf.parameters():
+        parameter.data = parameter.data.bfloat16()
+    hf.load_state_dict(adapter.to_hf(native.state_dict()), strict=True)
+    tokens = torch.tensor([1, 3, 5, 7])
+    monkeypatch.setattr(agpt, "_EZPZ_MAX_CONTEXT_LENGTH", tokens.numel())
+    with torch.inference_mode():
+        expected = native(tokens)
+        actual = hf(tokens[None], use_cache=False).logits[0]
+    actual, expected = actual.float(), expected.float()
+    relative_rms = (actual - expected).square().mean().sqrt() / expected.square().mean().sqrt()
+    assert relative_rms < 0.02
+    assert F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0) > 0.999
+    assert torch.equal(actual.argmax(-1), expected.argmax(-1))

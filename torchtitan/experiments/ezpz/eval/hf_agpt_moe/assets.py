@@ -2,6 +2,8 @@ import json
 import shutil
 from pathlib import Path
 
+import sentencepiece as spm
+
 from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.feed_forward import FeedForward
@@ -118,11 +120,28 @@ def _config(model_config, export_dtype):
     }
 
 
-def write_hf_assets(output_dir, model_config, hf_assets_path, export_dtype):
-    output_dir = Path(output_dir)
+def validate_tokenizer(hf_assets_path, vocab_size):
     assets = Path(hf_assets_path) if hf_assets_path is not None else None
     if assets is None or not (assets / "tokenizer.model").is_file():
         raise FileNotFoundError("AGPT MoE export requires hf_assets_path/tokenizer.model")
+    tokenizer = spm.SentencePieceProcessor(model_file=str(assets / "tokenizer.model"))
+    if not 0 < tokenizer.get_piece_size() <= vocab_size:
+        raise ValueError(
+            f"Tokenizer vocabulary {tokenizer.get_piece_size()} exceeds model "
+            f"vocabulary {vocab_size}"
+        )
+    if (
+        (tokenizer.unk_id(), tokenizer.bos_id(), tokenizer.eos_id()) != (0, 1, 2)
+        or [tokenizer.id_to_piece(i) for i in range(3)] != ["<unk>", "<s>", "</s>"]
+        or tokenizer.pad_id() != -1
+    ):
+        raise ValueError("AGPT MoE export requires Llama SentencePiece special tokens")
+
+
+def write_hf_assets(output_dir, model_config, hf_assets_path, export_dtype):
+    validate_tokenizer(hf_assets_path, model_config.vocab_size)
+    output_dir = Path(output_dir)
+    assets = Path(hf_assets_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_dir = Path(__file__).parent
     for name in ("configuration_agpt_moe.py", "modeling_agpt_moe.py"):

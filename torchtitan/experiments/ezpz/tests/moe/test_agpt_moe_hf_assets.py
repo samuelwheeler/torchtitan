@@ -1,13 +1,13 @@
 import json
+import pytest
 
-from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import write_hf_assets
+from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import (
+    validate_tokenizer, write_hf_assets,
+)
 from torchtitan.experiments.ezpz.moe import model_registry
 
 
-def test_hf_assets_are_derived_from_the_registered_model(tmp_path):
-    tokenizer_dir = tmp_path / "tokenizer"
-    tokenizer_dir.mkdir()
-    (tokenizer_dir / "tokenizer.model").write_bytes(b"test-tokenizer")
+def test_hf_assets_are_derived_from_the_registered_model(tmp_path, tokenizer_dir):
     output = tmp_path / "hf"
     config = model_registry("AGPT_2B_50K_MOE_sdpa_aurora_full_sonic")
 
@@ -28,4 +28,23 @@ def test_hf_assets_are_derived_from_the_registered_model(tmp_path):
     )
     assert (output / "modeling_agpt_moe.py").is_file()
     assert (output / "configuration_agpt_moe.py").is_file()
-    assert (output / "tokenizer.model").read_bytes() == b"test-tokenizer"
+    assert (output / "tokenizer.model").read_bytes() == (
+        tokenizer_dir / "tokenizer.model"
+    ).read_bytes()
+
+
+def test_tokenizer_rejects_vocabulary_outside_model(tokenizer_dir):
+    with pytest.raises(ValueError, match="exceeds model vocabulary"):
+        validate_tokenizer(tokenizer_dir, 3)
+
+
+def test_tokenizer_rejects_incompatible_special_tokens(tokenizer_dir):
+    from sentencepiece import sentencepiece_model_pb2
+
+    path = tokenizer_dir / "tokenizer.model"
+    model = sentencepiece_model_pb2.ModelProto()
+    model.ParseFromString(path.read_bytes())
+    model.pieces[1].piece = "<wrong-bos>"
+    path.write_bytes(model.SerializeToString())
+    with pytest.raises(ValueError, match="special tokens"):
+        validate_tokenizer(tokenizer_dir, 32)

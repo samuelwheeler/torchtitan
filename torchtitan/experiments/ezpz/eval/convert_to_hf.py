@@ -72,7 +72,8 @@ def _checkpoint_load_state_dict(
 
 
 def _prepare_hf_state_dict(
-    state_dict: dict[str, torch.Tensor], target_dtype: torch.dtype
+    state_dict: dict[str, torch.Tensor], target_dtype: torch.dtype,
+    dtype_overrides: dict[str, torch.dtype] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Cast and pack tensors for safetensors serialization.
 
@@ -82,8 +83,9 @@ def _prepare_hf_state_dict(
     so a lower-precision export does not first duplicate the full checkpoint
     in FP32.
     """
+    dtype_overrides = dtype_overrides or {}
     return {
-        key: value.to(dtype=target_dtype).contiguous()
+        key: value.to(dtype=dtype_overrides.get(key, target_dtype)).contiguous()
         for key, value in state_dict.items()
     }
 
@@ -189,7 +191,10 @@ def convert_to_hf(
     # Map to the export dtype and materialize adapter-produced tensor views.
     # safetensors rejects non-contiguous views (notably transposed MoE experts).
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
-    hf_state_dict = _prepare_hf_state_dict(hf_state_dict, target_dtype)
+    dtype_overrides = getattr(sd_adapter, "hf_dtype_overrides", lambda: {})()
+    hf_state_dict = _prepare_hf_state_dict(
+        hf_state_dict, target_dtype, dtype_overrides
+    )
 
     dcp.save(
         hf_state_dict,

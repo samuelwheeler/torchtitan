@@ -2,6 +2,7 @@ import re
 from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.utils import MoEStateDictAdapter
@@ -40,6 +41,54 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
         self._is_cos_sin = False
         self.num_layers = len(model_config.layers)
         self.num_experts = model_config.layers[0].moe.num_experts
+        from torchtitan.models.common.feed_forward import FeedForward
+        from . import _LegacyInterleavedColumnParallelLinear
+
+        self._interleaved_keys = {
+            f"{fqn}.w13.{name}"
+            for fqn, config, _, _ in model_config.traverse(FeedForward.Config)
+            if isinstance(config.w13, _LegacyInterleavedColumnParallelLinear.Config)
+            for name in ("weight", "bias")
+        }
+
+    def _split_stacked_linear(self, state_dict, *, fused_key, logical_keys, dim):
+        if fused_key not in self._interleaved_keys:
+            return super()._split_stacked_linear(
+                state_dict, fused_key=fused_key, logical_keys=logical_keys, dim=dim
+            )
+        if fused_key not in state_dict:
+            return
+        tensor = state_dict.pop(fused_key)
+        if isinstance(tensor, DTensor):
+            self._stacked_linear_sharding[fused_key] = (
+                tensor.device_mesh, tensor.placements
+            )
+            tensor = tensor.redistribute(
+                tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+            )
+        # Native shared FFNs alternate gate/up rows in a [2F, D] parameter.
+        projections = tensor.unflatten(0, (-1, 2)).unbind(1)
+        state_dict.update(zip(logical_keys, projections, strict=True))
+
+    def _stack_logical_linears(self, state_dict, *, fused_key, logical_keys, dim):
+        if fused_key not in self._interleaved_keys:
+            return super()._stack_logical_linears(
+                state_dict, fused_key=fused_key, logical_keys=logical_keys, dim=dim
+            )
+        if not all(key in state_dict for key in logical_keys):
+            return
+        fused = torch.stack([state_dict.pop(key) for key in logical_keys], dim=1)
+        fused = fused.flatten(0, 1)
+        if fused_key in self._stacked_linear_sharding:
+            mesh, placements = self._stacked_linear_sharding[fused_key]
+            fused = fused.redistribute(mesh, placements)
+        state_dict[fused_key] = fused
+
+    def hf_dtype_overrides(self):
+        return {
+            f"model.layers.{layer}.mlp.expert_bias": torch.float32
+            for layer in range(self.num_layers)
+        }
 
     @dtensor_safe
     def _permute(self, weight, num_heads, output_dim=None):
@@ -269,11 +318,8 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
         )
 
     def validate_hf_assets(self):
-        from pathlib import Path
+        from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import (
+            validate_tokenizer,
+        )
 
-        if self.hf_assets_path is None or not (
-            Path(self.hf_assets_path) / "tokenizer.model"
-        ).is_file():
-            raise FileNotFoundError(
-                "AGPT MoE export requires hf_assets_path/tokenizer.model"
-            )
+        validate_tokenizer(self.hf_assets_path, self.model_config.vocab_size)
