@@ -1086,16 +1086,9 @@ def model_registry(
     if flavor in ("2B_50K", "2b_50k"):
         from dataclasses import fields
 
-        from .hf_state_dict_adapter import AGPTDenseStateDictAdapter
+        from .hf_state_dict_adapter import AGPTDense50KModel
 
-        class _Dense50KModel(AgptModel):
-            state_dict_adapter_cls = AGPTDenseStateDictAdapter
-
-            @dataclass(kw_only=True, slots=True)
-            class Config(AgptModel.Config):
-                pass
-
-        return _Dense50KModel.Config(
+        return AGPTDense50KModel.Config(
             **{field.name: getattr(config, field.name) for field in fields(config)}
         )
     return config

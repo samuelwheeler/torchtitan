@@ -1,4 +1,5 @@
 import json
+import pickle
 from dataclasses import fields
 
 import pytest
@@ -14,6 +15,7 @@ from torchtitan.experiments.ezpz.eval.convert_to_hf import convert_to_hf
 
 def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
     config = agpt.model_registry("2b_50k")
+    assert pickle.loads(pickle.dumps(type(config))) is type(config)
     adapter = AGPTDenseStateDictAdapter(config, tokenizer_dir)
     adapter.write_hf_assets(tmp_path, "bfloat16")
     hf_config = json.loads((tmp_path / "config.json").read_text())

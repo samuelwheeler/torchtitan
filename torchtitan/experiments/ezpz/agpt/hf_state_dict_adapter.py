@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from torchtitan.experiments.ezpz.eval.hf_tokenizer import (
@@ -6,6 +7,7 @@ from torchtitan.experiments.ezpz.eval.hf_tokenizer import (
     write_tokenizer_assets,
 )
 
+from .model import AgptModel
 from .state_dict_adapter import AgptStateDictAdapter
 
 
@@ -46,3 +48,11 @@ class AGPTDenseStateDictAdapter(AgptStateDictAdapter):
         (Path(output_dir) / "config.json").write_text(
             json.dumps(config, indent=2) + "\n"
         )
+
+
+class AGPTDense50KModel(AgptModel):
+    state_dict_adapter_cls = AGPTDenseStateDictAdapter
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(AgptModel.Config):
+        pass
