@@ -34,8 +34,8 @@ def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
 def test_dense_dcp_hf_weights_and_logits(layout, tmp_path, tokenizer_dir, monkeypatch):
     template = agpt.model_registry("2b_50k")
     small = agpt._build_agpt_config(
-        dim=8, n_layers=1, n_heads=2, n_kv_heads=1, rope_theta=50000,
-        vocab_size=32, hidden_dim=16, max_context_length=16,
+        dim=16, n_layers=1, n_heads=4, n_kv_heads=2, rope_theta=50000,
+        vocab_size=32, hidden_dim=32, max_context_length=16,
     )
     config = type(template)(**{f.name: getattr(small, f.name) for f in fields(small)})
     monkeypatch.setattr(agpt, "model_registry", lambda flavor: config)

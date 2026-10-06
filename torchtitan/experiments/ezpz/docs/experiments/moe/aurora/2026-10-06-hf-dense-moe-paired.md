@@ -49,3 +49,13 @@ the eight-document MoE HF smoke is insufficient for a model-quality comparison.
 Initial submission `8907124` stayed queued because the user's debug-scaling
 running-job limit was reached. It was cancelled while queued and replaced by
 the one-node debug layout, preserving all evaluation settings.
+
+Job `8907144` stopped during module initialization because `set -u` exposed
+an optional module-system variable. Moving nounset after module loading fixed
+the launcher. Job `8907155` exported all 219 dense HF tensors exactly, then
+stopped at the numerical check before any benchmark scoring. The validation
+helper had loaded historical logical projections without restoring their
+packed native counterparts; GQA splitting can produce copies. The reference
+loader now explicitly repacks and strictly loads them. Dense CPU tests also
+cover multiple KV groups (three checks passed). The complete dense HF export
+is reused by the replacement job.
