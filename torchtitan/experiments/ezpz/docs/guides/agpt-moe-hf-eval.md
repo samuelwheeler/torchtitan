@@ -78,7 +78,8 @@ allocation:
 
 ```bash
 python -m pytest torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_*.py \
-  torchtitan/experiments/ezpz/tests/moe/test_convert_to_hf_output.py
+  torchtitan/experiments/ezpz/tests/moe/test_convert_to_hf_output.py \
+  torchtitan/experiments/ezpz/tests/moe/test_dense_hf_conversion.py
 ```
 
 ## Validation
@@ -92,3 +93,10 @@ All paths produced the same final-token top-10. The seven-task commonsense
 smoke completed 176 likelihood requests over eight documents per task.
 See the [review-fix validation report](../experiments/moe/aurora/2026-10-06-hf-export-review-fixes.md)
 for source SHA, runtime versions, artifacts, and the initial test-fixture failure.
+
+Job `8907189` completed all seven full evaluation splits for the matched dense
+and MoE step-27000 checkpoints, with 20,465 documents per model and identical
+HF settings and tokenizer assets. MoE's equal-task mean was 54.41% versus
+51.68% for dense; its document-weighted gain was +4.23 percentage points.
+See the [full paired HF report](../experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md)
+for per-task scores, paired statistics and dense conversion validation.

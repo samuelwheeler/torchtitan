@@ -43,8 +43,82 @@ Submission records, helpers and CPU logs:
 
 ## Results
 
-Compute evaluation pending. The previous native-model results are a reference;
-the eight-document MoE HF smoke is insufficient for a model-quality comparison.
+Job `8907189` completed on `x4112c4s4b0n0` with `job_state=F`,
+`Exit_status=0`, and PBS walltime **49m38s**. The checkout was clean and pinned
+to `4e6f3c99dd8665ad178c81d178b1cda9efae59d9`. All 14 model/task evaluations
+finished: **20,465 documents per model**, or 40,930 model/document records.
+
+Scores are percentages; deltas are MoE minus dense in percentage points.
+`acc_norm` is length-normalized multiple-choice accuracy; BoolQ and Winogrande
+use ordinary `acc`.
+
+| Task | Documents | Metric | Dense 2B | MoE 12B2A | Delta (pp) | Exact McNemar p |
+|---|---:|---|---:|---:|---:|---:|
+| HellaSwag | 10,042 | acc_norm | 56.33 | 63.35 | +7.02 | 2.67e-98 |
+| ARC-Easy | 2,376 | acc_norm | 54.59 | 56.73 | +2.15 | 0.0299 |
+| ARC-Challenge | 1,172 | acc_norm | 28.92 | 31.66 | +2.73 | 0.0416 |
+| Winogrande | 1,267 | acc | 56.04 | 59.83 | +3.79 | 0.0199 |
+| PIQA | 1,838 | acc_norm | 73.12 | 75.84 | +2.72 | 0.000606 |
+| OpenBookQA | 500 | acc_norm | 33.40 | 35.00 | +1.60 | 0.332 |
+| BoolQ | 3,270 | acc | 59.33 | 58.44 | -0.89 | 0.476 |
+| **Equal-task mean** | — | — | **51.68** | **54.41** | **+2.73** | — |
+| **Document-weighted mean** | **20,465** | — | **55.97** | **60.20** | **+4.23** | **4.05e-41** |
+
+MoE has higher point accuracy on six of seven tasks. The document-weighted
+gain has a paired normal-approximation 95% confidence interval of
+**+3.61 to +4.84 percentage points**. There are 2,517 examples where only MoE
+is correct and 1,652 where only dense is correct. HellaSwag supplies 10,042
+of 20,465 examples; the equal-task mean gives each task equal weight.
+Per-task p-values are two-sided and unadjusted for multiple comparisons.
+
+## Conversion and comparison validation
+
+The dense HF export contains **219 tensors**, all exactly equal to the DCP
+after the requested BF16 cast and layout/RoPE transformations. On a fixed
+64-token CPU input, native versus stock HF Llama logits have relative RMS
+error **1.1917%**, cosine **0.9997004**, and top-1 agreement **61/64 (95.3125%)**.
+These pass the preselected 2% RMS, 0.999 cosine and 95% top-1 gates. MoE uses
+the real-checkpoint export validated in
+[job 8907019](2026-10-06-hf-export-review-fixes.md).
+
+All paired document IDs, document/prompt/target hashes and filters match.
+Task configurations, versions/hashes, counts, special-token IDs, runtime
+versions and seeds match. Checkpoint paths are excluded from task metadata
+comparison, and serialized function memory addresses are normalized.
+The SentencePiece model, tokenizer configuration and special-token map are
+byte-identical. SentencePiece SHA-256:
+`9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347`.
+
+Converter/reference Torch: `2.13.0.dev20260430+xpu`; HF inference Torch:
+`2.10.0a0+git449b176`, Transformers `4.57.6`, lm-eval `0.4.10`.
+After the pinned run, `0eeb83681` moved the dense export model to module scope
+for stable configuration class identity. Three dense regression cases passed
+again, covering class serialization, full shapes, both DCP layouts, exact
+FP32 weights and native/HF logits. Full-config pickle serialization also
+encounters preexisting initializer closures; only class serialization is tested.
+
+## Artifacts
+
+Under `outputs/evals/pair-step27000/hf-full/8907189/`:
+
+- `pair-summary.json` / `.md`: full-precision metrics and paired statistics,
+  using the existing summarizer from the earlier evaluation checkout.
+- `validation/pair-identity.json`: comparison identities/settings, tokenizer
+  hashes, counts and summarizer source hash.
+- `validation/dense-validation.json`, `.log` and `dense-logits.pt`: numerical
+  and checkpoint checks; `validation/pbs-terminal.json`: scheduler evidence.
+- `{dense,moe}/<task>/results/`: original harness results and per-example logs;
+  `<task>/results.json`: normalized copy for paired statistics.
+- `dense/hf`: link to the complete dense export from job `8907155`;
+  `moe/hf`: link to the validated export from job `8907019`.
+
+Submission records, PBS script, launch log (`pbs-reference-fixed.log`),
+post-processing helper and CPU logs are under
+`outputs/evals/pair-step27000/hf-full-validation/`, outside tracked PR source.
+The requested seven-task evaluation gate is complete. Integration with
+current `origin/ezpz` remains a separate PR gate.
+
+## Earlier attempts
 
 Initial submission `8907124` stayed queued because the user's debug-scaling
 running-job limit was reached. It was cancelled while queued and replaced by
@@ -52,8 +126,9 @@ the one-node debug layout, preserving all evaluation settings.
 
 Job `8907144` stopped during module initialization because `set -u` exposed
 an optional module-system variable. Moving nounset after module loading fixed
-the launcher. Job `8907155` exported all 219 dense HF tensors exactly, then
-stopped at the numerical check before any benchmark scoring. The validation
+the launcher. Job `8907155` exported all 219 dense HF tensors exactly after
+BF16 conversion, then stopped at the numerical check before any benchmark
+scoring. The validation
 helper had loaded historical logical projections without restoring their
 packed native counterparts; GQA splitting can produce copies. The reference
 loader now explicitly repacks and strictly loads them. Dense CPU tests also

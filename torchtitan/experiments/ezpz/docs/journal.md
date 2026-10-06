@@ -6,8 +6,26 @@ Running log of what's happening, session by session. Most recent first.
 
 - Added the dense `2b_50k` export and HF pipeline selection, shared Llama
   tokenizer assets, explicit evaluation context and seed settings.
-- Nine focused CPU checks passed, including both dense DCP layouts and
-  native/HF logits. Full paired seven-task compute evaluation is pending.
+- Nine focused CPU checks passed. The dense model was then moved to module
+  scope for stable configuration class identity; all three dense cases passed
+  again, including both DCP layouts and native/HF logits.
+- Job `8907189`, pinned to `4e6f3c99d`, completed on `x4112c4s4b0n0`:
+  `job_state=F`, `Exit_status=0`, walltime 49m38s. All seven zero-shot HF tasks
+  completed for both step-27000 checkpoints (20,465 documents/model).
+- All 219 dense HF tensors matched the source after BF16 conversion and
+  mapping. Native/HF relative RMS was 1.1917%, cosine 0.9997004, top-1 61/64.
+- Paired document/prompt/target hashes, settings and tokenizer assets matched.
+  MoE led six tasks: equal-task mean 54.41% vs 51.68%; document-weighted
+  60.20% vs 55.97%, gain +4.23pp (paired 95% CI +3.61 to +4.84pp).
+- Job `8907124` was cancelled while queued at the debug-scaling user limit;
+  `8907144` failed module initialization, and `8907155` exported successfully
+  but stopped on an incorrect native reference loader. Both launcher/reference
+  issues were fixed before the successful run; failed artifacts are preserved.
+- Artifacts: `outputs/evals/pair-step27000/hf-full/8907189/`, including paired
+  statistics, identity checks and scheduler terminal evidence. Launch records
+  and CPU logs: `outputs/evals/pair-step27000/hf-full-validation/`.
+- Evaluation gate closed; integration with current `origin/ezpz` remains a
+  separate PR gate.
 - [Run plan and results](experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md).
 
 ## 2026-10-06 — MoE HF export review fixes and real-checkpoint validation
