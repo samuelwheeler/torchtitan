@@ -10,12 +10,23 @@ Running log of what's happening, session by session. Most recent first.
 - All 180 CPU cases passed. New checks cover concurrent writers, interrupted
   exports, static dense assets, independent mappings and pinned-source guards.
 - Evidence: `outputs/evals/moe-12b2a-step27000/pr-review-fixes/`.
-  [Report and compute plan](experiments/moe/aurora/2026-10-06-hf-export-pr-feedback.md).
+  [Validation report](experiments/moe/aurora/2026-10-06-hf-export-pr-feedback.md).
 - Job `8907545` passed both two-rank cases and published the MoE export, then
   failed the new wrapper validation on a training-only `ezpz` import in the
   inference runtime (exit 1, 7m01s). Direct standard-library validation and an
   isolated-runtime regression fix that dependency. Failed artifacts retained.
-- Next gate: rerun one-node Aurora conversion/evaluation regression, then update PR.
+- Job `8907576`, pinned to `a800018fd`, passed on `x4013c7s4b0n0`:
+  `job_state=F`, `Exit_status=0`, walltime 25m35s. Both two-rank cases and fresh
+  dense/MoE conversion plus seven-task smokes passed (56 documents/model);
+  document/prompt/target hashes and settings matched.
+- All 2,859 MoE and 219 dense tensors exactly match the earlier validated
+  exports; model/tokenizer assets are equivalent and MoE model syntax trees
+  are identical. All 24 FP32 routing biases remain exact. Native/Sonic relative
+  RMS is 0.449% / 0.536%, with unchanged top-1 agreement and final-token top-10.
+- Artifacts: `outputs/evals/moe-12b2a-step27000/pr-feedback-validation/`;
+  submission digests and terminal scheduler evidence in `pr-review-fixes/`.
+- Validation gate closed; issue 5 is deferred. PR #63 contains the correctness
+  fixes and accompanying validation evidence.
 
 ## 2026-10-06 -- MoE HF export PR preparation
 

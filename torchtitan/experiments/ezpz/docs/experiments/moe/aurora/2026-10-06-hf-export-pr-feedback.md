@@ -52,18 +52,42 @@ A regression runs the wrapper validation with site packages and dependency
 paths disabled. The failed job, complete export and terminal evidence are
 retained in the ignored artifacts.
 
-## Compute validation plan
+## Compute validation
 
-Use one Aurora debug node and a clean pinned checkout. Re-run both two-rank
-DTensor cases, export the same real dense and Sonic step-27000 checkpoints,
-and run eight documents from each of the seven tasks for each model through
-the existing wrapper. Settings: BF16, batch one, context 2048, zero shots,
-seeds `1234,1234,1234,1234`.
+Aurora debug job `8907576` ran on `x4013c7s4b0n0`, pinned to
+`a800018fdee8d03b759ac43487cd1e711ed9f04f`. Terminal evidence:
+`job_state=F`, `Exit_status=0`, walltime 25m35s. Both two-rank DTensor cases
+passed again. The existing wrapper freshly converted both real step-27000
+checkpoints and evaluated eight documents from each of the seven tasks for
+each model (56 documents and 176 likelihood requests per model). Settings:
+BF16, batch one, context 2048, zero shots, seeds `1234,1234,1234,1234`.
+Document/prompt/target hashes and task settings matched between models.
 
-Compare every exported tensor and HF asset against the previously validated
-exports from jobs `8907019` (MoE) and `8907155` (dense). Recheck the MoE native
-and Sonic logit references and all 24 exact FP32 routing biases. The full
-20,465-document paired benchmark remains the
-[existing result](2026-10-06-hf-dense-moe-paired.md); these are regression smokes.
+The MoE native/Sonic comparisons passed on the same 64-token input:
 
-Compute validation is pending.
+| Reference | Relative RMS | Cosine | Top-1 agreement |
+|---|---:|---:|---:|
+| Current native | 0.449% | 0.9997712 | 96.875% |
+| Frozen Sonic | 0.536% | 0.9997684 | 98.438% |
+
+Both references produced the same final-token top-10. All 24 loaded routing
+biases were exact FP32 matches to the source checkpoint.
+
+Every exported tensor matched the previously validated exports exactly in
+value, shape and dtype: 2,859 MoE tensors from job `8907019` and 219 dense
+tensors from the export used by job `8907189` (created in `8907155`). Model and
+tokenizer JSON assets matched, SentencePiece bytes matched, and the MoE model
+and configuration Python files had identical syntax trees. The inference
+implementation is unchanged, so these export/publication fixes preserve the
+artifacts used for the [full paired benchmark](2026-10-06-hf-dense-moe-paired.md).
+The bounded evaluations are regression checks, not replacement benchmark scores.
+
+Run artifacts are under
+`outputs/evals/moe-12b2a-step27000/pr-feedback-validation/hf-export-runs/8907576/`:
+`validation/{comparisons,routing-bias,export-equality,smoke-identity}.json`,
+`validation/dtensor-tests.log`, `hf/`, `dense/hf/`, and both `results/` trees.
+Submission inputs, script/helper SHA256 digests, terminal scheduler evidence,
+CPU and pre-commit logs remain under `pr-review-fixes/`. The scripts and large
+artifacts remain ignored and are excluded from the PR.
+
+Validation is complete. Expert-dispatch optimization remains deferred.

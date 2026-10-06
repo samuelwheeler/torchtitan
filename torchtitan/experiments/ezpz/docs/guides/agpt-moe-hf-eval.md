@@ -87,9 +87,7 @@ excludes experiment paths. On Aurora, run the two-rank CPU cases inside a PBS
 allocation:
 
 ```bash
-python -m pytest torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_*.py \
-  torchtitan/experiments/ezpz/tests/moe/test_convert_to_hf_output.py \
-  torchtitan/experiments/ezpz/tests/moe/test_dense_hf_conversion.py
+python -m pytest torchtitan/experiments/ezpz/tests/moe
 ```
 
 ## Validation
@@ -110,3 +108,8 @@ HF settings and tokenizer assets. MoE's equal-task mean was 54.41% versus
 51.68% for dense; its document-weighted gain was +4.23 percentage points.
 See the [full paired HF report](../experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md)
 for per-task scores, paired statistics and dense conversion validation.
+
+Job `8907576` reran fresh dense/MoE conversion and seven-task smokes after the
+PR feedback fixes. Every exported tensor and model/tokenizer asset matched the
+previously validated artifacts. See the [PR feedback validation report](../experiments/moe/aurora/2026-10-06-hf-export-pr-feedback.md)
+for atomic publication, source-pinning, independent-test and runtime checks.
