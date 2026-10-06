@@ -6,7 +6,10 @@ Running log of what's happening, session by session. Most recent first.
 
 - Integrated Sam's current `ezpz` base `d4449ba0e` in `c1c2847cc`, preserving
   both journal entries. The branch is no longer behind the target base.
-- All 23 focused CPU checks passed after integration; the two distributed
+- All 27 focused CPU checks passed after integration (23 converter/model/schema
+  cases plus four retained JSON config registrations on the meta device).
+  Initial config imports lacked existing Grain/renderers dependencies; an
+  isolated no-deps overlay resolved them without changing Torch. The two distributed
   DTensor checks and full paired HF evaluation already passed in jobs
   `8907019` / `8907189`. The upstream RL changes do not alter the evaluated
   HF implementation.

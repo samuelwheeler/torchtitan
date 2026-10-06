@@ -140,9 +140,14 @@ The requested seven-task evaluation gate is complete.
 Sam Foreman's `ezpz` base `d4449ba0ec254449b874ebc1b114fa84f66200f2` was
 integrated in `c1c2847cc`. The only conflict was the journal; both entries
 were preserved. The upstream changes concern RL transport, so the evaluated
-HF implementation is unaffected. All **23 focused CPU tests passed** after
-integration, including the existing dense converter schema cases; shell syntax
-checks also passed. The two distributed DTensor cases passed in job `8907019`.
+HF implementation is unaffected. All **27 focused CPU tests passed** after
+integration: 23 converter/model/schema cases and four retained JSON config
+registrations checked on the meta device. The latter initially failed on
+missing Grain/renderers imports in the evaluation environment; an isolated
+`--no-deps` overlay supplied those existing training dependencies, preserving
+the Torch installation. Both failed attempts and the successful rerun are
+logged in the readiness directory. Shell syntax checks also passed. The two
+distributed DTensor cases passed in job `8907019`.
 Commit `da71a884f` adds standard license headers; Python syntax-tree comparison
 confirmed that these additions preserve executable code.
 
