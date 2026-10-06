@@ -10,6 +10,24 @@ Both checkpoints consumed 169,869,312,000 training tokens and use the frozen
 The dense FFN width is 10496. The MoE has 36 routed experts of width 2112,
 top-3 selection and shared width 4224.
 
+## PR validation note
+
+The HF conversion and existing lm-eval workflow were validated on Aurora with
+matched dense 2B and MoE 12B2A step-27000 checkpoints, each trained on 169.9B
+tokens. Both completed all seven zero-shot benchmarks (20,465 documents per
+model) using the same tokenizer, HF backend, BF16 weights, batch size 8,
+context length 2048 and seeds. Paired document/prompt/target hashes and task
+settings matched; job `8907189` exited successfully.
+
+MoE scored higher on six of seven tasks. The equal-task mean was **54.41%
+versus 51.68%** for dense (**+2.73 percentage points**); the document-weighted
+mean was **60.20% versus 55.97%** (**+4.23 points**, paired 95% CI
+**+3.61 to +4.84**). HellaSwag showed the largest gain (+7.02 points), while
+dense led BoolQ by 0.89 points. These means use `acc_norm` where available and
+`acc` otherwise. The dense export also passed exact checks of all 219 tensors
+after BF16 casting and checkpoint mapping, native/HF logit checks and focused
+regression tests. Per-task scores, source SHA and artifacts are recorded below.
+
 ## Implementation and checks
 
 `convert_and_eval.sh --model 2b_50k` selects the dense baseline, derives its
