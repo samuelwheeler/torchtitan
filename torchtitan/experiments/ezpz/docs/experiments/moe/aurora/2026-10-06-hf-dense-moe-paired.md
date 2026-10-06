@@ -27,8 +27,9 @@ exact FP32 exported weights, and native/HF logits. Nine focused tests passed.
   1234; per-example logs for identity checks and paired statistics.
 - Converter: existing Torch 2.13 venv; inference: frameworks 2025.3.1 with
   Transformers 4.57.6 and lm-eval 0.4.10.
-- Two debug-scaling nodes; one arm per node and one task per tile. PBS launch
-  artifacts and validation helpers stay under ignored outputs.
+- One debug node; six tiles per model. Each tile handles one task, except
+  OpenBookQA and BoolQ share a tile sequentially. PBS launch artifacts and
+  validation helpers stay under ignored outputs.
 
 Inputs, relative to `/lus/flare/projects/AuroraGPT/sww/new_tt_aurora`:
 
@@ -44,3 +45,7 @@ Submission records, helpers and CPU logs:
 
 Compute evaluation pending. The previous native-model results are a reference;
 the eight-document MoE HF smoke is insufficient for a model-quality comparison.
+
+Initial submission `8907124` stayed queued because the user's debug-scaling
+running-job limit was reached. It was cancelled while queued and replaced by
+the one-node debug layout, preserving all evaluation settings.
