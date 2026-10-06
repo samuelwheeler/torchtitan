@@ -17,6 +17,7 @@ def test_dcp_to_hf_preserves_mapping_and_bias(
 
     monkeypatch.setattr(moe, "model_registry", lambda flavor: tiny_moe_config)
     model = tiny_moe_config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
     source = model.state_dict()
     source["layers.0.moe.expert_bias_E"].copy_(torch.tensor([0.001003, 0.001004]))
     adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)

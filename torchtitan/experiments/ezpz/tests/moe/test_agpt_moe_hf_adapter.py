@@ -85,6 +85,7 @@ def test_legacy_checkpoint_schema_rejects_extra_model_keys(tiny_moe_config):
 
 def test_current_fused_native_round_trip_and_shared_forward(tiny_moe_config):
     model = tiny_moe_config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
     source = model.state_dict()
     adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     hf = adapter.to_hf(source)
