@@ -2,6 +2,14 @@
 
 Running log of what's happening, session by session. Most recent first.
 
+## 2026-10-06 — Matched dense/MoE HF evaluation
+
+- Added the dense `2b_50k` export and HF pipeline selection, shared Llama
+  tokenizer assets, explicit evaluation context and seed settings.
+- Nine focused CPU checks passed, including both dense DCP layouts and
+  native/HF logits. Full paired seven-task compute evaluation is pending.
+- [Run plan and results](experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md).
+
 ## 2026-10-06 — MoE HF export review fixes and real-checkpoint validation
 
 - Fixed interleaved shared-expert mapping in both directions, preserved FP32

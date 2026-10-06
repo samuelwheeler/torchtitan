@@ -24,6 +24,8 @@ CONVERT_PYTHON="${CONVERT_PYTHON:-python3}"
 CONVERT_PYTHONPATH="${CONVERT_PYTHONPATH:-${PYTHONPATH:-}}"
 LM_EVAL_PYTHON="${LM_EVAL_PYTHON:-}"
 DEVICE="${DEVICE:-xpu:0}"
+MAX_LENGTH=""
+SEED="0,1234,1234,1234"
 LIMIT=""
 # `--ckpt-name` overrides the auto-derived "agpt-${MODEL}-sophiag-olmo-mix-1124-n256-gbs3072"
 # checkpoint name. Use this for v2 runs (e.g. n256-gbs6144 or n512-gbs12288).
@@ -49,6 +51,8 @@ while [[ $# -gt 0 ]]; do
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --num-fewshot) NUM_FEWSHOT="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
+        --max-length) MAX_LENGTH="$2"; shift 2 ;;
+        --seed) SEED="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         --ckpt-name) CKPT_NAME_OVERRIDE="$2"; shift 2 ;;
         --repo-root) REPO_ROOT_OVERRIDE="$2"; shift 2 ;;
@@ -61,7 +65,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$MODEL" || -z "$STEP" ]]; then
-    echo "Usage: $0 --model {2b|20b|12b2a} --step STEP [--dcp-dir DIR] [--tokenizer-dir DIR]"
+    echo "Usage: $0 --model {2b|20b|2b_50k|12b2a} --step STEP [--dcp-dir DIR] [--tokenizer-dir DIR]"
     exit 1
 fi
 
@@ -85,8 +89,7 @@ HF_DIR="${OUTPUT_ROOT}/hf"
 RESULTS_DIR="${OUTPUT_ROOT}/results"
 
 # HF config for this model size
-# Dense models use vLLM; the custom AGPT MoE uses the existing HF lm-eval
-# backend so its remote-code model preserves routing and shared-expert semantics.
+# The data-matched dense and MoE models share the HF evaluation backend.
 MODEL_NAME="experiments.ezpz.agpt"
 MODEL_FLAVOR="${MODEL}"
 HF_CONFIG="${EVAL_DIR}/configs/agpt_${MODEL}_config.json"
@@ -95,14 +98,16 @@ if [[ "$MODEL" == "2b" ]]; then
     TP=1
 elif [[ "$MODEL" == "20b" ]]; then
     TP=12
-elif [[ "$MODEL" == "12b2a" ]]; then
+elif [[ "$MODEL" == "2b_50k" || "$MODEL" == "12b2a" ]]; then
     TP=1
-    MODEL_NAME="experiments.ezpz.moe"
-    MODEL_FLAVOR="AGPT_2B_50K_MOE_sdpa_aurora_full_sonic"
+    if [[ "$MODEL" == "12b2a" ]]; then
+        MODEL_NAME="experiments.ezpz.moe"
+        MODEL_FLAVOR="AGPT_2B_50K_MOE_sdpa_aurora_full_sonic"
+    fi
     HF_CONFIG=""
     EVAL_BACKEND="hf"
     if [[ "$EVAL_ONLY" != true && -z "$TOKENIZER_DIR_OVERRIDE" ]]; then
-        echo "ERROR: MoE conversion requires --tokenizer-dir with the training tokenizer"
+        echo "ERROR: ${MODEL} conversion requires --tokenizer-dir with the training tokenizer"
         exit 1
     fi
 else
@@ -135,7 +140,7 @@ if [[ "$EVAL_ONLY" != true ]]; then
         exit 1
     fi
     REQUIRED_TOKENIZER_FILES=(tokenizer.model)
-    if [[ "$MODEL" != "12b2a" ]]; then
+    if [[ -n "$HF_CONFIG" ]]; then
         REQUIRED_TOKENIZER_FILES+=(
             tokenizer.json tokenizer_config.json special_tokens_map.json
         )
@@ -168,7 +173,7 @@ if [[ "$EVAL_ONLY" != true ]]; then
     # ---- Step 2: Copy config + tokenizer into HF dir ----
     echo ""
     echo "[2/3] Copying config.json and tokenizer files..."
-    if [[ "$MODEL" != "12b2a" ]]; then
+    if [[ -n "$HF_CONFIG" ]]; then
         cp "${HF_CONFIG}" "${HF_DIR}/config.json"
         cp "${TOKENIZER_DIR}/tokenizer.json" "${HF_DIR}/"
         cp "${TOKENIZER_DIR}/tokenizer.model" "${HF_DIR}/"
@@ -201,23 +206,30 @@ if [[ "$CONVERT_ONLY" != true ]]; then
     fi
 
     if [[ "$EVAL_BACKEND" == "hf" ]]; then
+        MODEL_ARGS="pretrained=${HF_DIR},dtype=${EXPORT_DTYPE},trust_remote_code=True"
+        if [[ -n "$MAX_LENGTH" ]]; then
+            MODEL_ARGS+=",max_length=${MAX_LENGTH}"
+        fi
         "${EVAL_COMMAND[@]}" \
             --model hf \
-            --model_args "pretrained=${HF_DIR},dtype=${EXPORT_DTYPE},trust_remote_code=True" \
+            --model_args "${MODEL_ARGS}" \
             --device "${DEVICE}" \
             --tasks "${TASKS}" \
             --batch_size "${BATCH_SIZE}" \
             --num_fewshot "${NUM_FEWSHOT}" \
+            --seed "${SEED}" \
             --output_path "${RESULTS_DIR}" \
             "${LIMIT_ARGS[@]}" \
             --log_samples
     else
+        MODEL_ARGS="pretrained=${HF_DIR},tensor_parallel_size=${TP},dtype=auto,gpu_memory_utilization=0.8,max_model_len=${MAX_LENGTH:-4096}"
         "${EVAL_COMMAND[@]}" \
             --model vllm \
-            --model_args "pretrained=${HF_DIR},tensor_parallel_size=${TP},dtype=auto,gpu_memory_utilization=0.8,max_model_len=4096" \
+            --model_args "${MODEL_ARGS}" \
             --tasks "${TASKS}" \
             --batch_size "${BATCH_SIZE}" \
             --num_fewshot "${NUM_FEWSHOT}" \
+            --seed "${SEED}" \
             --output_path "${RESULTS_DIR}" \
             "${LIMIT_ARGS[@]}" \
             --log_samples

@@ -60,6 +60,18 @@ BF16 exports keep the persistent routing bias in FP32. Current shared experts
 are unpacked from interleaved `[2F, D]` gate/up rows, and HF import restores
 that physical layout.
 
+The matched dense baseline uses `--model 2b_50k`, the same tokenizer directory,
+and a separate output root. This selects the 24-layer, vocabulary-50304 dense
+model and writes a standard Llama HF configuration from the model registry.
+It also uses the HF evaluation backend. Plain `--model 2b` selects the separate
+12-layer Gemma-tokenizer model.
+
+For paired benchmark runs, use identical `--tasks`, `--batch-size`,
+`--num-fewshot`, `--max-length 2048`, and `--seed 1234,1234,1234,1234` for both
+models, and omit `--limit`. Per-example logs are retained by the wrapper.
+The [full paired HF report](../experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md)
+records the checkpoint identities and comparison settings.
+
 Run the focused regression suite explicitly; the upstream CPU workflow
 excludes experiment paths. On Aurora, run the two-rank CPU cases inside a PBS
 allocation:

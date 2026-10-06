@@ -2,7 +2,10 @@ import json
 import shutil
 from pathlib import Path
 
-import sentencepiece as spm
+from torchtitan.experiments.ezpz.eval.hf_tokenizer import (
+    validate_tokenizer,
+    write_tokenizer_assets,
+)
 
 from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.attention import GQAttention
@@ -120,52 +123,15 @@ def _config(model_config, export_dtype):
     }
 
 
-def validate_tokenizer(hf_assets_path, vocab_size):
-    assets = Path(hf_assets_path) if hf_assets_path is not None else None
-    if assets is None or not (assets / "tokenizer.model").is_file():
-        raise FileNotFoundError("AGPT MoE export requires hf_assets_path/tokenizer.model")
-    tokenizer = spm.SentencePieceProcessor(model_file=str(assets / "tokenizer.model"))
-    if not 0 < tokenizer.get_piece_size() <= vocab_size:
-        raise ValueError(
-            f"Tokenizer vocabulary {tokenizer.get_piece_size()} exceeds model "
-            f"vocabulary {vocab_size}"
-        )
-    if (
-        (tokenizer.unk_id(), tokenizer.bos_id(), tokenizer.eos_id()) != (0, 1, 2)
-        or [tokenizer.id_to_piece(i) for i in range(3)] != ["<unk>", "<s>", "</s>"]
-        or tokenizer.pad_id() != -1
-    ):
-        raise ValueError("AGPT MoE export requires Llama SentencePiece special tokens")
-
-
 def write_hf_assets(output_dir, model_config, hf_assets_path, export_dtype):
     validate_tokenizer(hf_assets_path, model_config.vocab_size)
     output_dir = Path(output_dir)
-    assets = Path(hf_assets_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_dir = Path(__file__).parent
     for name in ("configuration_agpt_moe.py", "modeling_agpt_moe.py"):
         shutil.copy2(source_dir / name, output_dir / name)
-    shutil.copy2(assets / "tokenizer.model", output_dir / "tokenizer.model")
     (output_dir / "config.json").write_text(
         json.dumps(_config(model_config, export_dtype), indent=2) + "\n"
     )
-    tokenizer_config = {
-        "add_bos_token": True,
-        "add_eos_token": False,
-        "bos_token": "<s>",
-        "eos_token": "</s>",
-        "unk_token": "<unk>",
-        "model_max_length": model_config.max_context_length,
-        "tokenizer_class": "LlamaTokenizer",
-    }
-    (output_dir / "tokenizer_config.json").write_text(
-        json.dumps(tokenizer_config, indent=2) + "\n"
-    )
-    (output_dir / "special_tokens_map.json").write_text(
-        json.dumps(
-            {"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>"},
-            indent=2,
-        )
-        + "\n"
-    )
+    write_tokenizer_assets(output_dir, hf_assets_path, model_config.vocab_size,
+                           model_config.max_context_length)
