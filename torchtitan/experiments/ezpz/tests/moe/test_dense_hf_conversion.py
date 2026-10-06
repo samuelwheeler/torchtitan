@@ -12,10 +12,17 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig, LlamaForCausalLM
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LlamaConfig,
+    LlamaForCausalLM,
+)
 
 from torchtitan.experiments.ezpz import agpt
-from torchtitan.experiments.ezpz.agpt.hf_state_dict_adapter import AGPTDenseStateDictAdapter
+from torchtitan.experiments.ezpz.agpt.hf_state_dict_adapter import (
+    AGPTDenseStateDictAdapter,
+)
 from torchtitan.experiments.ezpz.eval.convert_to_hf import convert_to_hf
 
 
@@ -25,8 +32,11 @@ def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
     adapter = AGPTDenseStateDictAdapter(config, tokenizer_dir)
     adapter.write_hf_assets(tmp_path, "bfloat16")
     hf_config = json.loads((tmp_path / "config.json").read_text())
-    assert (hf_config["num_hidden_layers"], hf_config["vocab_size"],
-            hf_config["intermediate_size"]) == (24, 50304, 10496)
+    assert (
+        hf_config["num_hidden_layers"],
+        hf_config["vocab_size"],
+        hf_config["intermediate_size"],
+    ) == (24, 50304, 10496)
     with torch.device("meta"):
         native = config.build()
         hf = LlamaForCausalLM(LlamaConfig(**hf_config))
@@ -42,8 +52,14 @@ def test_dense_50k_hf_config_and_full_model_shapes(tmp_path, tokenizer_dir):
 def test_dense_dcp_hf_weights_and_logits(layout, tmp_path, tokenizer_dir, monkeypatch):
     template = agpt.model_registry("2b_50k")
     small = agpt._build_agpt_config(
-        dim=16, n_layers=1, n_heads=4, n_kv_heads=2, rope_theta=50000,
-        vocab_size=32, hidden_dim=32, max_context_length=16,
+        dim=16,
+        n_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        rope_theta=50000,
+        vocab_size=32,
+        hidden_dim=32,
+        max_context_length=16,
     )
     config = type(template)(**{f.name: getattr(small, f.name) for f in fields(small)})
     monkeypatch.setattr(agpt, "model_registry", lambda flavor: config)
@@ -58,8 +74,9 @@ def test_dense_dcp_hf_weights_and_logits(layout, tmp_path, tokenizer_dir, monkey
         source = adapter.native_fused_to_logical(source)
     checkpoint, output = tmp_path / "dcp", tmp_path / "hf"
     dcp.save(source, checkpoint_id=checkpoint)
-    convert_to_hf(checkpoint, output, "experiments.ezpz.agpt", "2b_50k",
-                  tokenizer_dir, "float32")
+    convert_to_hf(
+        checkpoint, output, "experiments.ezpz.agpt", "2b_50k", tokenizer_dir, "float32"
+    )
     actual = {}
     for shard in output.glob("*.safetensors"):
         actual.update(load_file(shard))

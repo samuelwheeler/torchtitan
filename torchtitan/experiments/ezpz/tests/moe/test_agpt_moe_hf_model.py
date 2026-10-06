@@ -53,9 +53,9 @@ def test_sparse_moe_uses_bias_for_selection_but_original_unnormalized_scores():
     assert scores[0, selected].sum() < 1
     expected = moe.shared_experts(tokens.view(1, 2))
     for expert_id in selected:
-        expected = expected + moe.experts[expert_id](tokens.view(1, 2)) * scores[
-            0, expert_id
-        ]
+        expected = (
+            expected + moe.experts[expert_id](tokens.view(1, 2)) * scores[0, expert_id]
+        )
     torch.testing.assert_close(moe(tokens).view(1, 2), expected)
 
 
@@ -107,7 +107,9 @@ def test_auto_model_remote_code_round_trip(tmp_path):
     assert bf16_model.model.layers[0].mlp.expert_bias.dtype == torch.float32
     torch.testing.assert_close(
         bf16_model.model.layers[0].mlp.expert_bias,
-        model.model.layers[0].mlp.expert_bias, rtol=0, atol=0,
+        model.model.layers[0].mlp.expert_bias,
+        rtol=0,
+        atol=0,
     )
 
 
@@ -125,7 +127,9 @@ def test_native_and_hf_logits_match(tiny_moe_config, monkeypatch):
     for parameter in native.parameters():
         parameter.data = parameter.data.bfloat16()
     adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
-    hf = AGPTMoEForCausalLM(AGPTMoEConfig(**_config(tiny_moe_config, "bfloat16"))).eval()
+    hf = AGPTMoEForCausalLM(
+        AGPTMoEConfig(**_config(tiny_moe_config, "bfloat16"))
+    ).eval()
     for parameter in hf.parameters():
         parameter.data = parameter.data.bfloat16()
     hf.load_state_dict(adapter.to_hf(native.state_dict()), strict=True)
@@ -135,7 +139,9 @@ def test_native_and_hf_logits_match(tiny_moe_config, monkeypatch):
         expected = native(tokens)
         actual = hf(tokens[None], use_cache=False).logits[0]
     actual, expected = actual.float(), expected.float()
-    relative_rms = (actual - expected).square().mean().sqrt() / expected.square().mean().sqrt()
+    relative_rms = (
+        actual - expected
+    ).square().mean().sqrt() / expected.square().mean().sqrt()
     assert relative_rms < 0.02
     assert F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0) > 0.999
     assert torch.equal(actual.argmax(-1), expected.argmax(-1))

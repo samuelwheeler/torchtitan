@@ -19,7 +19,10 @@ def _round_trip(rank, init_file, shard_dim):
     from torchtitan.experiments.ezpz.tests.moe.conftest import build_tiny_moe_config
 
     dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2,
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
     )
     try:
         torch.manual_seed(23)
@@ -36,7 +39,9 @@ def _round_trip(rank, init_file, shard_dim):
         restored = adapter.from_hf(adapter.to_hf(source))[key]
         assert restored.placements == source[key].placements
         assert restored.shape == original.shape
-        torch.testing.assert_close(restored.to_local(), source[key].to_local(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            restored.to_local(), source[key].to_local(), rtol=0, atol=0
+        )
         torch.testing.assert_close(restored.full_tensor(), original, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
@@ -45,5 +50,7 @@ def _round_trip(rank, init_file, shard_dim):
 @pytest.mark.parametrize("shard_dim", [0, 1])
 def test_shared_expert_dtensor_round_trip(tmp_path, shard_dim):
     torch.multiprocessing.spawn(
-        _round_trip, args=(str(tmp_path / "gloo-init"), shard_dim), nprocs=2,
+        _round_trip,
+        args=(str(tmp_path / "gloo-init"), shard_dim),
+        nprocs=2,
     )

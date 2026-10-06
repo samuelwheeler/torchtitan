@@ -67,7 +67,8 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
         tensor = state_dict.pop(fused_key)
         if isinstance(tensor, DTensor):
             self._stacked_linear_sharding[fused_key] = (
-                tensor.device_mesh, tensor.placements
+                tensor.device_mesh,
+                tensor.placements,
             )
             tensor = tensor.redistribute(
                 tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
@@ -170,9 +171,7 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
             return None
         expected = self._legacy_keys()
         actual = {
-            key
-            for key in metadata
-            if key.startswith("layers.") or key in self._TOP_MAP
+            key for key in metadata if key.startswith("layers.") or key in self._TOP_MAP
         }
         if actual != expected:
             missing = sorted(expected - actual)
@@ -241,9 +240,9 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
             )
             if expert is not None:
                 layer, name = expert.groups()
-                logical[f"layers.{layer}.moe.routed_experts.{expert_names[name]}"] = (
-                    value.transpose(-2, -1)
-                )
+                logical[
+                    f"layers.{layer}.moe.routed_experts.{expert_names[name]}"
+                ] = value.transpose(-2, -1)
             elif key.endswith(".moe.expert_bias"):
                 logical[key.removesuffix("expert_bias") + "expert_bias_E"] = value
             else:
@@ -307,14 +306,10 @@ class AGPTMoEStateDictAdapter(MoEStateDictAdapter):
             logical[
                 f"layers.{layer}.moe.routed_experts.{projection_map[projection]}"
             ] = torch.stack([weights[index] for index in range(self.num_experts)])
-        return self._native_fused_linears_from_hf(
-            logical, fuse_routed_experts=True
-        )
+        return self._native_fused_linears_from_hf(logical, fuse_routed_experts=True)
 
     def write_hf_assets(self, output_dir, export_dtype):
-        from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import (
-            write_hf_assets,
-        )
+        from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import write_hf_assets
 
         write_hf_assets(
             output_dir,

@@ -72,7 +72,8 @@ def _checkpoint_load_state_dict(
 
 
 def _prepare_hf_state_dict(
-    state_dict: dict[str, torch.Tensor], target_dtype: torch.dtype,
+    state_dict: dict[str, torch.Tensor],
+    target_dtype: torch.dtype,
     dtype_overrides: dict[str, torch.dtype] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Cast and pack tensors for safetensors serialization.
@@ -192,9 +193,7 @@ def convert_to_hf(
     # safetensors rejects non-contiguous views (notably transposed MoE experts).
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
     dtype_overrides = getattr(sd_adapter, "hf_dtype_overrides", lambda: {})()
-    hf_state_dict = _prepare_hf_state_dict(
-        hf_state_dict, target_dtype, dtype_overrides
-    )
+    hf_state_dict = _prepare_hf_state_dict(hf_state_dict, target_dtype, dtype_overrides)
 
     dcp.save(
         hf_state_dict,

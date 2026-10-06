@@ -6,9 +6,7 @@
 
 import torch
 
-from torchtitan.experiments.ezpz.eval.convert_to_hf import (
-    _prepare_hf_state_dict,
-)
+from torchtitan.experiments.ezpz.eval.convert_to_hf import _prepare_hf_state_dict
 
 
 def test_prepare_hf_state_dict_casts_and_packs_transpose_views():
@@ -35,6 +33,7 @@ def test_prepare_hf_state_dict_packs_without_dtype_change():
 
 def test_prepare_preserves_exact_fp32_routing_bias(tiny_moe_config, tmp_path):
     from safetensors.torch import load_file, save_file
+
     from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
         AGPTMoEStateDictAdapter,
     )
@@ -43,7 +42,8 @@ def test_prepare_preserves_exact_fp32_routing_bias(tiny_moe_config, tmp_path):
     bias = torch.tensor([0.001003, 0.001004], dtype=torch.float32)
     adapter = AGPTMoEStateDictAdapter(tiny_moe_config, None)
     prepared = _prepare_hf_state_dict(
-        {key: bias, "weight": torch.ones(2)}, torch.bfloat16,
+        {key: bias, "weight": torch.ones(2)},
+        torch.bfloat16,
         adapter.hf_dtype_overrides(),
     )
     save_file(prepared, tmp_path / "model.safetensors")

@@ -37,16 +37,12 @@ class AGPTSparseMoE(nn.Module):
             raise ValueError("AGPTSparseMoE requires routing-only expert bias")
         self.top_k = config.num_experts_per_tok
         self.router_scale = config.router_scale
-        self.gate = nn.Linear(
-            config.hidden_size, config.num_local_experts, bias=False
-        )
+        self.gate = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
         self.experts = nn.ModuleList(
             AGPTExpert(config, config.moe_intermediate_size)
             for _ in range(config.num_local_experts)
         )
-        self.shared_experts = AGPTExpert(
-            config, config.shared_expert_intermediate_size
-        )
+        self.shared_experts = AGPTExpert(config, config.shared_expert_intermediate_size)
         self.register_buffer(
             "expert_bias",
             torch.zeros(config.num_local_experts, dtype=torch.float32),

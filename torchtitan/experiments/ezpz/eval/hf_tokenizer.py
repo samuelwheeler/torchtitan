@@ -45,6 +45,8 @@ def write_tokenizer_assets(output_dir, hf_assets_path, vocab_size, max_length):
     }
     (output / "tokenizer_config.json").write_text(json.dumps(config, indent=2) + "\n")
     (output / "special_tokens_map.json").write_text(
-        json.dumps({"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>"},
-                   indent=2) + "\n"
+        json.dumps(
+            {"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>"}, indent=2
+        )
+        + "\n"
     )

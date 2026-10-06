@@ -18,8 +18,19 @@ Running log of what's happening, session by session. Most recent first.
   checks passed. All PR changes stay under `experiments/ezpz/`.
 - Evidence and submission text: `outputs/evals/pair-step27000/pr-readiness/`.
   [Validation and PR note](experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md).
-- Next gate: user-run pre-commit verification, as required by the ezpz policy.
-  The generic GitHub CPU workflow does not cover these experiment tests.
+- The user authorized local pre-commit verification as an exception to the
+  ezpz policy. The formatter changed 15 Python files without changing their
+  syntax trees; all PR-file hooks passed, with the repository-wide Pyrefly
+  hook checked separately in a temporary copy.
+- The post-format CPU rerun passed all 160 cases in the MoE and retained JSON
+  launch-config suites (156 ordinary and four meta-device checks). The
+  two-rank DTensor module retains its earlier compute-node evidence.
+- Pyrefly reports identical 35 core errors on the feature/base branches in
+  this environment. Repository-wide Lychee finds one existing broken skill
+  link in `experiments/graph_trainer/AGENTS.md:300`, reproduced on the base;
+  all PR-file links pass. See the linked report and readiness logs.
+- The generic GitHub CPU workflow does not cover these experiment tests;
+  inherited repository-wide lint failures remain a CI limitation.
 
 ## 2026-10-06 — Matched dense/MoE HF evaluation
 

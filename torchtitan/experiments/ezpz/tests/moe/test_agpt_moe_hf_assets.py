@@ -5,10 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+
 import pytest
 
 from torchtitan.experiments.ezpz.eval.hf_agpt_moe.assets import (
-    validate_tokenizer, write_hf_assets,
+    validate_tokenizer,
+    write_hf_assets,
 )
 from torchtitan.experiments.ezpz.moe import model_registry
 
@@ -29,9 +31,7 @@ def test_hf_assets_are_derived_from_the_registered_model(tmp_path, tokenizer_dir
     assert hf_config["moe_intermediate_size"] == 2112
     assert hf_config["shared_expert_intermediate_size"] == 4224
     assert hf_config["rope_theta"] == 50000
-    assert hf_config["auto_map"]["AutoModelForCausalLM"].endswith(
-        "AGPTMoEForCausalLM"
-    )
+    assert hf_config["auto_map"]["AutoModelForCausalLM"].endswith("AGPTMoEForCausalLM")
     assert (output / "modeling_agpt_moe.py").is_file()
     assert (output / "configuration_agpt_moe.py").is_file()
     assert (output / "tokenizer.model").read_bytes() == (

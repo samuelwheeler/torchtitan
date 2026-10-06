@@ -156,8 +156,37 @@ CPU evidence and the prepared PR description are under
 `saforem2/torchtitan:ezpz`, with head
 `samuelwheeler:feature/aurora-moe-hf-export`. The existing GitHub CPU workflow
 excludes experiment paths and uses private PyTorch runners, so these tests
-remain manually validated. Local pre-commit verification is pending:
-[ezpz policy](../../../../AGENTS.md) assigns that check to the user.
+remain manually validated.
+
+The user explicitly authorized local pre-commit verification, overriding the
+[ezpz policy](../../../../AGENTS.md) that normally assigns it to the user.
+The configured formatter changed 15 Python files; syntax-tree comparison
+against `9289e6329` confirmed identical executable code. The PR-file hooks
+passed, including flake8, formatting, docstring checks, spelling, licenses and
+link checking. Pyrefly's repository-wide hook ran separately in a temporary
+copy because its configured `--remove-unused-ignores` can rewrite core files.
+After formatting, all **160 CPU tests** in the MoE directory and retained JSON
+launch-config suite passed (156 ordinary cases plus four meta-device factory
+checks). The two-rank DTensor module was excluded from this CPU rerun; its
+earlier compute-node results remain applicable because the formatter preserved
+the Python syntax trees.
+
+Repository-wide checks are not fully green in this Aurora environment:
+
+- Pyrefly 0.45.1 reports the same 35 errors on the feature and base branches,
+  with identical file/line diagnostics and no new errors. These concern
+  unchanged core files, missing packages such as `torch_checkpointing`, and
+  API differences with the installed Intel PyTorch build. Experiment paths
+  are excluded by the existing Pyrefly configuration.
+- Lychee 0.24.1 checked all 1,412 tracked Markdown/Python files and found one
+  broken local skill link at `torchtitan/experiments/graph_trainer/AGENTS.md:300`.
+  That file is identical on the base branch; checking it there reproduces the
+  failure. All links in the PR's changed files pass.
+
+The existing model environment was preserved. Logs, the formatter AST check,
+and the base/feature type-check comparison are in the readiness directory.
+These inherited failures must be distinguished from the passing PR-file checks
+when assessing CI readiness.
 
 ## Earlier attempts
 

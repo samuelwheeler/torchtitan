@@ -52,9 +52,12 @@ def test_legacy_sonic_to_hf_is_strict_and_transposes_experts(tiny_moe_config):
         hf["model.layers.0.mlp.experts.0.down_proj.weight"],
         source["layers.0.moe.experts.aurora_down"][0].T,
     )
-    expected_q = source["layers.0.attention.qkv_linear.wq.weight"].view(
-        2, 2, 2, 8
-    ).transpose(1, 2).reshape(8, 8)
+    expected_q = (
+        source["layers.0.attention.qkv_linear.wq.weight"]
+        .view(2, 2, 2, 8)
+        .transpose(1, 2)
+        .reshape(8, 8)
+    )
     assert torch.equal(hf["model.layers.0.self_attn.q_proj.weight"], expected_q)
 
 

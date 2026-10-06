@@ -47,8 +47,12 @@ def validate(args):
         for layer_id, layer in enumerate(model.model.layers):
             prefix = f"layers.{layer_id}.moe."
             key = next(
-                (prefix + name for name in ("expert_bias_E", "expert_bias")
-                 if prefix + name in metadata.state_dict_metadata), None
+                (
+                    prefix + name
+                    for name in ("expert_bias_E", "expert_bias")
+                    if prefix + name in metadata.state_dict_metadata
+                ),
+                None,
             )
             if key is None:
                 raise RuntimeError(f"Missing source routing bias in layer {layer_id}")
@@ -58,11 +62,21 @@ def validate(args):
         for layer, bias in zip(model.model.layers, biases.values(), strict=True):
             actual = layer.mlp.expert_bias.cpu()
             if actual.dtype != torch.float32 or not torch.equal(actual, bias):
-                raise RuntimeError("Exported routing bias differs from source FP32 bias")
-        (output / "routing-bias.json").write_text(json.dumps({
-            "layers": len(biases), "dtype": "float32", "exact_match": True,
-            "source_dcp": args.source_dcp,
-        }, indent=2) + "\n")
+                raise RuntimeError(
+                    "Exported routing bias differs from source FP32 bias"
+                )
+        (output / "routing-bias.json").write_text(
+            json.dumps(
+                {
+                    "layers": len(biases),
+                    "dtype": "float32",
+                    "exact_match": True,
+                    "source_dcp": args.source_dcp,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
     input_ids = torch.tensor(tokens, dtype=torch.long, device=args.device)[None]
     logits = model(input_ids, use_cache=False).logits.float().cpu()
     comparisons = {}
@@ -85,12 +99,11 @@ def validate(args):
             "cosine_similarity": F.cosine_similarity(
                 logits.flatten(), reference_logits.flatten(), dim=0
             ).item(),
-            "top1_agreement": (
-                logits.argmax(-1) == reference_logits.argmax(-1)
-            ).float().mean().item(),
-            "last_top10_reference": reference_logits[0, -1]
-            .topk(10)
-            .indices.tolist(),
+            "top1_agreement": (logits.argmax(-1) == reference_logits.argmax(-1))
+            .float()
+            .mean()
+            .item(),
+            "last_top10_reference": reference_logits[0, -1].topk(10).indices.tolist(),
             "last_top10_candidate": logits[0, -1].topk(10).indices.tolist(),
         }
         comparisons[path] = metrics
@@ -100,9 +113,7 @@ def validate(args):
             raise RuntimeError(f"Cosine similarity is below threshold for {path}")
         if metrics["top1_agreement"] < args.min_top1_agreement:
             raise RuntimeError(f"Top-1 agreement is below threshold for {path}")
-    (output / "comparisons.json").write_text(
-        json.dumps(comparisons, indent=2) + "\n"
-    )
+    (output / "comparisons.json").write_text(json.dumps(comparisons, indent=2) + "\n")
     torch.save({"tokens": tokens, "logits": logits}, output / "logits.pt")
     print(json.dumps(comparisons, indent=2), flush=True)
 
@@ -110,7 +121,9 @@ def validate(args):
 parser = argparse.ArgumentParser()
 parser.add_argument("--hf-checkpoint", required=True)
 parser.add_argument("--reference", required=True, action="append")
-parser.add_argument("--source-dcp", help="Verify every loaded FP32 routing bias exactly")
+parser.add_argument(
+    "--source-dcp", help="Verify every loaded FP32 routing bias exactly"
+)
 parser.add_argument("--output", required=True)
 parser.add_argument("--device", default="xpu:0")
 parser.add_argument("--max-relative-rms", type=float, default=0.02)

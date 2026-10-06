@@ -139,5 +139,9 @@ def write_hf_assets(output_dir, model_config, hf_assets_path, export_dtype):
     (output_dir / "config.json").write_text(
         json.dumps(_config(model_config, export_dtype), indent=2) + "\n"
     )
-    write_tokenizer_assets(output_dir, hf_assets_path, model_config.vocab_size,
-                           model_config.max_context_length)
+    write_tokenizer_assets(
+        output_dir,
+        hf_assets_path,
+        model_config.vocab_size,
+        model_config.max_context_length,
+    )

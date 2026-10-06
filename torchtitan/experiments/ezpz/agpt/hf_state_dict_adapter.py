@@ -49,8 +49,9 @@ class AGPTDenseStateDictAdapter(AgptStateDictAdapter):
             "tie_word_embeddings": model.enable_weight_tying,
             "torch_dtype": export_dtype,
         }
-        write_tokenizer_assets(output_dir, self.hf_assets_path, model.vocab_size,
-                               model.max_context_length)
+        write_tokenizer_assets(
+            output_dir, self.hf_assets_path, model.vocab_size, model.max_context_length
+        )
         (Path(output_dir) / "config.json").write_text(
             json.dumps(config, indent=2) + "\n"
         )
