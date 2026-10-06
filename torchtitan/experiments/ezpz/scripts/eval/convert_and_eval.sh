@@ -157,7 +157,10 @@ fi
 if [[ "$EVAL_ONLY" != true ]]; then
     echo ""
     echo "[1/3] Converting DCP checkpoint to HuggingFace format..."
-    mkdir -p "${HF_DIR}"
+    CONFIG_ARGS=()
+    if [[ -n "$HF_CONFIG" ]]; then
+        CONFIG_ARGS=(--hf_config_path "${HF_CONFIG}")
+    fi
 
     PYTHONPATH="${SCRIPT_REPO_ROOT}${CONVERT_PYTHONPATH:+:${CONVERT_PYTHONPATH}}" \
         "${CONVERT_PYTHON}" -m torchtitan.experiments.ezpz.eval.convert_to_hf \
@@ -166,22 +169,12 @@ if [[ "$EVAL_ONLY" != true ]]; then
         --hf_assets_path "${TOKENIZER_DIR}" \
         --model_name "${MODEL_NAME}" \
         --model_flavor "${MODEL_FLAVOR}" \
-        --export_dtype "${EXPORT_DTYPE}"
+        --export_dtype "${EXPORT_DTYPE}" \
+        "${CONFIG_ARGS[@]}"
 
     echo "[1/3] Conversion complete."
 
-    # ---- Step 2: Copy config + tokenizer into HF dir ----
-    echo ""
-    echo "[2/3] Copying config.json and tokenizer files..."
-    if [[ -n "$HF_CONFIG" ]]; then
-        cp "${HF_CONFIG}" "${HF_DIR}/config.json"
-        cp "${TOKENIZER_DIR}/tokenizer.json" "${HF_DIR}/"
-        cp "${TOKENIZER_DIR}/tokenizer.model" "${HF_DIR}/"
-        cp "${TOKENIZER_DIR}/tokenizer_config.json" "${HF_DIR}/"
-        cp "${TOKENIZER_DIR}/special_tokens_map.json" "${HF_DIR}/"
-    fi
-
-    echo "[2/3] Assets copied."
+    echo "[2/3] Weights and assets published together."
 else
     echo ""
     echo "[1-2/3] Skipping conversion (--eval-only)"
@@ -190,6 +183,11 @@ else
         exit 1
     fi
 fi
+
+PYTHONPATH="${SCRIPT_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${LM_EVAL_PYTHON:-${CONVERT_PYTHON}}" -c \
+    'import sys; from torchtitan.experiments.ezpz.eval.hf_export import validate_export; validate_export(sys.argv[1])' \
+    "${HF_DIR}"
 
 # ---- Step 3: Run lm-eval ----
 if [[ "$CONVERT_ONLY" != true ]]; then

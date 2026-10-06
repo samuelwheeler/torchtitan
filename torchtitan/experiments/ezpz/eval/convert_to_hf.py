@@ -9,6 +9,7 @@
 
 import argparse
 import importlib
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,11 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
 from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.experiments.ezpz.eval.hf_export import (
+    staged_export,
+    validate_export,
+    write_export_manifest,
+)
 
 
 def _checkpoint_load_state_dict(
@@ -92,13 +98,14 @@ def _prepare_hf_state_dict(
 
 
 @torch.inference_mode()
-def convert_to_hf(
+def _convert_to_hf(
     input_dir,
     output_dir,
     model_name,
     model_flavor,
     hf_assets_path,
     export_dtype,
+    hf_config_path=None,
 ):
     # load model and model args so that we can get the state dict shape
     # Support both core models (torchtitan.models.*) and experiment models
@@ -203,33 +210,57 @@ def convert_to_hf(
     write_hf_assets = getattr(sd_adapter, "write_hf_assets", None)
     if write_hf_assets is not None:
         write_hf_assets(output_dir, export_dtype)
+    elif hf_config_path is not None:
+        shutil.copy2(hf_config_path, Path(output_dir) / "config.json")
+        for name in (
+            "tokenizer.model",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ):
+            shutil.copy2(Path(hf_assets_path) / name, Path(output_dir) / name)
 
     # Provenance for the export: which flavor produced it, and therefore which
     # RoPE convention the weights are in. Without this there is no way to audit
     # an existing HF dir after the fact -- the weights look identical either way.
-    try:
-        import json
+    write_export_manifest(
+        output_dir,
+        {
+            "source_dcp": str(input_dir),
+            "model_name": model_name,
+            "model_flavor": model_flavor,
+            "rope": rope_name,
+            "export_dtype": export_dtype,
+        },
+    )
+    if write_hf_assets is not None or hf_config_path is not None:
+        validate_export(output_dir)
 
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        with open(Path(output_dir) / "ezpz_export.json", "w") as fh:
-            json.dump(
-                {
-                    "source_dcp": str(input_dir),
-                    "model_name": model_name,
-                    "model_flavor": model_flavor,
-                    "rope": rope_name,
-                    "export_dtype": export_dtype,
-                },
-                fh,
-                indent=2,
-            )
-    except OSError as exc:
-        # Provenance is a nicety; never fail a good conversion over it.
-        print(f"[convert_to_hf] WARNING: could not write ezpz_export.json: {exc}")
+
+def convert_to_hf(
+    input_dir,
+    output_dir,
+    model_name,
+    model_flavor,
+    hf_assets_path,
+    export_dtype,
+    hf_config_path=None,
+):
+    with staged_export(output_dir) as staging:
+        _convert_to_hf(
+            input_dir,
+            staging,
+            model_name,
+            model_flavor,
+            hf_assets_path,
+            export_dtype,
+            hf_config_path,
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert DCP weights to HF format.")
+    parser.add_argument("--hf_config_path", type=Path, default=None)
     parser.add_argument(
         "input_dir", type=Path, help="Input directory with DCP weights."
     )
@@ -281,4 +312,5 @@ if __name__ == "__main__":
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,
+        args.hf_config_path,
     )

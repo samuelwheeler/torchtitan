@@ -48,6 +48,16 @@ been host-tested with Transformers 4.57.6, the version in Aurora frameworks
 For conversion alone, add `--convert-only`. To evaluate an existing export,
 add `--eval-only` and use the same `--output-root`.
 
+Exports are written to a hidden staging directory beside `hf`, then published
+with an atomic rename after weights, assets and a completion manifest are
+written. A destination lock rejects concurrent converters. Existing nonempty
+exports are never overwritten; choose a fresh `--output-root` to reconvert.
+Failed staging directories are retained for inspection. The wrapper checks
+the completion manifest and every recorded file before evaluation, including
+`--eval-only`. Exports made before completion manifests were added must be
+reconverted to a fresh output root. The same publication path includes the
+static config/tokenizer assets for the older `2b` and `20b` models.
+
 The converter needs the current TorchTitan runtime (Torch 2.13 on Aurora).
 Evaluation can use a separate Python environment with Transformers 4.57.6 and
 lm-eval 0.4.10. Set `CONVERT_PYTHON` and `LM_EVAL_PYTHON` to their interpreter
