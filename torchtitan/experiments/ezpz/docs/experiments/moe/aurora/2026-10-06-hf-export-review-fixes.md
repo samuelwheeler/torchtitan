@@ -57,4 +57,9 @@ The full registered model passed a meta-device round trip with all keys and
 shapes restored. The real tokenizer and source DCP metadata also passed
 preflight checks (336 layer tensors; FP32 source routing bias).
 
-Compute submission is pending the pinned-source preflight.
+Job `8907007` ran on `x4504c0s6b0n0` at source `b024aa791`, then exited 1
+after 1m44s. The two spawned CPU test processes failed to import the fixture
+through the unqualified `conftest` module name. The pipeline correctly stopped
+before conversion. The test now imports a plain configuration factory through
+the full repository package path; the failed logs are retained under
+`outputs/evals/moe-12b2a-step27000/hf-export-runs/8907007/validation/`.

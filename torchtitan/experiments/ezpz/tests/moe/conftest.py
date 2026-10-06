@@ -13,8 +13,7 @@ from torchtitan.models.common.config_utils import make_gqa_config
 from torchtitan.models.common.rope import ComplexRoPE
 
 
-@pytest.fixture
-def tiny_moe_config():
+def build_tiny_moe_config():
     config = model_registry("AGPT_2B_50K_MOE_sdpa_aurora_full_sonic")
     config.dim, config.vocab_size, config.max_context_length = 8, 32, 16
     config.tok_embeddings.num_embeddings = 32
@@ -46,6 +45,11 @@ def tiny_moe_config():
         dim=8, hidden_dim=6, w1_param_init=init, w2w3_param_init=init,
     )
     return config
+
+
+@pytest.fixture
+def tiny_moe_config():
+    return build_tiny_moe_config()
 
 
 @pytest.fixture

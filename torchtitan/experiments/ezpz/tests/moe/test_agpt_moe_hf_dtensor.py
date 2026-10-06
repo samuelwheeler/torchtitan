@@ -10,14 +10,14 @@ from torchtitan.experiments.ezpz.moe.agpt_hf_state_dict_adapter import (
 
 
 def _round_trip(rank, init_file, shard_dim):
-    from conftest import tiny_moe_config
+    from torchtitan.experiments.ezpz.tests.moe.conftest import build_tiny_moe_config
 
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2,
     )
     try:
         torch.manual_seed(23)
-        config = tiny_moe_config.__wrapped__()
+        config = build_tiny_moe_config()
         # Five rows per rank cut through gate/up pairs in the physical layout.
         config.layers[0].moe.shared_experts.w13.out_features = 5
         config.layers[0].moe.shared_experts.w2.in_features = 5
