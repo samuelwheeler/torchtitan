@@ -24,6 +24,10 @@ are validated exactly.
 
 Run this inside the established Aurora lm-eval environment. The tokenizer
 directory must contain the `tokenizer.model` used for training.
+MoE conversion requires an explicit `--tokenizer-dir`; it has no tokenizer
+default. The exporter checks that the SentencePiece vocabulary fits the model
+and that UNK/BOS/EOS are the Llama IDs 0/1/2. These checks cannot establish
+whether a different tokenizer with the same vocabulary size matches training.
 
 ```bash
 bash torchtitan/experiments/ezpz/scripts/eval/convert_and_eval.sh \
@@ -43,6 +47,26 @@ been host-tested with Transformers 4.57.6, the version in Aurora frameworks
 
 For conversion alone, add `--convert-only`. To evaluate an existing export,
 add `--eval-only` and use the same `--output-root`.
+
+The converter needs the current TorchTitan runtime (Torch 2.13 on Aurora).
+Evaluation can use a separate Python environment with Transformers 4.57.6 and
+lm-eval 0.4.10. Set `CONVERT_PYTHON` and `LM_EVAL_PYTHON` to their interpreter
+paths, and `CONVERT_PYTHONPATH` to any converter dependency overlay. The wrapper
+adds its own checkout to the converter import path. Evaluation retains the
+calling environment's `PYTHONPATH`. `--device` selects the HF device (default
+`xpu:0`); `--limit` bounds documents per task for integration checks.
+
+BF16 exports keep the persistent routing bias in FP32. Current shared experts
+are unpacked from interleaved `[2F, D]` gate/up rows, and HF import restores
+that physical layout.
+
+Run the focused CPU regression suite explicitly; the upstream CPU workflow
+excludes experiment paths:
+
+```bash
+python -m pytest torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_*.py \
+  torchtitan/experiments/ezpz/tests/moe/test_convert_to_hf_output.py
+```
 
 ## Validation
 

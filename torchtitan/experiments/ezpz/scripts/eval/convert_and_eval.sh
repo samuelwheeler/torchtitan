@@ -20,6 +20,11 @@ EVAL_ONLY=false
 EXPORT_DTYPE="${EXPORT_DTYPE:-bfloat16}"
 BATCH_SIZE="${BATCH_SIZE:-auto}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
+CONVERT_PYTHON="${CONVERT_PYTHON:-python3}"
+CONVERT_PYTHONPATH="${CONVERT_PYTHONPATH:-${PYTHONPATH:-}}"
+LM_EVAL_PYTHON="${LM_EVAL_PYTHON:-}"
+DEVICE="${DEVICE:-xpu:0}"
+LIMIT=""
 # `--ckpt-name` overrides the auto-derived "agpt-${MODEL}-sophiag-olmo-mix-1124-n256-gbs3072"
 # checkpoint name. Use this for v2 runs (e.g. n256-gbs6144 or n512-gbs12288).
 CKPT_NAME_OVERRIDE=""
@@ -43,6 +48,8 @@ while [[ $# -gt 0 ]]; do
         --export-dtype) EXPORT_DTYPE="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --num-fewshot) NUM_FEWSHOT="$2"; shift 2 ;;
+        --device) DEVICE="$2"; shift 2 ;;
+        --limit) LIMIT="$2"; shift 2 ;;
         --ckpt-name) CKPT_NAME_OVERRIDE="$2"; shift 2 ;;
         --repo-root) REPO_ROOT_OVERRIDE="$2"; shift 2 ;;
         --label) EVAL_LABEL="$2"; shift 2 ;;
@@ -94,6 +101,10 @@ elif [[ "$MODEL" == "12b2a" ]]; then
     MODEL_FLAVOR="AGPT_2B_50K_MOE_sdpa_aurora_full_sonic"
     HF_CONFIG=""
     EVAL_BACKEND="hf"
+    if [[ "$EVAL_ONLY" != true && -z "$TOKENIZER_DIR_OVERRIDE" ]]; then
+        echo "ERROR: MoE conversion requires --tokenizer-dir with the training tokenizer"
+        exit 1
+    fi
 else
     echo "ERROR: unsupported model: ${MODEL}"
     exit 1
@@ -143,7 +154,8 @@ if [[ "$EVAL_ONLY" != true ]]; then
     echo "[1/3] Converting DCP checkpoint to HuggingFace format..."
     mkdir -p "${HF_DIR}"
 
-    python3 "${EVAL_DIR}/convert_to_hf.py" \
+    PYTHONPATH="${SCRIPT_REPO_ROOT}${CONVERT_PYTHONPATH:+:${CONVERT_PYTHONPATH}}" \
+        "${CONVERT_PYTHON}" -m torchtitan.experiments.ezpz.eval.convert_to_hf \
         "${DCP_DIR}" \
         "${HF_DIR}" \
         --hf_assets_path "${TOKENIZER_DIR}" \
@@ -179,25 +191,35 @@ if [[ "$CONVERT_ONLY" != true ]]; then
     echo ""
     echo "[3/3] Running lm-eval with ${EVAL_BACKEND} backend..."
     mkdir -p "${RESULTS_DIR}"
+    EVAL_COMMAND=(lm_eval)
+    if [[ -n "$LM_EVAL_PYTHON" ]]; then
+        EVAL_COMMAND=("${LM_EVAL_PYTHON}" -m lm_eval)
+    fi
+    LIMIT_ARGS=()
+    if [[ -n "$LIMIT" ]]; then
+        LIMIT_ARGS=(--limit "${LIMIT}")
+    fi
 
     if [[ "$EVAL_BACKEND" == "hf" ]]; then
-        lm_eval \
+        "${EVAL_COMMAND[@]}" \
             --model hf \
             --model_args "pretrained=${HF_DIR},dtype=${EXPORT_DTYPE},trust_remote_code=True" \
-            --device xpu:0 \
+            --device "${DEVICE}" \
             --tasks "${TASKS}" \
             --batch_size "${BATCH_SIZE}" \
             --num_fewshot "${NUM_FEWSHOT}" \
             --output_path "${RESULTS_DIR}" \
+            "${LIMIT_ARGS[@]}" \
             --log_samples
     else
-        lm_eval \
+        "${EVAL_COMMAND[@]}" \
             --model vllm \
             --model_args "pretrained=${HF_DIR},tensor_parallel_size=${TP},dtype=auto,gpu_memory_utilization=0.8,max_model_len=4096" \
             --tasks "${TASKS}" \
             --batch_size "${BATCH_SIZE}" \
             --num_fewshot "${NUM_FEWSHOT}" \
             --output_path "${RESULTS_DIR}" \
+            "${LIMIT_ARGS[@]}" \
             --log_samples
     fi
 

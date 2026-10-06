@@ -23,7 +23,11 @@ cd "$W" 2>/dev/null || { bad "worktree $W does not exist"; exit 1; }
 # --- worktree currency: a pinned worktree misses files recent commits moved ---
 if git rev-parse --git-dir >/dev/null 2>&1; then
   h=$(git rev-parse --short HEAD 2>/dev/null)
-  u=$(git rev-parse --short '@{u}' 2>/dev/null || echo "$h")
+  if [ -n "${PREFLIGHT_SOURCE_SHA:-}" ]; then
+    u=$(git rev-parse --short "$PREFLIGHT_SOURCE_SHA" 2>/dev/null)
+  else
+    u=$(git rev-parse --short '@{u}' 2>/dev/null || echo "$h")
+  fi
   [ "$h" = "$u" ] && ok "worktree current ($h)" || bad "worktree $h != upstream $u -- fetch/checkout first"
 fi
 

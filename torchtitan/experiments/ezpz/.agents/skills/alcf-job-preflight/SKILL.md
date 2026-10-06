@@ -64,6 +64,9 @@ blendcorpus, mpi4py, ezpz, torch"`.
 
 **3. Check the worktree is current.** A worktree pinned to an older tip will
 be missing files a recent commit moved or added.
+For deliberate feature-branch validation, set `PREFLIGHT_SOURCE_SHA` to the
+reviewed commit instead of comparing with the tracking branch. The PBS script
+must independently assert that SHA and reject uncommitted source changes.
 
 ## Eval-job traps specifically
 
