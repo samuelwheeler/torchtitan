@@ -16,7 +16,7 @@ ENTRYPOINT = SCRIPT.with_name("multihost_train_upstream.py")
 def test_multihost_launcher_allowlists_network_transport_controls():
     text = SCRIPT.read_text()
 
-    assert 'TORCHSTORE_TRANSPORT="${TORCHSTORE_TRANSPORT:-gloo}"' in text
+    assert 'TORCHSTORE_TRANSPORT="${TORCHSTORE_TRANSPORT:-auto}"' in text
     assert "auto_no_shm)" in text
     assert "TORCHSTORE_SHARED_MEMORY_ENABLED=0" in text
     assert "gloo|xccl|monarch_rdma)" in text

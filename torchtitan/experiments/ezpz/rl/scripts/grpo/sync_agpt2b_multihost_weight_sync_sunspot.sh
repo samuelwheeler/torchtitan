@@ -40,7 +40,14 @@ export TORCHINDUCTOR_MAX_AUTOTUNE=0 VLLM_ENABLE_V1_MULTIPROCESSING=1
 export WANDB_MODE=disabled HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export TORCHTITAN_TORCHSTORE_TRANSPORT=gloo
+export TORCHSTORE_TRANSPORT="${TORCHSTORE_TRANSPORT:-auto}"
+case "$TORCHSTORE_TRANSPORT" in
+    auto) unset TORCHTITAN_TORCHSTORE_TRANSPORT TORCHSTORE_SHARED_MEMORY_ENABLED ;;
+    gloo|xccl|monarch_rdma)
+        export TORCHTITAN_TORCHSTORE_TRANSPORT="$TORCHSTORE_TRANSPORT"
+        ;;
+    *) printf 'FATAL: unsupported TORCHSTORE_TRANSPORT=%s\n' "$TORCHSTORE_TRANSPORT"; exit 18 ;;
+esac
 unset TORCHSTORE_GLOO_ENABLED TORCHSTORE_XCCL_ENABLED CCL_OP_SYNC CCL_OFI_PROVIDER
 export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=tcp
 head_node=$(head -1 "$PBS_NODEFILE")
@@ -48,7 +55,8 @@ export CCL_KVS_IP_PORT="${head_node}_$((29500 + JOB % 1000))"
 
 "$V/bin/python" -m py_compile \
     torchtitan/experiments/ezpz/rl/scripts/grpo/multihost_train_upstream.py
-"$V/bin/python" - <<'PY' || exit 18
+"${V}/bin/python" - <<'PY' || exit 18
+import os
 from torchtitan.experiments.ezpz.rl.reason_agpt.config_registry import (
     rl_grpo_lora_agpt_2b_gsm8k_b2smoke,
 )
@@ -56,9 +64,13 @@ config = rl_grpo_lora_agpt_2b_gsm8k_b2smoke()
 assert config.async_loop.num_samples_per_prompt == 4
 assert config.generator.model_dtype == "float32"
 assert tuple(config.renderer.extra_stop_token_ids) == (1, 107)
+requested = os.environ.get("TORCHTITAN_TORCHSTORE_TRANSPORT", "auto")
+assert requested in {"auto", "gloo", "xccl", "monarch_rdma"}
+print(f"RL_MULTIHOST_TRANSPORT_REQUESTED={requested}")
 PY
 
-printf 'RL_MULTIHOST_START job=%s commit=%s out=%s\n' "$JOB" "$EXPECTED_SHA" "$OUT" | tee "$LOG"
+printf 'RL_MULTIHOST_START job=%s commit=%s transport=%s out=%s\n' \
+    "$JOB" "$EXPECTED_SHA" "$TORCHSTORE_TRANSPORT" "$OUT" | tee "$LOG"
 "$V/bin/python" -c 'from ezpz.cli import main; main()' launch \
     --nproc 2 --nproc_per_node 1 --cpu-bind none --timeout 1800 -- \
     "$V/bin/python" -u \

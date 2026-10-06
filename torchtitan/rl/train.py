@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 def _preimport_torch() -> None:
     """``bootstrap`` setup callable: pre-import torch on the spawned proc."""
+    # Scheduler launchers can propagate the controller's HOSTNAME to actors on
+    # other hosts. Repair it before TorchStore uses it for locality selection.
+    from torchtitan.torchstore_compat import repair_hostname_env
+
+    repair_hostname_env()
     # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
     import torch  # noqa: F401
 

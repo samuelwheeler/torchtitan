@@ -1,0 +1,85 @@
+#!/bin/bash --login
+#PBS -A datascience
+#PBS -N torchstore-locality
+#PBS -l walltime=00:20:00
+#PBS -l filesystems=tegu:home
+#PBS -l select=2
+#PBS -q workq
+#PBS -j oe
+#
+# Two-host diagnostic for TorchStore's locality classification.
+#
+# This does NOT train. It spawns one Monarch actor per scheduler host and
+# compares the HOSTNAME environment variable against socket.gethostname() in
+# each actor, which is exactly how torchstore.utils.get_local_hostname()
+# resolves co-location. A mismatch is the defect that makes automatic
+# (TransportType.Unset) selection choose SharedMemory for a remote generator.
+#
+# Expected markers:
+#   TORCHSTORE_LOCALITY_BUG  - before the fix (and the reason Gloo is pinned)
+#   TORCHSTORE_LOCALITY_OK   - after the fix
+set -o pipefail
+
+WT="${PBS_O_WORKDIR:-$(pwd)}"
+V="${V:-/lus/tegu/projects/datascience/foremans/venvs/rl-monarch-torch214}"
+: "${EXPECTED_COMMIT:?submit with -v EXPECTED_COMMIT=<exact-pushed-sha>}"
+
+source "$WT/torchtitan/experiments/ezpz/scripts/load_pinned_ezpz_utils.sh"
+load_pinned_ezpz_utils || exit $?
+ezpz_setup_job || exit $?
+ezpz_load_modules || exit $?
+export VIRTUAL_ENV="$V"
+export PATH="$V/bin:/opt/pbs/bin:$PATH"
+hash -r
+[[ "$(command -v python)" == "$V/bin/python" ]] || exit 13
+cd "$WT" || exit 11
+actual_commit=$(git rev-parse HEAD) || exit 15
+[[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || {
+  echo "FATAL: commit mismatch expected=$EXPECTED_COMMIT actual=$actual_commit"
+  exit 15
+}
+
+export PATH="$V/bin:/opt/pbs/bin:$PATH"
+export PYTHONPATH="$WT${PYTHONPATH:+:$PYTHONPATH}"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=tcp
+head_node=$(head -1 "$PBS_NODEFILE")
+export CCL_KVS_IP_PORT="${head_node}_$((29500 + ${PBS_JOBID%%.*} % 1000))"
+
+STORE="$WT/.torchstore-locality-${PBS_JOBID%%.*}.store"
+rm -f "$STORE"
+PORT=$((35000 + ${PBS_JOBID%%.*} % 20000))
+
+# Record what the submitting shell exports, since that is the suspected source
+# of the misclassification.
+echo "LAUNCH_SHELL HOSTNAME=${HOSTNAME:-<unset>} real=$(hostname)"
+
+set +e
+# Launcher note: this diagnostic uses raw `mpiexec` as an EXPLICIT launcher
+# control rather than `ezpz launch`. The pinned RL runtime
+# (rl-monarch-torch214) currently has a damaged `click` install, so its
+# `bin/ezpz` entry point raises `ModuleNotFoundError: No module named
+# 'click.core'` before any application code runs. That venv is protected and
+# must not be modified to unblock a diagnostic. This probe tests hostname
+# resolution inside spawned actors, not launcher behavior, so the substitution
+# does not weaken the result. Do NOT copy this pattern into a training or
+# acceptance launcher, which must use `ezpz launch`.
+if "$V/bin/python" -c "import ezpz.cli" >/dev/null 2>&1; then
+  # Invoke the CLI module with the selected interpreter. A copied venv's
+  # console-script shebang can still name its source venv even when
+  # `$V/bin/python` and its packages are healthy.
+  LAUNCH=("$V/bin/python" -c "from ezpz.cli import main; main()" launch -n 2 -ppn 1 --cpu-bind none --timeout 600 --)
+  echo "PROBE_LAUNCHER=ezpz-via-selected-python"
+else
+  echo "PROBE_LAUNCHER=mpiexec (ezpz CLI unavailable in $V; protected venv left untouched)"
+  LAUNCH=(mpiexec -n 2 -ppn 1 --cpu-bind none)
+fi
+"${LAUNCH[@]}" \
+  "$V/bin/python" -u \
+  torchtitan/experiments/ezpz/rl/scripts/grpo/torchstore_locality_probe.py \
+  --store "$STORE" --port "$PORT" --world-size 2
+rc=$?
+set -e
+rm -f "$STORE"
+echo "TORCHSTORE_LOCALITY_DONE rc=$rc $(date -Is)"
+exit "$rc"

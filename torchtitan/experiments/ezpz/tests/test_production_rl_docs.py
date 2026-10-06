@@ -23,7 +23,9 @@ def test_rl_index_points_to_current_production_runbook():
     assert "## Inspectable rollout examples" in current
     assert "Artifact row 16, policy version 1" in current
     assert "intended automatic (`TransportType.Unset`) preference order" in current
-    assert "currently validated workaround" in current
+    assert "same host  → SharedMemory" in current
+    assert "cross host → Gloo" in current
+    assert "RL_MULTIHOST_VERDICT: ok rows=40 versions=[0, 1, 2, 3]" in current
     assert "cross-host runs force Gloo" not in current
 
 

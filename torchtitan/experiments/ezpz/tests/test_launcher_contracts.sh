@@ -88,8 +88,10 @@ assert_contains "$rl_sync" '--generator.sampling.max-tokens=256' \
 assert_not_contains "$rl_sync" 'pip install' \
     'sync RL gate must not mutate the protected runtime'
 
-assert_contains "$rl_multihost" 'TORCHTITAN_TORCHSTORE_TRANSPORT=gloo' \
-    'multi-host sync gate must force the validated Gloo weight transport'
+assert_contains "$rl_multihost" 'TORCHSTORE_TRANSPORT:-auto' \
+    'multi-host sync gate must exercise automatic weight transport by default'
+assert_contains "$rl_multihost" 'RL_MULTIHOST_TRANSPORT_REQUESTED=' \
+    'multi-host sync gate must log the requested transport policy'
 assert_contains "$rl_multihost" 'multihost_train_upstream.py' \
     'multi-host sync gate must use the scheduler-SPMD entry point'
 assert_contains "$rl_multihost" 'RL_MULTIHOST_VERDICT: ok' \

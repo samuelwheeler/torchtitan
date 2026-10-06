@@ -54,6 +54,42 @@ Running log of what's happening, session by session. Most recent first.
   exception to the ezpz-only edit policy. Full-task benchmark metrics were
   outside this bounded integration validation.
 
+## 2026-10-01 (Sunspot) -- automatic TorchStore locality resolution
+
+Resolved the forced-Gloo caveat in the production Monarch/TorchStore runbook.
+TorchStore compared `os.environ.get("HOSTNAME", socket.gethostname())` between
+clients and storage volumes, but scheduler/MPI launchers propagated the head
+process's exported `HOSTNAME` to remote actors. Two-host stdlib probe `12479166`
+measured a process on `x1922c6s5b0n0` resolving as `x1922c6s3b0n0`, which made
+a remote volume appear local and selected inaccessible SharedMemory.
+
+`repair_hostname_env()` now runs in the controller, the core trainer/generator
+actor bootstraps, and the ezpz XPU bootstrap before TorchStore resolves
+locality. Actor probe `12479169` corrected each inherited FQDN to its own
+physical hostname and passed with `TORCHSTORE_LOCALITY_OK`, PBS exit 0.
+
+Correct locality exposed a second policy defect: capability probes selected
+MonarchRDMA and then XCCL ahead of Gloo even though neither TorchStore backend
+is qualified on this XPU stack. Controls `12479170`, `12479171`, and `12479174`
+failed at the initial generator pull, matching historical explicit controls.
+The final automatic policy preserves SharedMemory for genuine same-host
+transfers and selects Gloo cross-host; explicit Gloo/XCCL/MonarchRDMA selectors
+remain available for controlled qualification.
+
+The protected `rl-monarch-torch214` venv was not modified. A separate clone
+was repaired from exact RECORD-hash-matching uv-cache files after a complete
+audit found 41 missing files across 30 packages; its final audit found zero
+missing files and its Torch/ezpz/Monarch/TorchStore import closure passed.
+
+Matched explicit-Gloo job `12479172` and exact-head automatic job `12479179`
+both passed the complete two-host gate. Job `12479179`, source
+`e02b5266efa5fa0f1e7a6704e166265c21ed725d`, produced 40/40 rollouts across
+policy versions 0–3, four pushes/pulls, three finite updates (losses
+`-0.0021/-0.030/-0.100`, gradient norms `0.36/0.31/0.32`), full checkpoints at
+steps 1–3, clean shutdown, and PBS exit 0. [PR #61](https://github.com/saforem2/torchtitan/pull/61)
+contains the fix, tests, reusable probe, and updated runbook; 19 focused tests,
+launcher contracts, GitHub lint, and independent review pass.
+
 ## 2026-09-30 (reporting) -- INCITE Q3 report
 
 Created [`summaries/2026-Q3-incite.md`](summaries/2026-Q3-incite.md) from the

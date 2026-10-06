@@ -134,7 +134,10 @@ from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import GenerateFn
 from torchtitan.rl.trainer import Trainer
 from torchtitan.rl.types import Completion, TrainerStepBatch
-from torchtitan.torchstore_compat import torchstore_transport_from_env
+from torchtitan.torchstore_compat import (
+    repair_hostname_env,
+    torchstore_transport_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +148,12 @@ def _torchstore_strategy_from_env() -> ts.LocalRankStrategy:
     This affects only trainer/generator weight transfer; TorchTitan model
     collectives continue to use their configured accelerator backend.
     """
+    # TorchStore classifies client/volume co-location by comparing HOSTNAME
+    # (falling back to socket.gethostname()) on both sides. Launchers that
+    # propagate the submitting shell's environment give remote ranks the
+    # launcher's hostname, which makes a remote volume look local and selects
+    # SharedMemory. Repair this process's view before the strategy is built.
+    repair_hostname_env()
     transport = torchstore_transport_from_env()
     if transport is None:
         return ts.LocalRankStrategy()

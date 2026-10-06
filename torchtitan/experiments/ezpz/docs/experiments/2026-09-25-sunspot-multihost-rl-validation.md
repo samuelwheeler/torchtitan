@@ -2,6 +2,16 @@
 
 Date: 2026-09-25
 
+> [!NOTE]
+> **Superseded transport status (2026-10-01).** This page remains the immutable
+> record of the first successful two-host run, which explicitly forced Gloo.
+> Automatic locality resolution was subsequently root-caused and fixed:
+> inherited `HOSTNAME` collapsed distinct hosts, while unqualified XPU
+> MonarchRDMA/XCCL capability probes preempted Gloo. Final exact-head automatic
+> job `12479179` completed the same full gate with PBS exit 0. The current
+> topology-aware policy is same-host SharedMemory and cross-host Gloo; see the
+> [current Monarch production runbook](../production/rl/monarch.md).
+
 ## Result
 
 Merged `ezpz` plus the multi-host validation additions at commit
@@ -100,10 +110,12 @@ The failed jobs were necessary to isolate the production requirements:
   initial trainer publication. No rollout or optimizer step completed; PBS
   recorded `Exit_status=1`.
 
-The final implementation uses Monarch's scheduler-SPMD `host_mesh_from_store`,
-dimension-preserving host slices, a 120-second attach timeout, a 30-minute
-coordination-store timeout, and explicit Gloo as the validated workaround for
-the current automatic locality-resolution bug.
+At the time of this run, the implementation used Monarch's scheduler-SPMD
+`host_mesh_from_store`, dimension-preserving host slices, a 120-second attach
+timeout, a 30-minute coordination-store timeout, and explicit Gloo as the
+validated workaround. The 2026-10-01 fix recorded above supersedes only that
+transport-selection workaround; this job's actor/update/checkpoint evidence
+remains valid.
 
 ## Scope of the claim
 

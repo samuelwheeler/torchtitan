@@ -1,6 +1,6 @@
 # Production RL with Monarch, TorchStore, and vLLM on XPU
 
-**Current production runbook. Last updated: 2026-09-25.**
+**Current production runbook. Last updated: 2026-10-01.**
 
 > [!IMPORTANT]
 > This page is the canonical operator guide for the current upstream-style
@@ -42,7 +42,7 @@ It supplies separate trainer/generator `HostMeshes` to the existing
 `train_upstream.spawn_proc_mesh()` path; model, controller, reward, and
 checkpoint logic remain the normal TorchTitan RL implementation.
 
-## Why the validated cross-host launcher currently forces Gloo
+## Automatic transport locality and the former forced-Gloo workaround
 
 TorchStore's intended automatic (`TransportType.Unset`) preference order is:
 
@@ -64,14 +64,53 @@ fixed but hung during the first publication after flatten/cast. Thus forced
 XCCL is not a passing result on this stack.
 
 For the two-host topology, automatic-selection job `12478709` incorrectly
-entered the SharedMemory path even though the generator was remote. This points
-to a locality/hostname-classification defect in the current integration, not a
-design rule that cross-host TorchStore must use Gloo. The remote generator
-correctly rejected the inaccessible shared-memory volume:
+entered the SharedMemory path even though the generator was remote. The remote
+generator correctly rejected the inaccessible shared-memory volume:
 
 ```text
 Shared memory storage not found. This may indicate the storage volume is on a different host.
 ```
+
+### Root cause: `HOSTNAME` is inherited, not per-host
+
+This was a locality-classification defect, and it is now diagnosed. TorchStore
+decides co-location by string-comparing
+`os.environ.get("HOSTNAME", socket.gethostname())` on the client and on the
+storage volume (`torchstore.utils.get_local_hostname`, and
+`StorageVolume.get_id`). `HOSTNAME` is an ordinary exported shell variable, so
+MPI/scheduler launchers propagate the *submitting shell's* value to every
+remote rank.
+
+Two-host Sunspot probe `12479166` measured this directly — one process per
+node, stdlib only:
+
+```text
+LAUNCH HOSTNAME=x1922c6s3b0n0 real=x1922c6s3b0n0
+PROBE_ROW {"env_hostname": "x1922c6s3b0n0", "real_hostname": "x1922c6s3b0n0", "torchstore_resolved": "x1922c6s3b0n0"}
+PROBE_ROW {"env_hostname": "x1922c6s3b0n0", "real_hostname": "x1922c6s5b0n0", "torchstore_resolved": "x1922c6s3b0n0"}
+```
+
+Both ranks resolve to `x1922c6s3b0n0`, so `is_local_to_volume()` returns true
+for a volume that is physically on another node and automatic selection picks
+SharedMemory. The same mechanism has an inverse failure mode: Sunspot's batch
+shell exports `HOSTNAME` as the FQDN while `socket.gethostname()` is short, so
+a genuinely local volume can look remote and silently take a slower transport.
+
+**Fix.** `torchtitan/torchstore_compat.py` gains `repair_hostname_env()`, which
+aligns `HOSTNAME` with the real hostname of the running process. It is called
+in the RL actor bootstrap (before any TorchStore import) and in
+`_torchstore_strategy_from_env()`. It is a no-op when `HOSTNAME` is absent or
+already correct, and it never invents a value. Contracts, including the
+measured two-host values, are locked in
+`tests/rl/unit_tests/cpu/test_torchstore_locality.py`.
+
+Reusable diagnostic:
+`torchtitan/experiments/ezpz/rl/scripts/grpo/torchstore_locality_probe.pbs`.
+
+The actor-local repair passed on two physical hosts in job `12479169`: each
+actor corrected the inherited launcher FQDN to its own short physical hostname,
+the two resolved names were distinct, and the job emitted
+`TORCHSTORE_LOCALITY_OK` with PBS exit 0.
 
 Two follow-up controls tested the remaining automatic/RDMA question directly:
 
@@ -84,18 +123,60 @@ TorchComms was not testable in this environment: the `torchcomms` package was
 absent and both TorchComms availability probes returned false. MonarchRDMA was
 available at capability-probe level, but the explicit end-to-end control failed.
 
-Until automatic locality resolution is fixed and revalidated, the committed
-two-host launcher pins the known-good network fallback:
+The original forced-Gloo fallback was:
 
 ```bash
 export TORCHTITAN_TORCHSTORE_TRANSPORT=gloo
 ```
 
-Gloo is therefore the **currently validated workaround** for this cross-host
-topology. It is not the preferred design endpoint, and it does not prove that
-automatic XCCL cannot work after the locality bug is corrected. Do not silently
-replace Gloo with XCCL or relabel the passing result as RDMA/XCCL without a new
-hardware gate.
+That global pin is no longer required. The repaired XPU automatic policy is
+topology-aware:
+
+```text
+same host  → SharedMemory
+cross host → Gloo
+```
+
+MonarchRDMA and XCCL remain explicit experimental controls, but are excluded
+from automatic XPU selection on this runtime. Capability probes had reported
+both as candidates despite neither being a qualified TorchStore weight-transfer
+backend here: explicit MonarchRDMA `12478722` and automatic `12479170` crashed
+with SIGSEGV on the initial pull; explicit XCCL `12478537` hung there, and
+automatic controls `12479171`/`12479174` reproduced that boundary after RDMA
+was excluded.
+
+Matched explicit-Gloo control `12479172` and final exact-head automatic job
+`12479177` both completed the full two-host gate. `12479177` used
+`TransportType.Unset`,
+completed 40/40 rollouts across policy versions 0–3, four trainer
+publication/generator pulls, three finite nonzero-gradient updates, DCP
+checkpoints at steps 1–3, clean shutdown, and PBS exit 0. Final update metrics:
+
+```text
+step 1: loss=0.0480, grad_norm=0.38
+step 2: loss=0.0058, grad_norm=0.27
+step 3: loss=0.0500, grad_norm=0.39
+RL_MULTIHOST_VERDICT: ok rows=40 versions=[0, 1, 2, 3]
+  grads=[0.38, 0.27, 0.39] losses=[0.048, 0.0058, 0.05]
+  pushes=4 pulls=4
+```
+
+The committed two-host launcher now defaults to `TORCHSTORE_TRANSPORT=auto`;
+operators can still request `gloo`, `xccl`, or `monarch_rdma` explicitly for a
+controlled comparison.
+
+### Runtime used for revalidation
+
+The protected `rl-monarch-torch214` runtime had 41 RECORD-listed files missing
+across 30 packages, including `click.core`, Torch FX unification, SymPy, Triton,
+and vLLM modules. It was not modified. A separate clone at
+`/lus/tegu/projects/datascience/foremans/venvs/rl-monarch-torch214-locality-20261001`
+was repaired exclusively from exact RECORD-hash-matching uv cache objects, with
+`py-cpuinfo==9.0.0` reinstalled `--no-deps` for its missing console script and
+the previously qualified BlendCorpus commit `50502b0c9de3` installed
+`--no-deps`. The resulting full RECORD existence audit reported zero missing
+files, and the Torch/ezpz/Monarch/TorchStore import closure passed before jobs
+`12479169`–`12479179` ran.
 
 ## Required evidence before promotion
 
@@ -104,7 +185,9 @@ A scheduler state or model load is not a pass. Require all of the following:
 1. exact checkout SHA asserted by the batch script;
 2. clean tracked worktree;
 3. trainer and generator placement on distinct host identities;
-4. explicit `TransportType.Gloo` in the controller log;
+4. `TORCHSTORE_TRANSPORT=auto` requested and the XPU topology policy installed
+   (`SharedMemory` only when local, otherwise `Gloo`); explicit transport
+   controls must log the requested backend;
 5. vLLM pre-training generation completes;
 6. initial trainer policy publication and generator pull complete;
 7. at least three finite optimizer updates with finite loss and gradient norm;
