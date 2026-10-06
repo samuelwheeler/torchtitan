@@ -7,11 +7,15 @@ Running log of what's happening, session by session. Most recent first.
 - Addressed unknown legacy model keys, atomic export publication, untracked
   source files and circular conversion expectations from PR #63. The user
   deferred expert-dispatch optimization; the inference code remains unchanged.
-- All 179 CPU cases passed. New checks cover concurrent writers, interrupted
+- All 180 CPU cases passed. New checks cover concurrent writers, interrupted
   exports, static dense assets, independent mappings and pinned-source guards.
 - Evidence: `outputs/evals/moe-12b2a-step27000/pr-review-fixes/`.
   [Report and compute plan](experiments/moe/aurora/2026-10-06-hf-export-pr-feedback.md).
-- Next gate: one-node Aurora conversion/evaluation regression, then update PR.
+- Job `8907545` passed both two-rank cases and published the MoE export, then
+  failed the new wrapper validation on a training-only `ezpz` import in the
+  inference runtime (exit 1, 7m01s). Direct standard-library validation and an
+  isolated-runtime regression fix that dependency. Failed artifacts retained.
+- Next gate: rerun one-node Aurora conversion/evaluation regression, then update PR.
 
 ## 2026-10-06 -- MoE HF export PR preparation
 

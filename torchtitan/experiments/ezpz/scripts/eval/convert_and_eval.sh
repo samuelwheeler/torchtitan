@@ -184,10 +184,9 @@ else
     fi
 fi
 
-PYTHONPATH="${SCRIPT_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${LM_EVAL_PYTHON:-${CONVERT_PYTHON}}" -c \
-    'import sys; from torchtitan.experiments.ezpz.eval.hf_export import validate_export; validate_export(sys.argv[1])' \
-    "${HF_DIR}"
+"${LM_EVAL_PYTHON:-${CONVERT_PYTHON}}" -c \
+    'import runpy, sys; runpy.run_path(sys.argv[1])["validate_export"](sys.argv[2])' \
+    "${EVAL_DIR}/hf_export.py" "${HF_DIR}"
 
 # ---- Step 3: Run lm-eval ----
 if [[ "$CONVERT_ONLY" != true ]]; then

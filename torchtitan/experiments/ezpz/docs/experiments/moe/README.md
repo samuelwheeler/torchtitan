@@ -8,7 +8,7 @@ MoE training benchmarks using DeepSeek-style MLA + MoE architecture across ALCF 
 
 | Date | Report | Configs | Nodes | Key Result |
 |------|--------|---------|-------|------------|
-| 2026-10-06 | [PR feedback fixes](aurora/2026-10-06-hf-export-pr-feedback.md) | Dense 2B/50K + AGPT 12B2A | 1 planned | 179 CPU cases passed; compute regression pending |
+| 2026-10-06 | [PR feedback fixes](aurora/2026-10-06-hf-export-pr-feedback.md) | Dense 2B/50K + AGPT 12B2A | 1 planned | 180 CPU cases passed; compute regression pending |
 | 2026-10-06 | [Paired HF evaluation](aurora/2026-10-06-hf-dense-moe-paired.md) | Dense 2B/50K + AGPT 12B2A | 1 | Full seven-task pair passed: MoE +2.73pp equal-task / +4.23pp document-weighted |
 | 2026-10-06 | [HF export review fixes](aurora/2026-10-06-hf-export-review-fixes.md) | AGPT 12B2A | 1 | Export + seven-task HF smoke passed; all 24 FP32 biases exact |
 | 2026-04-12 | [Smoke test (n2)](aurora/20260412-002800-smoke-n2.md) | 500M, 2B, 4B, 7B, 10B_2B_sdpa | 2 | All pass; AC incompatible with 7B+ routing |

@@ -28,7 +28,7 @@ the Python loop still scans the expert list.
 
 ## CPU validation
 
-All 179 CPU cases passed: 175 MoE/converter/schema/publication/source-guard
+All 180 CPU cases passed: 176 MoE/converter/schema/publication/source-guard
 cases and four retained JSON configuration factories on the meta device.
 The static-asset fixture initially lacked the fast tokenizer JSON required by
 the existing dense workflow; saving its HF tokenizer supplied that file, and
@@ -39,6 +39,18 @@ Logs and compute submission helpers are ignored artifacts under
 `outputs/evals/moe-12b2a-step27000/pr-review-fixes/`. The helpers are excluded
 from the PR. The inherited repository-wide lint limitations are recorded in
 the [paired evaluation report](2026-10-06-hf-dense-moe-paired.md#pr-preparation).
+
+## Initial compute run
+
+Aurora job `8907545`, pinned to
+`872cb25c07416b39e8d6bf484bcbf424fa58e8c0`, passed both two-rank cases and
+published the complete real MoE export, then exited 1 after 7m01s. The new
+wrapper validation imported the experiment package, whose initializer requires
+`ezpz`; that dependency is absent from the separate inference environment.
+The check now loads the standard-library validation file directly with `runpy`.
+A regression runs the wrapper validation with site packages and dependency
+paths disabled. The failed job, complete export and terminal evidence are
+retained in the ignored artifacts.
 
 ## Compute validation plan
 
