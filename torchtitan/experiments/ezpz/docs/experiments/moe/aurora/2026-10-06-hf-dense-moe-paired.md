@@ -133,8 +133,26 @@ Under `outputs/evals/pair-step27000/hf-full/8907189/`:
 Submission records, PBS script, launch log (`pbs-reference-fixed.log`),
 post-processing helper and CPU logs are under
 `outputs/evals/pair-step27000/hf-full-validation/`, outside tracked PR source.
-The requested seven-task evaluation gate is complete. Integration with
-current `origin/ezpz` remains a separate PR gate.
+The requested seven-task evaluation gate is complete.
+
+## PR preparation
+
+Sam Foreman's `ezpz` base `d4449ba0ec254449b874ebc1b114fa84f66200f2` was
+integrated in `c1c2847cc`. The only conflict was the journal; both entries
+were preserved. The upstream changes concern RL transport, so the evaluated
+HF implementation is unaffected. All **23 focused CPU tests passed** after
+integration, including the existing dense converter schema cases; shell syntax
+checks also passed. The two distributed DTensor cases passed in job `8907019`.
+Commit `da71a884f` adds standard license headers; Python syntax-tree comparison
+confirmed that these additions preserve executable code.
+
+CPU evidence and the prepared PR description are under
+`outputs/evals/pair-step27000/pr-readiness/`. The target is
+`saforem2/torchtitan:ezpz`, with head
+`samuelwheeler:feature/aurora-moe-hf-export`. The existing GitHub CPU workflow
+excludes experiment paths and uses private PyTorch runners, so these tests
+remain manually validated. Local pre-commit verification is pending:
+[ezpz policy](../../../../AGENTS.md) assigns that check to the user.
 
 ## Earlier attempts
 

@@ -2,6 +2,22 @@
 
 Running log of what's happening, session by session. Most recent first.
 
+## 2026-10-06 -- MoE HF export PR preparation
+
+- Integrated Sam's current `ezpz` base `d4449ba0e` in `c1c2847cc`, preserving
+  both journal entries. The branch is no longer behind the target base.
+- All 23 focused CPU checks passed after integration; the two distributed
+  DTensor checks and full paired HF evaluation already passed in jobs
+  `8907019` / `8907189`. The upstream RL changes do not alter the evaluated
+  HF implementation.
+- Added standard license headers in `da71a884f`; syntax-tree comparison
+  confirmed identical executable code. Wrapper, PBS and preflight shell syntax
+  checks passed. All PR changes stay under `experiments/ezpz/`.
+- Evidence and submission text: `outputs/evals/pair-step27000/pr-readiness/`.
+  [Validation and PR note](experiments/moe/aurora/2026-10-06-hf-dense-moe-paired.md).
+- Next gate: user-run pre-commit verification, as required by the ezpz policy.
+  The generic GitHub CPU workflow does not cover these experiment tests.
+
 ## 2026-10-06 — Matched dense/MoE HF evaluation
 
 - Added the dense `2b_50k` export and HF pipeline selection, shared Llama
