@@ -2,6 +2,32 @@
 
 Running log of what's happening, session by session. Most recent first.
 
+## 2026-10-06 — MoE HF export review fixes and real-checkpoint validation
+
+- Fixed interleaved shared-expert mapping in both directions, preserved FP32
+  routing biases in BF16 exports, validated the explicit training tokenizer,
+  and exercised the existing conversion/evaluation wrapper with separate
+  converter and inference runtimes.
+- Initial debug job `8907007` exited 1 after 1m44s because spawned DTensor
+  workers could not import a test fixture; conversion never started. The
+  fixture factory now uses its fully qualified package path.
+- Replacement job `8907019`, pinned to `3df50f0f7`, ran on
+  `x4112c2s6b0n0` and ended `job_state=F`, `Exit_status=0`, walltime 16m34s.
+  Both two-rank layout tests passed; step-27000 exported successfully; lm-eval
+  completed 176 likelihood requests across seven tasks (eight documents each).
+  All 24 serialized and loaded FP32 routing biases matched the DCP exactly.
+- Native/Sonic relative RMS errors were 0.4401% / 0.5275%, cosine >= 0.999768,
+  and top-1 agreement 96.875% / 98.4375%; final-token top-10s matched both.
+- The final CPU run passed 20 tests, including existing dense converter checks.
+  A combined run had exposed uninitialized toy experts; explicit initialization
+  fixed the fixtures. With the two distributed cases, 22 checks passed.
+- Artifacts: `outputs/evals/moe-12b2a-step27000/hf-export-runs/8907019/`.
+  Logs and submission record: `outputs/evals/moe-12b2a-step27000/review-fixes/`.
+  [Validation report](experiments/moe/aurora/2026-10-06-hf-export-review-fixes.md).
+- Next gate: adding the prepared GitHub CPU workflow requires the requested
+  exception to the ezpz-only edit policy. Full-task benchmark metrics were
+  outside this bounded integration validation.
+
 ## 2026-09-30 (reporting) -- INCITE Q3 report
 
 Created [`summaries/2026-Q3-incite.md`](summaries/2026-Q3-incite.md) from the

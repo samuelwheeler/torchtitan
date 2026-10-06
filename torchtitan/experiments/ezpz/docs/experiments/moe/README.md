@@ -8,7 +8,7 @@ MoE training benchmarks using DeepSeek-style MLA + MoE architecture across ALCF 
 
 | Date | Report | Configs | Nodes | Key Result |
 |------|--------|---------|-------|------------|
-| 2026-10-06 | [HF export review fixes](aurora/2026-10-06-hf-export-review-fixes.md) | AGPT 12B2A | 1 | Conversion/evaluation validation in progress |
+| 2026-10-06 | [HF export review fixes](aurora/2026-10-06-hf-export-review-fixes.md) | AGPT 12B2A | 1 | Export + seven-task HF smoke passed; all 24 FP32 biases exact |
 | 2026-04-12 | [Smoke test (n2)](aurora/20260412-002800-smoke-n2.md) | 500M, 2B, 4B, 7B, 10B_2B_sdpa | 2 | All pass; AC incompatible with 7B+ routing |
 | 2026-04-12 | [Smoke test (n2)](aurora/20260412-033047-smoke-n2.md) | debugmodel | 2 | OK; 25.8k TPS, 5.11% MFU |
 | 2026-04-12 | [Smoke test (n2)](aurora/20260412-035648-smoke-n2.md) | debugmodel, 2b | 2 | OK; 2b at 11.4% MFU, 34 TFLOPS |

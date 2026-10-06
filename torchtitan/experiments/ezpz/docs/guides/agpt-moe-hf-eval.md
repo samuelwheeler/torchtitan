@@ -60,8 +60,9 @@ BF16 exports keep the persistent routing bias in FP32. Current shared experts
 are unpacked from interleaved `[2F, D]` gate/up rows, and HF import restores
 that physical layout.
 
-Run the focused CPU regression suite explicitly; the upstream CPU workflow
-excludes experiment paths:
+Run the focused regression suite explicitly; the upstream CPU workflow
+excludes experiment paths. On Aurora, run the two-rank CPU cases inside a PBS
+allocation:
 
 ```bash
 python -m pytest torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_*.py \
@@ -70,10 +71,12 @@ python -m pytest torchtitan/experiments/ezpz/tests/moe/test_agpt_moe_hf_*.py \
 
 ## Validation
 
-The historical step-27000 checkpoint was exported in BF16 and compared on the
-same 64-token input with both the current native TorchTitan implementation and
-the frozen Sonic training implementation. The HF logits had relative RMS error
-below 0.5%, cosine similarity 0.999770, and at least 96.875% top-1 agreement
-against each reference; all three paths produced the same final-token top-10.
-The exported directory also completed an ARC-Easy likelihood smoke through
-lm-eval 0.4.10's standard `hf` backend on XPU.
+Job `8907019` exported the historical step-27000 checkpoint in BF16 with exact
+FP32 routing biases, then evaluated it through the wrapper on XPU. On the same
+64-token input, relative RMS error was 0.440% against current native TorchTitan
+and 0.528% against the frozen Sonic training implementation. Cosine similarity
+was at least 0.999768 and top-1 agreement was 96.875% / 98.438%, respectively.
+All paths produced the same final-token top-10. The seven-task commonsense
+smoke completed 176 likelihood requests over eight documents per task.
+See the [review-fix validation report](../experiments/moe/aurora/2026-10-06-hf-export-review-fixes.md)
+for source SHA, runtime versions, artifacts, and the initial test-fixture failure.
